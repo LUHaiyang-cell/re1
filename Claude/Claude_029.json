@@ -1,0 +1,774 @@
+[
+  {
+    "index": 281,
+    "question": "Show Clearwater coffee shops with menu photos, rated at least 4.0 with at least 50 reviews.",
+    "success": true,
+    "result": {
+      "analysis": "用户想要在 Clearwater 的咖啡店（coffee shops），且满足：评分(stars)≥4.0、评论数(review_count)≥50，并且该店在照片库中有“菜单(menu)相关照片”。在 Yelp photo 数据中通常没有严格的 menu 标签（常见 label 为 food/drink/inside/outside），因此这里用 caption 含“menu”作为主判定，并用 food/drink 作为补充（可在代码里开关）。主要使用 SQLite（business.db + photo.db）完成过滤与关联；不强制使用向量库/图数据库。",
+      "natural_question": "列出 Clearwater 的咖啡店，要求评分至少4.0、至少50条评论，并且有菜单相关的照片。",
+      "difficulty": "medium",
+      "query_types": [
+        "sql"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "SQLite: business.db (business表)"
+            ],
+            "filter_condition": {
+              "city": {
+                "=": "Clearwater"
+              },
+              "stars": {
+                ">=": 4.0
+              },
+              "review_count": {
+                ">=": 50
+              },
+              "categories": {
+                "LIKE": "%Coffee%"
+              }
+            }
+          },
+          "result_var": "biz_rows",
+          "description": {
+            "narrative": "从 business.db 中筛选 Clearwater 的咖啡店：stars>=4.0 且 review_count>=50，并用 categories 模糊匹配 Coffee/Cafe/Tea 等关键词。",
+            "example_query": "SELECT business_id, name, address, city, state, postal_code, stars, review_count, categories\nFROM business\nWHERE city = 'Clearwater'\n  AND stars >= 4.0\n  AND review_count >= 50\n  AND (\n    categories LIKE '%Coffee%'\n    OR categories LIKE '%Cafe%'\n    OR categories LIKE '%Caf%C3%A9%'\n    OR categories LIKE '%Tea%'\n  )\nORDER BY stars DESC, review_count DESC;"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "SQLite: photo.db (photo表)"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "IN": "biz_rows.business_id"
+              },
+              "caption": {
+                "LIKE": "%menu%"
+              },
+              "label": {
+                "IN": [
+                  "food",
+                  "drink"
+                ]
+              }
+            }
+          },
+          "result_var": "photo_rows",
+          "description": {
+            "narrative": "在 photo.db 中找出这些店的“菜单相关照片”。优先用 caption 包含 'menu'；如数据 caption 稀疏，可额外把 label=food/drink 作为“菜单/菜品相关”照片补充（代码提供开关）。",
+            "example_query": "SELECT photo_id, business_id, caption, label\nFROM photo\nWHERE business_id IN ('id1','id2','...')\n  AND (LOWER(caption) LIKE '%menu%' OR label IN ('food','drink'));"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "Python合并结果"
+            ],
+            "filter_condition": {
+              "has_menu_photos": {
+                "=": true
+              }
+            }
+          },
+          "result_var": "final_rows",
+          "description": {
+            "narrative": "将 business 与 photo 按 business_id 合并，只保留至少有1张菜单相关照片的店铺，输出店铺信息 + 菜单照片数量 + 示例 photo_id 列表。",
+            "example_query": "N/A（Python merge / group by）"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nfrom collections import defaultdict\nfrom typing import List, Dict, Any, Iterable\n\n# -----------------------------\n# Fixed configuration (required)\n# -----------------------------\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nmilvus_config = {\n    'milvus_collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    },\n    'milvus_host': 'localhost',\n    'milvus_port': '19530',\n}\n\nneo4j_config = {\n    'neo4j_uri': 'bolt://localhost:7687',\n    'neo4j_auth': ('neo4j', 'password')\n}\n\n# -----------------------------\n# Helpers\n# -----------------------------\ndef chunked(seq: List[str], size: int) -> Iterable[List[str]]:\n    for i in range(0, len(seq), size):\n        yield seq[i:i + size]\n\n\ndef connect_sqlite(path: str) -> sqlite3.Connection:\n    conn = sqlite3.connect(path)\n    conn.row_factory = sqlite3.Row\n    return conn\n\n\ndef fetch_clearwater_coffee_shops(conn: sqlite3.Connection,\n                                 min_stars: float = 4.0,\n                                 min_review_count: int = 50) -> List[Dict[str, Any]]:\n    # Categories matching: Coffee/Cafe/Tea (Yelp categories is a comma-separated string)\n    sql = \"\"\"\n    SELECT business_id, name, address, city, state, postal_code,\n           stars, review_count, categories\n    FROM business\n    WHERE city = ?\n      AND stars >= ?\n      AND review_count >= ?\n      AND (\n        categories LIKE '%Coffee%'\n        OR categories LIKE '%Cafe%'\n        OR categories LIKE '%Caf%C3%A9%'\n        OR categories LIKE '%Tea%'\n      )\n    ORDER BY stars DESC, review_count DESC;\n    \"\"\"\n    return [dict(r) for r in conn.execute(sql, (\"Clearwater\", min_stars, min_review_count)).fetchall()]\n\n\ndef fetch_menu_related_photos(conn: sqlite3.Connection,\n                             business_ids: List[str],\n                             menu_caption_keyword: str = \"menu\",\n                             include_food_drink_as_fallback: bool = True) -> List[Dict[str, Any]]:\n    if not business_ids:\n        return []\n\n    # SQLite has a max variable limit (commonly 999); chunk business_ids.\n    all_rows: List[Dict[str, Any]] = []\n    for chunk in chunked(business_ids, 900):\n        placeholders = \",\".join([\"?\"] * len(chunk))\n\n        if include_food_drink_as_fallback:\n            sql = f\"\"\"\n            SELECT photo_id, business_id, caption, label\n            FROM photo\n            WHERE business_id IN ({placeholders})\n              AND (\n                (caption IS NOT NULL AND LOWER(caption) LIKE ?)\n                OR label IN ('food','drink')\n              );\n            \"\"\"\n            params = list(chunk) + [f\"%{menu_caption_keyword.lower()}%\"]\n        else:\n            # strict: caption contains 'menu'\n            sql = f\"\"\"\n            SELECT photo_id, business_id, caption, label\n            FROM photo\n            WHERE business_id IN ({placeholders})\n              AND caption IS NOT NULL\n              AND LOWER(caption) LIKE ?;\n            \"\"\"\n            params = list(chunk) + [f\"%{menu_caption_keyword.lower()}%\"]\n\n        rows = conn.execute(sql, params).fetchall()\n        all_rows.extend(dict(r) for r in rows)\n\n    return all_rows\n\n\ndef main():\n    # Tune behavior here\n    MIN_STARS = 4.0\n    MIN_REVIEWS = 50\n    INCLUDE_FOOD_DRINK_FALLBACK = True  # set False if you only accept caption containing 'menu'\n\n    try:\n        biz_conn = connect_sqlite(sqlite_paths[\"business\"])\n        photo_conn = connect_sqlite(sqlite_paths[\"photo\"])\n\n        biz_rows = fetch_clearwater_coffee_shops(biz_conn, MIN_STARS, MIN_REVIEWS)\n        biz_ids = [r[\"business_id\"] for r in biz_rows]\n\n        photo_rows = fetch_menu_related_photos(\n            photo_conn,\n            biz_ids,\n            menu_caption_keyword=\"menu\",\n            include_food_drink_as_fallback=INCLUDE_FOOD_DRINK_FALLBACK\n        )\n\n        photos_by_biz = defaultdict(list)\n        for p in photo_rows:\n            photos_by_biz[p[\"business_id\"]].append(p)\n\n        # Build final output: only businesses with >=1 matched photo\n        final = []\n        for b in biz_rows:\n            ps = photos_by_biz.get(b[\"business_id\"], [])\n            if not ps:\n                continue\n            sample_photo_ids = [x[\"photo_id\"] for x in ps[:5]]\n            final.append({\n                \"business_id\": b[\"business_id\"],\n                \"name\": b[\"name\"],\n                \"address\": b.get(\"address\"),\n                \"city\": b.get(\"city\"),\n                \"state\": b.get(\"state\"),\n                \"postal_code\": b.get(\"postal_code\"),\n                \"stars\": b.get(\"stars\"),\n                \"review_count\": b.get(\"review_count\"),\n                \"categories\": b.get(\"categories\"),\n                \"menu_photo_count\": len(ps),\n                \"sample_photo_ids\": sample_photo_ids\n            })\n\n        # Sort by stars desc, then review_count desc, then menu_photo_count desc\n        final.sort(key=lambda x: (x[\"stars\"], x[\"review_count\"], x[\"menu_photo_count\"]), reverse=True)\n\n        # Print results\n        print(f\"Found {len(final)} Clearwater coffee shops with menu-related photos (stars>={MIN_STARS}, reviews>={MIN_REVIEWS}).\")\n        print(\"-\" * 100)\n        for i, r in enumerate(final, 1):\n            line1 = f\"{i}. {r['name']} | {r['stars']} stars | {r['review_count']} reviews | menu_photos={r['menu_photo_count']}\"\n            line2 = f\"   {r['address']}, {r['city']}, {r['state']} {r['postal_code']}\"\n            line3 = f\"   sample_photo_ids: {', '.join(r['sample_photo_ids'])}\"\n            print(line1)\n            print(line2)\n            print(line3)\n            print(\"   categories:\", r[\"categories\"])\n            print(\"-\" * 100)\n\n    except sqlite3.Error as e:\n        raise SystemExit(f\"SQLite error: {e}\")\n    finally:\n        try:\n            biz_conn.close()\n        except Exception:\n            pass\n        try:\n            photo_conn.close()\n        except Exception:\n            pass\n\n\nif __name__ == \"__main__\":\n    main()\n"
+    }
+  },
+  {
+    "index": 282,
+    "question": "Show Metairie coffee shops with outdoor seating and their inside/outside photos.",
+    "success": true,
+    "result": {
+      "analysis": "用户想要筛选出位于Metairie的咖啡店（Coffee shops），且需要具备户外座位（OutdoorSeating=True），并展示这些店铺对应的inside/outside照片。该问题主要依赖SQLite中的business与photo结构化数据即可完成：business用于筛选门店，photo用于按label提取inside/outside照片。难点在于Yelp attributes字段通常是字符串/JSON样式文本，需要用LIKE做鲁棒匹配；以及一次性查询多家店铺的照片需要IN批量参数化。",
+      "natural_question": "Show Metairie coffee shops with outdoor seating and their inside/outside photos.",
+      "difficulty": "medium",
+      "query_types": [
+        "sql"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "SQLite:business.db / table business"
+            ],
+            "filter_condition": {
+              "city": {
+                "=": "Metairie"
+              },
+              "categories": {
+                "LIKE": "%Coffee%"
+              },
+              "attributes": {
+                "LIKE": "%OutdoorSeating%True%"
+              }
+            }
+          },
+          "result_var": "metairie_coffee_outdoor",
+          "description": {
+            "narrative": "在business库中筛选city=Metairie、类别包含Coffee（或Coffee & Tea等）且attributes中OutdoorSeating为True的商家，返回business_id、名称与基础信息。",
+            "example_query": "SELECT business_id, name, address, city, state, postal_code, stars, review_count, categories, attributes\nFROM business\nWHERE city = 'Metairie'\n  AND (lower(categories) LIKE '%coffee%')\n  AND (lower(COALESCE(attributes,'')) LIKE '%outdoorseating%true%');"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "SQLite:photo.db / table photo"
+            ],
+            "filter_condition": {
+              "label": {
+                "IN": [
+                  "inside",
+                  "outside"
+                ]
+              },
+              "business_id": {
+                "IN": "metairie_coffee_outdoor.business_id列表"
+              }
+            }
+          },
+          "result_var": "inside_outside_photos",
+          "description": {
+            "narrative": "在photo库中，按上述筛选出的business_id批量查询label为inside/outside的照片，返回photo_id、business_id、label、caption。",
+            "example_query": "SELECT photo_id, business_id, label, caption\nFROM photo\nWHERE label IN ('inside','outside')\n  AND business_id IN ('id1','id2','id3');"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "Python结果聚合"
+            ]
+          },
+          "result_var": "final_result",
+          "description": {
+            "narrative": "将photo按business_id聚合，分别整理inside/outside的photo列表，并与商家信息合并输出。",
+            "example_query": "（Python中按business_id分组聚合inside/outside photo_id列表）"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nfrom collections import defaultdict\n\n# ---------- Fixed configuration (as required) ----------\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nconfig = {\n    'milvus_collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    },\n    'milvus_host': 'localhost',\n    'milvus_port': '19530',\n    'neo4j_uri': 'bolt://localhost:7687',\n    'neo4j_auth': ('neo4j', 'password')\n}\n\n\ndef fetch_metairie_coffee_with_outdoor_seating(limit=50):\n    \"\"\"Step 1: Query businesses in Metairie that look like coffee shops and have OutdoorSeating=True.\"\"\"\n    sql = \"\"\"\n    SELECT business_id, name, address, city, state, postal_code, stars, review_count, categories, attributes\n    FROM business\n    WHERE city = ?\n      AND lower(COALESCE(categories,'')) LIKE '%coffee%'\n      AND lower(COALESCE(attributes,'')) LIKE '%outdoorseating%true%'\n    ORDER BY review_count DESC\n    LIMIT ?;\n    \"\"\"\n\n    conn = sqlite3.connect(sqlite_paths[\"business\"])\n    try:\n        conn.row_factory = sqlite3.Row\n        cur = conn.cursor()\n        cur.execute(sql, (\"Metairie\", limit))\n        rows = cur.fetchall()\n        return [dict(r) for r in rows]\n    finally:\n        conn.close()\n\n\ndef fetch_inside_outside_photos(business_ids):\n    \"\"\"Step 2: Fetch inside/outside photos for a list of business_ids.\"\"\"\n    if not business_ids:\n        return []\n\n    placeholders = \",\".join([\"?\"] * len(business_ids))\n    sql = f\"\"\"\n    SELECT photo_id, business_id, label, caption\n    FROM photo\n    WHERE label IN ('inside','outside')\n      AND business_id IN ({placeholders});\n    \"\"\"\n\n    conn = sqlite3.connect(sqlite_paths[\"photo\"])\n    try:\n        conn.row_factory = sqlite3.Row\n        cur = conn.cursor()\n        cur.execute(sql, business_ids)\n        rows = cur.fetchall()\n        return [dict(r) for r in rows]\n    finally:\n        conn.close()\n\n\ndef main():\n    # Step 1\n    businesses = fetch_metairie_coffee_with_outdoor_seating(limit=50)\n    business_ids = [b[\"business_id\"] for b in businesses]\n\n    # Step 2\n    photos = fetch_inside_outside_photos(business_ids)\n\n    # Step 3: Aggregate\n    grouped = defaultdict(lambda: {\"inside\": [], \"outside\": []})\n    for p in photos:\n        label = (p.get(\"label\") or \"\").lower()\n        if label in (\"inside\", \"outside\"):\n            grouped[p[\"business_id\"]][label].append({\n                \"photo_id\": p.get(\"photo_id\"),\n                \"caption\": p.get(\"caption\")\n            })\n\n    final = []\n    for b in businesses:\n        bid = b[\"business_id\"]\n        final.append({\n            \"business_id\": bid,\n            \"name\": b.get(\"name\"),\n            \"address\": b.get(\"address\"),\n            \"city\": b.get(\"city\"),\n            \"state\": b.get(\"state\"),\n            \"postal_code\": b.get(\"postal_code\"),\n            \"stars\": b.get(\"stars\"),\n            \"review_count\": b.get(\"review_count\"),\n            \"categories\": b.get(\"categories\"),\n            \"inside_photos\": grouped[bid][\"inside\"],\n            \"outside_photos\": grouped[bid][\"outside\"],\n        })\n\n    # Print results\n    # Note: Yelp photo table typically provides photo_id/label/caption; actual image files/URLs may be stored elsewhere.\n    print(f\"Found {len(final)} Metairie coffee shops with OutdoorSeating=True (showing inside/outside photo_ids).\\n\")\n    for item in final:\n        print(\"-\" * 80)\n        print(f\"{item['name']}  |  {item['address']}, {item['city']}, {item['state']} {item['postal_code']}\")\n        print(f\"Stars: {item['stars']}  Reviews: {item['review_count']}\")\n        print(f\"Categories: {item['categories']}\")\n        print(f\"Inside photos ({len(item['inside_photos'])}): {[p['photo_id'] for p in item['inside_photos'][:10]]}\")\n        print(f\"Outside photos ({len(item['outside_photos'])}): {[p['photo_id'] for p in item['outside_photos'][:10]]}\")\n\n\nif __name__ == \"__main__\":\n    try:\n        main()\n    except sqlite3.Error as e:\n        raise SystemExit(f\"SQLite error: {e}\")\n"
+    }
+  },
+  {
+    "index": 283,
+    "question": "Show Wilmington coffee shops rated >=4.5 and their indoor photos.",
+    "success": true,
+    "result": {
+      "analysis": "用户要找：Wilmington 城市中评分>=4.5的咖啡店（business信息来自SQLite的business.db），并展示这些店的室内照片（photo信息来自SQLite的photo.db，通常用photo.label='inside'标识室内）。这是一个跨两个SQLite库、通过business_id关联的关系型查询与结果合并问题，不需要向量检索或图查询。",
+      "natural_question": "Show Wilmington coffee shops rated >=4.5 and their indoor photos.",
+      "difficulty": "easy",
+      "query_types": [
+        "sql"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "sqlite:business.db (business table)"
+            ],
+            "filter_condition": {
+              "city": {
+                "=": "Wilmington"
+              },
+              "stars": {
+                ">=": 4.5
+              },
+              "categories": {
+                "LIKE": "%Coffee%"
+              }
+            }
+          },
+          "result_var": "biz_rows",
+          "description": {
+            "narrative": "从business库筛选出Wilmington且stars>=4.5并且类别包含Coffee的商家，返回business_id、name、stars、address等字段。",
+            "example_query": "SELECT business_id, name, stars, city, state, address, categories\nFROM business\nWHERE city = 'Wilmington'\n  AND stars >= 4.5\n  AND categories LIKE '%Coffee%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "sqlite:photo.db (photo table)"
+            ],
+            "filter_condition": {
+              "label": {
+                "=": "inside"
+              },
+              "business_id": {
+                "IN": "来自步骤1的business_id列表"
+              }
+            }
+          },
+          "result_var": "photo_rows",
+          "description": {
+            "narrative": "在photo库中查找这些商家的室内照片（label='inside'），取photo_id、business_id、caption、label。",
+            "example_query": "SELECT photo_id, business_id, caption, label\nFROM photo\nWHERE label = 'inside'\n  AND business_id IN ('id1','id2','id3');"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "python merge"
+            ],
+            "filter_condition": {}
+          },
+          "result_var": "final_result",
+          "description": {
+            "narrative": "用business_id把步骤1与步骤2的结果合并，按商家聚合出室内photo_id列表并输出。",
+            "example_query": "Python: group photos by business_id, then attach to business rows."
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nfrom typing import List, Dict, Any\n\n# ---- Required exact config (do not modify) ----\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nconfig = {\n    'milvus_collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    },\n    'milvus_host': 'localhost',\n    'milvus_port': '19530',\n    'neo4j_uri': 'bolt://localhost:7687',\n    'neo4j_auth': ('neo4j', 'password')\n}\n\n\ndef fetch_all(conn: sqlite3.Connection, query: str, params: tuple = ()) -> List[Dict[str, Any]]:\n    conn.row_factory = sqlite3.Row\n    cur = conn.cursor()\n    cur.execute(query, params)\n    rows = cur.fetchall()\n    return [dict(r) for r in rows]\n\n\ndef main(city: str = \"Wilmington\", min_stars: float = 4.5) -> List[Dict[str, Any]]:\n    # Step 1: businesses\n    biz_query = \"\"\"\n    SELECT business_id, name, stars, city, state, address, categories\n    FROM business\n    WHERE city = ?\n      AND stars >= ?\n      AND categories IS NOT NULL\n      AND categories LIKE '%Coffee%'\n    ORDER BY stars DESC, name ASC;\n    \"\"\"\n\n    # Step 2: photos (inside)\n    # We'll query photos using an IN (...) list built from step1 business_ids.\n    photo_base_query = \"\"\"\n    SELECT photo_id, business_id, caption, label\n    FROM photo\n    WHERE label = 'inside'\n      AND business_id IN ({placeholders})\n    ORDER BY business_id;\n    \"\"\"\n\n    try:\n        with sqlite3.connect(sqlite_paths[\"business\"]) as biz_conn:\n            biz_rows = fetch_all(biz_conn, biz_query, (city, min_stars))\n\n        if not biz_rows:\n            print(f\"No businesses found for city={city!r}, min_stars={min_stars}, categories LIKE '%Coffee%'.\")\n            return []\n\n        business_ids = [r[\"business_id\"] for r in biz_rows]\n\n        # Avoid SQLite parameter limit issues by chunking if needed\n        chunk_size = 800\n        photos_by_biz: Dict[str, List[Dict[str, Any]]] = {}\n\n        with sqlite3.connect(sqlite_paths[\"photo\"]) as photo_conn:\n            for i in range(0, len(business_ids), chunk_size):\n                chunk = business_ids[i:i + chunk_size]\n                placeholders = \",\".join([\"?\"] * len(chunk))\n                q = photo_base_query.format(placeholders=placeholders)\n                photo_rows = fetch_all(photo_conn, q, tuple(chunk))\n                for p in photo_rows:\n                    photos_by_biz.setdefault(p[\"business_id\"], []).append(p)\n\n        # Step 3: merge + output structure\n        final_result: List[Dict[str, Any]] = []\n        for b in biz_rows:\n            pid_list = [p[\"photo_id\"] for p in photos_by_biz.get(b[\"business_id\"], [])]\n            final_result.append({\n                \"business_id\": b[\"business_id\"],\n                \"name\": b[\"name\"],\n                \"stars\": b[\"stars\"],\n                \"address\": b.get(\"address\"),\n                \"city\": b.get(\"city\"),\n                \"state\": b.get(\"state\"),\n                \"categories\": b.get(\"categories\"),\n                \"indoor_photo_ids\": pid_list,\n                \"indoor_photo_count\": len(pid_list)\n            })\n\n        # Print a readable view\n        for item in final_result:\n            print(\"-\" * 80)\n            print(f\"{item['name']}  (stars={item['stars']})\")\n            print(f\"{item['address']}, {item['city']}, {item['state']}\")\n            print(f\"Indoor photos: {item['indoor_photo_count']}\")\n            if item[\"indoor_photo_ids\"]:\n                # show up to first 10 photo ids\n                print(\"Photo IDs (first 10):\", item[\"indoor_photo_ids\"][:10])\n            else:\n                print(\"Photo IDs: []\")\n\n        return final_result\n\n    except sqlite3.OperationalError as e:\n        raise RuntimeError(\n            \"SQLite operational error. Please verify DB paths and table names (business/photo).\"\n        ) from e\n\n\nif __name__ == \"__main__\":\n    main(city=\"Wilmington\", min_stars=4.5)\n"
+    }
+  },
+  {
+    "index": 284,
+    "question": "Find Wilmington coffee shops rated >=4.5 with outdoor seating and list the top 5 by check-ins since 2023-01-01.",
+    "success": true,
+    "result": {
+      "analysis": "该问题需要在SQLite中完成条件筛选（城市=Wilmingtion、咖啡店类别、评分>=4.5、带OutdoorSeating属性），再结合checkin数据统计从2023-01-01起的签到次数，并按次数排序取Top5。主要难点在于Yelp的checkin通常以逗号分隔的时间戳字符串存储，需要在Python侧解析并计数（比在SQLite里做字符串拆分更稳妥）。",
+      "natural_question": "查找Wilmington评分>=4.5且提供户外座位(Outdoor Seating)的咖啡店，并按自2023-01-01以来的签到次数排序，列出前5名。",
+      "difficulty": "medium",
+      "query_types": [
+        "sql"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "SQLite.business (business.db)"
+            ],
+            "filter_condition": {
+              "city": {
+                "=": "Wilmington"
+              },
+              "stars": {
+                ">=": 4.5
+              },
+              "categories": {
+                "LIKE": "%Coffee%"
+              },
+              "attributes": {
+                "CONTAINS": "OutdoorSeating=True"
+              }
+            }
+          },
+          "result_var": "biz_rows",
+          "description": {
+            "narrative": "从business库筛选出Wilmington的咖啡店，评分>=4.5，并在attributes中包含OutdoorSeating为True的记录。",
+            "example_query": "SELECT business_id, name, address, city, state, postal_code, stars, review_count, categories, attributes\nFROM business\nWHERE city = 'Wilmington'\n  AND stars >= 4.5\n  AND categories LIKE '%Coffee%'\n  AND (\n    attributes LIKE '%\"OutdoorSeating\": \"True\"%'\n    OR attributes LIKE '%\"OutdoorSeating\":\"True\"%'\n    OR attributes LIKE '%OutdoorSeating%True%'\n  );"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "SQLite.checkin (checkin.db)"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "IN": "biz_rows.business_id"
+              }
+            }
+          },
+          "result_var": "checkin_rows",
+          "description": {
+            "narrative": "在checkin库中取回这些business_id对应的签到时间字段（通常为逗号分隔的时间戳字符串）。",
+            "example_query": "SELECT business_id, date\nFROM checkin\nWHERE business_id IN (?,?,...);"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "Python processing"
+            ],
+            "filter_condition": {
+              "checkin_datetime": {
+                ">=": "2023-01-01"
+              }
+            }
+          },
+          "result_var": "top5",
+          "description": {
+            "narrative": "用Python解析每条checkin.date中的时间戳列表，统计>=2023-01-01的签到次数；与商户信息合并后按签到数降序排序取前5。",
+            "example_query": "Python: parse date string -> split(',') -> datetime.strptime -> count(dt >= threshold)"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nfrom datetime import datetime\nfrom typing import Dict, List, Tuple\n\n\ndef chunked(seq, size):\n    for i in range(0, len(seq), size):\n        yield seq[i:i + size]\n\n\ndef parse_checkin_count_since(date_str: str, threshold: datetime) -> int:\n    \"\"\"Parse Yelp checkin date field (often comma-separated timestamps) and count checkins >= threshold.\"\"\"\n    if not date_str:\n        return 0\n    # Typical format: \"2018-06-01 18:00:00, 2018-06-02 19:00:00\"\n    parts = [p.strip() for p in date_str.split(',') if p.strip()]\n    cnt = 0\n    for p in parts:\n        try:\n            dt = datetime.strptime(p, \"%Y-%m-%d %H:%M:%S\")\n            if dt >= threshold:\n                cnt += 1\n        except ValueError:\n            # If any unexpected format appears, ignore that timestamp\n            continue\n    return cnt\n\n\ndef main():\n    # Required exact configuration\n    sqlite_paths = {\n        \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n        \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n        \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n        \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n        \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n        \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n    }\n\n    milvus_config = {\n        'milvus_collections': {\n            'reviews': 'reviews',\n            'photos': 'photo_vector',\n            'tips': 'milvus_tip'\n        },\n        'milvus_host': 'localhost',\n        'milvus_port': '19530',\n    }\n\n    neo4j_config = {\n        'neo4j_uri': 'bolt://localhost:7687',\n        'neo4j_auth': ('neo4j', 'password')\n    }\n\n    # Query parameters\n    city = \"Wilmington\"\n    min_stars = 4.5\n    since = datetime(2023, 1, 1)\n\n    # Connect to SQLite DBs\n    biz_conn = sqlite3.connect(sqlite_paths[\"business\"])\n    chk_conn = sqlite3.connect(sqlite_paths[\"checkin\"])\n    biz_conn.row_factory = sqlite3.Row\n    chk_conn.row_factory = sqlite3.Row\n\n    try:\n        # Step 1: filter businesses\n        # Note: attributes often stored as JSON-ish text; we use LIKE patterns to detect OutdoorSeating=True\n        biz_sql = \"\"\"\n        SELECT business_id, name, address, city, state, postal_code, stars, review_count, categories, attributes\n        FROM business\n        WHERE city = ?\n          AND stars >= ?\n          AND categories LIKE ?\n          AND (\n            attributes LIKE '%\"OutdoorSeating\": \"True\"%'\n            OR attributes LIKE '%\"OutdoorSeating\":\"True\"%'\n            OR attributes LIKE '%OutdoorSeating%True%'\n          )\n        \"\"\"\n        biz_params = (city, min_stars, \"%Coffee%\")\n        biz_rows = biz_conn.execute(biz_sql, biz_params).fetchall()\n\n        if not biz_rows:\n            print(\"No matching coffee shops found for the given criteria.\")\n            return\n\n        biz_by_id: Dict[str, sqlite3.Row] = {r[\"business_id\"]: r for r in biz_rows}\n        biz_ids = list(biz_by_id.keys())\n\n        # Step 2: fetch checkin rows for those businesses\n        # Yelp checkin table is commonly: (business_id TEXT PRIMARY KEY, date TEXT)\n        checkins_by_id: Dict[str, str] = {}\n        placeholders_limit = 900  # safe chunk size for SQLite parameter limits\n        chk_sql_template = \"SELECT business_id, date FROM checkin WHERE business_id IN ({})\"\n\n        for ids_chunk in chunked(biz_ids, placeholders_limit):\n            ph = \",\".join([\"?\"] * len(ids_chunk))\n            chk_sql = chk_sql_template.format(ph)\n            for row in chk_conn.execute(chk_sql, ids_chunk).fetchall():\n                checkins_by_id[row[\"business_id\"]] = row[\"date\"]\n\n        # Step 3: parse and count since date, merge, rank\n        results: List[Tuple[int, sqlite3.Row]] = []  # (checkin_count, biz_row)\n        for bid, brow in biz_by_id.items():\n            date_str = checkins_by_id.get(bid, \"\")\n            cnt = parse_checkin_count_since(date_str, since)\n            results.append((cnt, brow))\n\n        results.sort(key=lambda x: x[0], reverse=True)\n        top5 = results[:5]\n\n        # Output\n        print(f\"Top 5 Wilmington coffee shops (stars >= {min_stars}) with Outdoor Seating by check-ins since {since.date()}\\n\")\n        for rank, (cnt, brow) in enumerate(top5, start=1):\n            name = brow[\"name\"]\n            stars = brow[\"stars\"]\n            addr = \" \".join([str(brow.get(\"address\", \"\")) or \"\", str(brow.get(\"city\", \"\")) or \"\", str(brow.get(\"state\", \"\")) or \"\", str(brow.get(\"postal_code\", \"\")) or \"\"]).strip()\n            review_count = brow[\"review_count\"]\n            print(f\"{rank}. {name} | stars={stars} | reviews={review_count} | checkins_since_2023_01_01={cnt}\")\n            print(f\"   {addr}\")\n\n    finally:\n        biz_conn.close()\n        chk_conn.close()\n\n\nif __name__ == \"__main__\":\n    main()\n"
+    }
+  },
+  {
+    "index": 285,
+    "question": "Find Wilmington pizza places rated >=4.0 with over 150 reviews and count check-ins since 2023-01-01.",
+    "success": true,
+    "result": {
+      "analysis": "该问题是一个跨表（跨库）聚合查询：先在SQLite的business库中按城市/类别/评分/评论数筛选披萨店，再到SQLite的checkin库中按business_id取出checkin.date（通常为逗号分隔的时间戳字符串），在Python中解析并统计自2023-01-01以来的打卡次数。难点在于checkin日期字段的存储格式需要在应用层拆分统计。",
+      "natural_question": "查找Wilmington评分>=4.0且评论数>150的披萨店，并统计每家店自2023-01-01以来的check-in次数。",
+      "difficulty": "medium",
+      "query_types": [
+        "sql"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "sqlite:business.db (business表)"
+            ],
+            "filter_condition": {
+              "city": {
+                "=": "Wilmington"
+              },
+              "stars": {
+                ">=": 4.0
+              },
+              "review_count": {
+                ">": 150
+              },
+              "categories": {
+                "LIKE": "%Pizza%"
+              }
+            }
+          },
+          "result_var": "biz_rows",
+          "description": {
+            "narrative": "从business表筛选Wilmington的披萨店（categories包含Pizza），并满足stars>=4.0且review_count>150，取出business_id、name、stars、review_count、address等字段。",
+            "example_query": "SELECT business_id, name, stars, review_count, address, city, state, categories FROM business WHERE city = 'Wilmington' AND stars >= 4.0 AND review_count > 150 AND categories LIKE '%Pizza%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "sqlite:checkin.db (checkin表)"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "IN": "步骤1返回的business_id列表"
+              }
+            }
+          },
+          "result_var": "checkin_rows",
+          "description": {
+            "narrative": "在checkin表中取出这些business_id对应的date字段（通常为逗号分隔的日期时间列表）。",
+            "example_query": "SELECT business_id, date FROM checkin WHERE business_id IN ('id1','id2','id3');"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "python处理"
+            ],
+            "filter_condition": {
+              "checkin_datetime": {
+                ">=": "2023-01-01"
+              }
+            }
+          },
+          "result_var": "final_results",
+          "description": {
+            "narrative": "将每行checkin.date按逗号拆分为时间戳，解析为datetime，统计>=2023-01-01的条目数量，输出每家店的checkin_count_since_2023_01_01。",
+            "example_query": "（Python）sum(dt >= datetime(2023,1,1) for dt in parsed_datetimes)"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nfrom datetime import datetime\nfrom typing import Dict, List, Any, Tuple\n\n# -------------------------------\n# Fixed configuration (as required)\n# -------------------------------\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nmilvus_config = {\n    'milvus_collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    },\n    'milvus_host': 'localhost',\n    'milvus_port': '19530',\n}\n\nneo4j_config = {\n    'neo4j_uri': 'bolt://localhost:7687',\n    'neo4j_auth': ('neo4j', 'password')\n}\n\n\ndef fetch_all(conn: sqlite3.Connection, query: str, params: Tuple = ()) -> List[sqlite3.Row]:\n    conn.row_factory = sqlite3.Row\n    cur = conn.cursor()\n    cur.execute(query, params)\n    return cur.fetchall()\n\n\ndef parse_checkin_dates(date_field: str) -> List[datetime]:\n    \"\"\"Parse Yelp checkin.date field.\n\n    Common format in Yelp dataset: 'YYYY-MM-DD HH:MM:SS,YYYY-MM-DD HH:MM:SS,...'\n    \"\"\"\n    if not date_field:\n        return []\n    parts = [p.strip() for p in date_field.split(',') if p.strip()]\n    out = []\n    for p in parts:\n        # Be defensive: try a couple of common formats\n        for fmt in (\"%Y-%m-%d %H:%M:%S\", \"%Y-%m-%d %H:%M\"):\n            try:\n                out.append(datetime.strptime(p, fmt))\n                break\n            except ValueError:\n                continue\n        else:\n            # If no format matched, skip this token\n            continue\n    return out\n\n\ndef main():\n    city = \"Wilmington\"\n    min_stars = 4.0\n    min_review_count = 150\n    category_keyword = \"Pizza\"\n    since_dt = datetime(2023, 1, 1)\n\n    # -------------------------------\n    # Step 1: filter businesses in business.db\n    # -------------------------------\n    biz_query = \"\"\"\n        SELECT business_id, name, stars, review_count, address, city, state, categories\n        FROM business\n        WHERE city = ?\n          AND stars >= ?\n          AND review_count > ?\n          AND categories LIKE ?\n    \"\"\"\n\n    try:\n        with sqlite3.connect(sqlite_paths[\"business\"]) as biz_conn:\n            biz_rows = fetch_all(\n                biz_conn,\n                biz_query,\n                (city, min_stars, min_review_count, f\"%{category_keyword}%\")\n            )\n    except Exception as e:\n        raise RuntimeError(f\"Failed querying business.db: {e}\")\n\n    if not biz_rows:\n        print(\"No matching businesses found.\")\n        return\n\n    biz_by_id: Dict[str, Dict[str, Any]] = {}\n    biz_ids: List[str] = []\n    for r in biz_rows:\n        biz_ids.append(r[\"business_id\"])\n        biz_by_id[r[\"business_id\"]] = {\n            \"business_id\": r[\"business_id\"],\n            \"name\": r[\"name\"],\n            \"stars\": r[\"stars\"],\n            \"review_count\": r[\"review_count\"],\n            \"address\": r[\"address\"],\n            \"city\": r[\"city\"],\n            \"state\": r[\"state\"],\n            \"categories\": r[\"categories\"],\n        }\n\n    # -------------------------------\n    # Step 2: fetch checkins from checkin.db for those business_ids\n    # -------------------------------\n    # Use chunking to avoid SQLite parameter limits for very large lists\n    def chunks(lst, n=900):\n        for i in range(0, len(lst), n):\n            yield lst[i:i+n]\n\n    checkin_map: Dict[str, str] = {}  # business_id -> date_field\n\n    try:\n        with sqlite3.connect(sqlite_paths[\"checkin\"]) as chk_conn:\n            for ch in chunks(biz_ids):\n                placeholders = \",\".join([\"?\"] * len(ch))\n                chk_query = f\"SELECT business_id, date FROM checkin WHERE business_id IN ({placeholders})\"\n                rows = fetch_all(chk_conn, chk_query, tuple(ch))\n                for rr in rows:\n                    checkin_map[rr[\"business_id\"]] = rr[\"date\"]\n    except Exception as e:\n        raise RuntimeError(f\"Failed querying checkin.db: {e}\")\n\n    # -------------------------------\n    # Step 3: parse and count check-ins since 2023-01-01\n    # -------------------------------\n    results = []\n    for bid, biz in biz_by_id.items():\n        date_field = checkin_map.get(bid, \"\")\n        dts = parse_checkin_dates(date_field)\n        cnt_since = sum(1 for dt in dts if dt >= since_dt)\n        results.append({\n            **biz,\n            \"checkin_count_since_2023_01_01\": cnt_since\n        })\n\n    # Sort: most checkins since date, then stars, then review_count\n    results.sort(key=lambda x: (x[\"checkin_count_since_2023_01_01\"], x[\"stars\"], x[\"review_count\"]), reverse=True)\n\n    # Print output\n    print(f\"Found {len(results)} Wilmington pizza places with stars>={min_stars} and review_count>{min_review_count}.\")\n    print(\"\\nTop results (sorted by check-ins since 2023-01-01):\")\n    for r in results:\n        print(\n            f\"- {r['name']} | {r['stars']} stars | {r['review_count']} reviews | \"\n            f\"checkins_since_2023_01_01={r['checkin_count_since_2023_01_01']} | \"\n            f\"{r['address']}, {r['city']}, {r['state']}\"\n        )\n\n\nif __name__ == \"__main__\":\n    main()\n"
+    }
+  },
+  {
+    "index": 286,
+    "question": "Find Clearwater bars rated >=4.0 with reviews mentioning great atmosphere or comfortable/cozy, and show those review texts.",
+    "success": true,
+    "result": {
+      "analysis": "需求是从Yelp多库架构中筛选：位于Clearwater、类别包含Bars、business星级>=4.0 的商家；并进一步找出这些商家的review文本中提到“great atmosphere”或“comfortable/cozy”的评论，并输出评论文本。此问题可完全用SQLite完成：business表用于城市/类别/星级过滤，review表用于文本匹配与输出。实现上可在review.db连接中ATTACH business.db，然后跨库JOIN查询。",
+      "natural_question": "查找Clearwater中评分>=4.0的酒吧（Bars），并展示那些评论里提到“great atmosphere”或“comfortable/cozy”的评论文本。",
+      "difficulty": "easy",
+      "query_types": [
+        "sql"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "SQLite: review.db",
+              "SQLite: business.db"
+            ],
+            "filter_condition": {
+              "business.city": {
+                "=": "Clearwater"
+              },
+              "business.stars": {
+                ">=": 4.0
+              },
+              "business.categories": {
+                "LIKE": "%Bars%"
+              }
+            }
+          },
+          "result_var": "conn",
+          "description": {
+            "narrative": "连接review.db，并将business.db以ATTACH方式挂载到同一连接中，便于跨库JOIN business与review。",
+            "example_query": "ATTACH DATABASE 'D:/Yelp-JSON/db/sqlite3/business.db' AS businessdb;"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "SQLite: businessdb.business",
+              "SQLite: main.review"
+            ],
+            "filter_condition": {
+              "review.text": {
+                "OR_LIKE(lower)": [
+                  "%great atmosphere%",
+                  "%comfortable%",
+                  "%cozy%",
+                  "%cosy%"
+                ]
+              }
+            }
+          },
+          "result_var": "rows",
+          "description": {
+            "narrative": "跨库JOIN查询：筛选Clearwater中Bars且商家星级>=4.0；再在review文本中匹配关键词（great atmosphere / comfortable / cozy/cosy），返回商家信息与对应review文本。",
+            "example_query": "SELECT b.business_id, b.name, b.stars AS business_stars, r.review_id, r.date, r.stars AS review_stars, r.text\nFROM businessdb.business b\nJOIN main.review r ON r.business_id = b.business_id\nWHERE b.city = 'Clearwater'\n  AND b.stars >= 4.0\n  AND COALESCE(b.categories,'') LIKE '%Bars%'\n  AND (\n    lower(r.text) LIKE '%great atmosphere%'\n    OR lower(r.text) LIKE '%comfortable%'\n    OR lower(r.text) LIKE '%cozy%'\n    OR lower(r.text) LIKE '%cosy%'\n  )\nORDER BY b.stars DESC, r.date DESC\nLIMIT 200;"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nfrom typing import List, Dict, Any\n\n# ---- Required exact configuration ----\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nconfig = {\n    'milvus_collections': {\n        'reviews': 'reviews',  # review的text存储成向量在reviews这个collection里面\n        'photos': 'photo_vector',  # photo存储在photo_vector里面\n        'tips': 'milvus_tip'  # tip的text存储在milvus_tip这个collection里面\n    },\n    'milvus_host': 'localhost',\n    'milvus_port': '19530',\n    'neo4j_uri': 'bolt://localhost:7687',\n    'neo4j_auth': ('neo4j', 'password')\n}\n\n\ndef table_exists(conn: sqlite3.Connection, table_name: str, schema: str = 'main') -> bool:\n    q = f\"SELECT 1 FROM {schema}.sqlite_master WHERE type='table' AND name=? LIMIT 1\"\n    return conn.execute(q, (table_name,)).fetchone() is not None\n\n\ndef run_query_clearwater_bars_reviews(limit: int = 200) -> List[Dict[str, Any]]:\n    review_db = sqlite_paths[\"review\"]\n    business_db = sqlite_paths[\"business\"]\n\n    conn = sqlite3.connect(review_db)\n    conn.row_factory = sqlite3.Row\n\n    try:\n        # Attach business DB for cross-db joins\n        conn.execute(\"ATTACH DATABASE ? AS businessdb\", (business_db,))\n\n        # Basic sanity checks (adjust here if your table names differ)\n        if not table_exists(conn, \"review\", \"main\"):\n            raise RuntimeError(\"Table 'review' not found in review.db (main schema).\")\n        if not table_exists(conn, \"business\", \"businessdb\"):\n            raise RuntimeError(\"Table 'business' not found in business.db (businessdb schema).\")\n\n        sql = \"\"\"\n        SELECT\n            b.business_id,\n            b.name,\n            b.city,\n            b.stars AS business_stars,\n            b.categories,\n            r.review_id,\n            r.date,\n            r.stars AS review_stars,\n            r.text\n        FROM businessdb.business b\n        JOIN main.review r\n          ON r.business_id = b.business_id\n        WHERE b.city = ?\n          AND b.stars >= ?\n          AND COALESCE(b.categories, '') LIKE ?\n          AND (\n            lower(r.text) LIKE ?\n            OR lower(r.text) LIKE ?\n            OR lower(r.text) LIKE ?\n            OR lower(r.text) LIKE ?\n          )\n        ORDER BY b.stars DESC, r.date DESC\n        LIMIT ?;\n        \"\"\"\n\n        params = (\n            \"Clearwater\",\n            4.0,\n            \"%Bars%\",\n            \"%great atmosphere%\",\n            \"%comfortable%\",\n            \"%cozy%\",\n            \"%cosy%\",\n            int(limit)\n        )\n\n        rows = conn.execute(sql, params).fetchall()\n        return [dict(row) for row in rows]\n\n    finally:\n        try:\n            conn.execute(\"DETACH DATABASE businessdb\")\n        except Exception:\n            pass\n        conn.close()\n\n\nif __name__ == \"__main__\":\n    results = run_query_clearwater_bars_reviews(limit=200)\n\n    print(f\"Found {len(results)} matching reviews.\\n\")\n\n    # Print in a readable way\n    for i, r in enumerate(results, 1):\n        print(\"=\" * 100)\n        print(f\"{i}. {r.get('name')}  | business_stars={r.get('business_stars')} | city={r.get('city')}\")\n        print(f\"   categories: {r.get('categories')}\")\n        print(f\"   review_id: {r.get('review_id')} | review_stars={r.get('review_stars')} | date={r.get('date')}\")\n        print(\"--- review text ---\")\n        print(r.get('text', ''))\n        print()\n"
+    }
+  },
+  {
+    "index": 287,
+    "question": "Show Franklin coffee shops with outdoor seating and free WiFi and their indoor and drink photos.",
+    "success": true,
+    "result": {
+      "analysis": "用户想找位于“Franklin”的咖啡店（coffee shops），并且要求属性同时满足：OutdoorSeating=True（可户外座位）以及 WiFi=free（免费WiFi），然后列出这些店的“inside(室内)”与“drink(饮品)”两类照片。该问题主要是关系型过滤查询（business表按城市/类别筛选 + attributes字段解析过滤）并跨库关联到photo表按label取图；如Milvus中存有图片向量库，可补充查询photo_id对应的额外元数据（如路径/URI字段，取决于collection schema）。整体为中等难度：关键点在于Yelp attributes在SQLite中常以JSON或类似dict字符串存储，需要健壮解析。",
+      "natural_question": "展示Franklin的咖啡店，要求有户外座位且提供免费WiFi，并列出这些店的室内(inside)和饮品(drink)照片。",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "SQLite: business.db / table business"
+            ],
+            "filter_condition": {
+              "city": {
+                "=": "Franklin"
+              },
+              "categories": {
+                "LIKE": "%Coffee%"
+              }
+            }
+          },
+          "result_var": "biz_rows",
+          "description": {
+            "narrative": "从business.db中初筛Franklin城市下的咖啡相关商家（通过categories模糊匹配）。取出business_id、name、city、state、categories、attributes等字段，为下一步属性解析做准备。",
+            "example_query": "SELECT business_id, name, city, state, categories, attributes, stars, review_count\nFROM business\nWHERE city = 'Franklin'\n  AND categories LIKE '%Coffee%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "Python属性解析/过滤"
+            ],
+            "filter_condition": {
+              "attributes.OutdoorSeating": {
+                "=": true
+              },
+              "attributes.WiFi": {
+                "=": "free"
+              }
+            }
+          },
+          "result_var": "filtered_biz",
+          "description": {
+            "narrative": "对attributes字段做健壮解析（可能是JSON字符串或python dict风格字符串），提取OutdoorSeating与WiFi字段，保留OutdoorSeating为True且WiFi为free的商家。",
+            "example_query": "（Python伪代码）\nattrs = parse(attributes)\nif truthy(attrs['OutdoorSeating']) and normalize_wifi(attrs['WiFi']) == 'free': keep"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "SQLite: photo.db / table photo"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "IN": "filtered_biz.business_id"
+              },
+              "label": {
+                "IN": [
+                  "inside",
+                  "drink"
+                ]
+              }
+            }
+          },
+          "result_var": "photo_rows",
+          "description": {
+            "narrative": "用上一步得到的business_id集合去photo.db取对应照片元数据，只保留label为inside与drink两类。按business分组后输出。",
+            "example_query": "SELECT photo_id, business_id, label, caption\nFROM photo\nWHERE business_id IN ('id1','id2',...)\n  AND label IN ('inside','drink');"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "Milvus: photo_vector collection"
+            ],
+            "filter_condition": {
+              "photo_id": {
+                "IN": "photo_rows.photo_id"
+              }
+            }
+          },
+          "result_var": "milvus_photo_meta",
+          "description": {
+            "narrative": "（可选增强）如果Milvus的photo_vector collection里除了向量外还存了photo_id对应的路径/URI等字段，可按photo_id回查并补充到输出中。由于不同实现schema可能不同，本步骤会先读取collection schema并仅在存在对应字段时查询。",
+            "example_query": "（Milvus伪代码）\ncollection.query(expr=\"photo_id in [..]\", output_fields=[\"photo_id\",\"image_path\"])"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport json\nimport ast\nfrom collections import defaultdict\nfrom typing import Any, Dict, List, Optional, Tuple\n\n# Milvus\nfrom pymilvus import connections, Collection, utility\n\n\n# =========================\n# Fixed configuration (as required)\n# =========================\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nmilvus_config = {\n    'milvus_collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    },\n    'milvus_host': 'localhost',\n    'milvus_port': '19530',\n}\n\nneo4j_config = {\n    'neo4j_uri': 'bolt://localhost:7687',\n    'neo4j_auth': ('neo4j', 'password')\n}\n\n\n# =========================\n# Helpers\n# =========================\ndef parse_attributes(raw: Any) -> Dict[str, Any]:\n    \"\"\"Parse Yelp 'attributes' field robustly.\n\n    Common cases:\n    - NULL/None\n    - JSON string (double quotes)\n    - Python dict-like string (single quotes)\n    - Already a dict\n    \"\"\"\n    if raw is None:\n        return {}\n    if isinstance(raw, dict):\n        return raw\n\n    s = str(raw).strip()\n    if not s or s.lower() == 'none' or s.lower() == 'null':\n        return {}\n\n    # Try JSON\n    try:\n        return json.loads(s)\n    except Exception:\n        pass\n\n    # Try python literal (handles single quotes dict)\n    try:\n        val = ast.literal_eval(s)\n        if isinstance(val, dict):\n            return val\n    except Exception:\n        pass\n\n    return {}\n\n\ndef truthy(v: Any) -> bool:\n    if v is True:\n        return True\n    if v is False or v is None:\n        return False\n    if isinstance(v, (int, float)):\n        return v != 0\n    if isinstance(v, str):\n        x = v.strip().lower()\n        return x in {\"true\", \"1\", \"yes\", \"y\"}\n    return False\n\n\ndef normalize_wifi(v: Any) -> Optional[str]:\n    if v is None:\n        return None\n    if isinstance(v, str):\n        x = v.strip().lower()\n        # Yelp sometimes stores as 'free', 'paid', 'no' or 'u' variants\n        return x\n    return str(v).strip().lower()\n\n\ndef chunked(lst: List[Any], n: int) -> List[List[Any]]:\n    return [lst[i:i+n] for i in range(0, len(lst), n)]\n\n\n# =========================\n# Step 1-3: SQLite queries\n# =========================\ndef fetch_franklin_coffee_candidates() -> List[Tuple]:\n    \"\"\"Return rows: (business_id, name, city, state, categories, attributes, stars, review_count).\"\"\"\n    conn = sqlite3.connect(sqlite_paths[\"business\"])\n    try:\n        cur = conn.cursor()\n        # Broad coffee match; you can expand patterns if needed\n        sql = \"\"\"\n        SELECT business_id, name, city, state, categories, attributes, stars, review_count\n        FROM business\n        WHERE city = ?\n          AND categories LIKE ?\n        \"\"\"\n        cur.execute(sql, (\"Franklin\", \"%Coffee%\"))\n        return cur.fetchall()\n    finally:\n        conn.close()\n\n\ndef filter_by_outdoor_and_free_wifi(biz_rows: List[Tuple]) -> List[Dict[str, Any]]:\n    filtered = []\n    for (business_id, name, city, state, categories, attributes, stars, review_count) in biz_rows:\n        attrs = parse_attributes(attributes)\n        outdoor = attrs.get(\"OutdoorSeating\")\n        wifi = attrs.get(\"WiFi\")\n\n        if truthy(outdoor) and normalize_wifi(wifi) == \"free\":\n            filtered.append({\n                \"business_id\": business_id,\n                \"name\": name,\n                \"city\": city,\n                \"state\": state,\n                \"categories\": categories,\n                \"stars\": stars,\n                \"review_count\": review_count,\n                \"attributes\": attrs,\n            })\n    return filtered\n\n\ndef fetch_inside_and_drink_photos(business_ids: List[str]) -> List[Tuple]:\n    \"\"\"Return rows: (photo_id, business_id, label, caption).\"\"\"\n    if not business_ids:\n        return []\n\n    conn = sqlite3.connect(sqlite_paths[\"photo\"])\n    try:\n        cur = conn.cursor()\n\n        # Avoid SQLite parameter limit issues by chunking\n        out = []\n        for ids in chunked(business_ids, 900):\n            placeholders = \",\".join([\"?\"] * len(ids))\n            sql = f\"\"\"\n            SELECT photo_id, business_id, label, caption\n            FROM photo\n            WHERE business_id IN ({placeholders})\n              AND label IN ('inside','drink')\n            \"\"\"\n            cur.execute(sql, ids)\n            out.extend(cur.fetchall())\n        return out\n    finally:\n        conn.close()\n\n\n# =========================\n# Step 4: (Optional) Milvus enrich\n# =========================\ndef try_enrich_photos_from_milvus(photo_ids: List[str]) -> Dict[str, Dict[str, Any]]:\n    \"\"\"Attempt to fetch extra fields for each photo_id from Milvus 'photo_vector' collection.\n\n    Returns mapping: photo_id -> extra_fields\n    If Milvus/collection/fields not available, returns empty dict.\n    \"\"\"\n    if not photo_ids:\n        return {}\n\n    collection_name = milvus_config['milvus_collections']['photos']\n\n    try:\n        connections.connect(alias=\"default\", host=milvus_config['milvus_host'], port=milvus_config['milvus_port'])\n    except Exception:\n        return {}\n\n    try:\n        if not utility.has_collection(collection_name):\n            return {}\n\n        col = Collection(collection_name)\n        schema_fields = [f.name for f in col.schema.fields]\n\n        # Determine the id field name. Common choices: 'photo_id', 'id', or primary key.\n        # We'll prefer 'photo_id' if present.\n        if \"photo_id\" in schema_fields:\n            id_field = \"photo_id\"\n        else:\n            # Fallback to primary key field if any\n            pk_fields = [f.name for f in col.schema.fields if getattr(f, \"is_primary\", False)]\n            id_field = pk_fields[0] if pk_fields else None\n\n        if not id_field:\n            return {}\n\n        # Output fields to attempt (only those that exist)\n        candidate_fields = [\n            \"photo_id\", \"business_id\", \"image_path\", \"path\", \"uri\", \"url\", \"caption\", \"label\"\n        ]\n        output_fields = [f for f in candidate_fields if f in schema_fields and f != \"embedding\"]\n\n        if not output_fields:\n            return {}\n\n        # Query in chunks\n        enriched: Dict[str, Dict[str, Any]] = {}\n        for ids in chunked(photo_ids, 200):\n            # Milvus expr expects string quotes for varchar fields\n            quoted = \",\".join([f'\"{x}\"' for x in ids])\n            expr = f\"{id_field} in [{quoted}]\"\n            rows = col.query(expr=expr, output_fields=output_fields)\n            for r in rows:\n                pid = r.get(\"photo_id\") or r.get(id_field)\n                if pid is not None:\n                    enriched[str(pid)] = r\n        return enriched\n\n    except Exception:\n        return {}\n\n\n# =========================\n# Main execution\n# =========================\ndef main(limit_businesses: Optional[int] = None, limit_photos_per_label: int = 5):\n    # Step 1\n    biz_rows = fetch_franklin_coffee_candidates()\n\n    # Step 2\n    filtered_biz = filter_by_outdoor_and_free_wifi(biz_rows)\n\n    if limit_businesses is not None:\n        filtered_biz = filtered_biz[:limit_businesses]\n\n    business_ids = [b[\"business_id\"] for b in filtered_biz]\n\n    # Step 3\n    photo_rows = fetch_inside_and_drink_photos(business_ids)\n\n    # Group photos by business_id + label\n    photos_by_biz: Dict[str, Dict[str, List[Dict[str, Any]]]] = defaultdict(lambda: {\"inside\": [], \"drink\": []})\n    all_photo_ids = []\n    for (photo_id, business_id, label, caption) in photo_rows:\n        all_photo_ids.append(str(photo_id))\n        label_norm = (label or \"\").strip().lower()\n        if label_norm not in (\"inside\", \"drink\"):\n            continue\n        photos_by_biz[business_id][label_norm].append({\n            \"photo_id\": str(photo_id),\n            \"label\": label_norm,\n            \"caption\": caption\n        })\n\n    # Optional Step 4: try enrich from Milvus\n    milvus_enrich = try_enrich_photos_from_milvus(all_photo_ids)\n    if milvus_enrich:\n        for biz_id, buckets in photos_by_biz.items():\n            for label in (\"inside\", \"drink\"):\n                for p in buckets[label]:\n                    extra = milvus_enrich.get(p[\"photo_id\"])\n                    if extra:\n                        # Attach only non-null extra fields\n                        p[\"milvus\"] = {k: v for k, v in extra.items() if v is not None}\n\n    # Build final output\n    results = []\n    for b in filtered_biz:\n        biz_id = b[\"business_id\"]\n        inside = photos_by_biz[biz_id][\"inside\"][:limit_photos_per_label]\n        drink = photos_by_biz[biz_id][\"drink\"][:limit_photos_per_label]\n        results.append({\n            \"business_id\": biz_id,\n            \"name\": b[\"name\"],\n            \"city\": b[\"city\"],\n            \"state\": b[\"state\"],\n            \"stars\": b[\"stars\"],\n            \"review_count\": b[\"review_count\"],\n            \"categories\": b[\"categories\"],\n            \"requirements\": {\n                \"OutdoorSeating\": True,\n                \"WiFi\": \"free\"\n            },\n            \"photos\": {\n                \"inside\": inside,\n                \"drink\": drink\n            }\n        })\n\n    # Print as JSON\n    print(json.dumps({\n        \"query_city\": \"Franklin\",\n        \"category_match\": \"%Coffee%\",\n        \"matched_business_count\": len(results),\n        \"businesses\": results\n    }, ensure_ascii=False, indent=2))\n\n\nif __name__ == \"__main__\":\n    # You can tweak limits for faster iteration.\n    main(limit_businesses=None, limit_photos_per_label=5)\n"
+    }
+  },
+  {
+    "index": 288,
+    "question": "For Wilmington coffee shops or tea rooms rated >=4.5 with >150 reviews, show check-in counts since 2023-01-01.",
+    "success": true,
+    "result": {
+      "analysis": "问题意图：筛选出位于Wilmington、评分>=4.5且review_count>150的咖啡店/茶室（基于business表的categories），并统计这些商家自2023-01-01以来的check-in次数。数据来源需要跨两个SQLite库：business.db（商家属性筛选）+ checkin.db（check-in日期明细）。难点在于Yelp checkin的date字段通常是“逗号分隔的时间戳字符串”，需要在Python里拆分并按日期阈值计数。",
+      "natural_question": "For Wilmington coffee shops or tea rooms rated >=4.5 with >150 reviews, show check-in counts since 2023-01-01.",
+      "difficulty": "medium",
+      "query_types": [
+        "sql"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "sqlite:business.db (business table)"
+            ],
+            "filter_condition": {
+              "city": {
+                "=": "Wilmington"
+              },
+              "stars": {
+                ">=": 4.5
+              },
+              "review_count": {
+                ">": 150
+              },
+              "categories": {
+                "contains_any(case-insensitive)": [
+                  "Coffee & Tea",
+                  "Tea Rooms",
+                  "Coffee Shops"
+                ]
+              }
+            }
+          },
+          "result_var": "biz_rows",
+          "description": {
+            "narrative": "在business库中筛选Wilmington的高评分高评论数、且类别包含咖啡/茶相关的商家，取出business_id以及展示所需字段。",
+            "example_query": "SELECT business_id, name, city, state, stars, review_count, categories\nFROM business\nWHERE city = 'Wilmington'\n  AND stars >= 4.5\n  AND review_count > 150\n  AND (\n    lower(categories) LIKE '%coffee%tea%'\n    OR lower(categories) LIKE '%tea rooms%'\n    OR lower(categories) LIKE '%coffee shops%'\n    OR lower(categories) LIKE '%coffee%'\n    OR lower(categories) LIKE '%tea%'\n  );"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "sqlite:checkin.db (checkin table)"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "biz_rows.business_id"
+              }
+            }
+          },
+          "result_var": "checkin_rows",
+          "description": {
+            "narrative": "在checkin库中取回这些business_id对应的checkin记录（通常包含一个date字段，里面是逗号分隔的时间戳）。",
+            "example_query": "SELECT business_id, date\nFROM checkin\nWHERE business_id IN (?,?,...);"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "python"
+            ],
+            "filter_condition": {
+              "start_date": {
+                ">=": "2023-01-01"
+              }
+            }
+          },
+          "result_var": "result_table",
+          "description": {
+            "narrative": "将每条checkin.date按逗号拆分成单个时间戳，解析为datetime，与阈值(2023-01-01)比较后计数；输出每个商家的自该日期以来check-in总数，并按数量降序展示。",
+            "example_query": "N/A (Python aggregation)"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nfrom datetime import datetime\nfrom typing import Dict, List, Tuple\n\n# ----------------------------\n# Fixed configuration (as required)\n# ----------------------------\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nmilvus_config = {\n    'milvus_collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    },\n    'milvus_host': 'localhost',\n    'milvus_port': '19530',\n}\n\nneo4j_config = {\n    'neo4j_uri': 'bolt://localhost:7687',\n    'neo4j_auth': ('neo4j', 'password')\n}\n\n\ndef safe_parse_dt(s: str):\n    \"\"\"Parse Yelp checkin timestamp like '2018-01-16 21:41:00'. Return datetime or None.\"\"\"\n    s = s.strip()\n    if not s:\n        return None\n    # Yelp format is typically ISO-like without 'T'\n    try:\n        return datetime.strptime(s, \"%Y-%m-%d %H:%M:%S\")\n    except ValueError:\n        # Fallback: try fromisoformat (handles 'YYYY-MM-DD HH:MM:SS' too in many cases)\n        try:\n            return datetime.fromisoformat(s)\n        except ValueError:\n            return None\n\n\ndef main(city: str = \"Wilmington\", start_date: str = \"2023-01-01\", min_stars: float = 4.5, min_review_count: int = 150):\n    start_dt = datetime.strptime(start_date, \"%Y-%m-%d\")\n\n    # ----------------------------\n    # Step 1: Query businesses\n    # ----------------------------\n    biz_conn = sqlite3.connect(sqlite_paths[\"business\"])\n    biz_conn.row_factory = sqlite3.Row\n\n    # Categories in Yelp are a comma-separated string; we do a pragmatic keyword filter.\n    # We include Coffee & Tea / Tea Rooms / Coffee Shops; plus generic coffee/tea keyword.\n    biz_sql = \"\"\"\n    SELECT business_id, name, city, state, stars, review_count, categories\n    FROM business\n    WHERE city = ?\n      AND stars >= ?\n      AND review_count > ?\n      AND (\n        lower(categories) LIKE '%coffee%tea%'\n        OR lower(categories) LIKE '%tea rooms%'\n        OR lower(categories) LIKE '%coffee shops%'\n        OR lower(categories) LIKE '%coffee%'\n        OR lower(categories) LIKE '%tea%'\n      )\n    \"\"\"\n\n    try:\n        biz_rows = biz_conn.execute(biz_sql, (city, min_stars, min_review_count)).fetchall()\n    finally:\n        biz_conn.close()\n\n    if not biz_rows:\n        print(f\"No matching businesses found for city='{city}', stars>={min_stars}, review_count>{min_review_count}.\")\n        return\n\n    biz_list = [dict(r) for r in biz_rows]\n    biz_ids = [r[\"business_id\"] for r in biz_list]\n\n    # ----------------------------\n    # Step 2: Query checkins for those businesses\n    # ----------------------------\n    chk_conn = sqlite3.connect(sqlite_paths[\"checkin\"])\n    chk_conn.row_factory = sqlite3.Row\n\n    # Chunk IN queries to avoid SQLite variable limits\n    def chunks(lst, n):\n        for i in range(0, len(lst), n):\n            yield lst[i:i+n]\n\n    checkin_map: Dict[str, str] = {}  # business_id -> date string\n    try:\n        for chunk in chunks(biz_ids, 900):\n            placeholders = \",\".join([\"?\"] * len(chunk))\n            chk_sql = f\"SELECT business_id, date FROM checkin WHERE business_id IN ({placeholders})\"\n            for row in chk_conn.execute(chk_sql, chunk).fetchall():\n                # If duplicates exist (unlikely), keep the latest non-null\n                if row[\"date\"] is not None:\n                    checkin_map[row[\"business_id\"]] = row[\"date\"]\n    finally:\n        chk_conn.close()\n\n    # ----------------------------\n    # Step 3: Parse and count checkins since start_dt\n    # ----------------------------\n    results: List[Tuple] = []\n    for b in biz_list:\n        bid = b[\"business_id\"]\n        date_blob = checkin_map.get(bid, \"\")\n        cnt = 0\n        if date_blob:\n            # Yelp checkin 'date' is typically: '2018-01-16 21:41:00, 2018-01-17 01:28:00, ...'\n            for ts in date_blob.split(\",\"):\n                dt = safe_parse_dt(ts)\n                if dt is not None and dt >= start_dt:\n                    cnt += 1\n\n        results.append((\n            b[\"name\"], b[\"city\"], b[\"state\"], b[\"stars\"], b[\"review_count\"], cnt, b[\"business_id\"], b.get(\"categories\")\n        ))\n\n    # Sort by checkin count desc, then stars desc\n    results.sort(key=lambda x: (x[5], x[3]), reverse=True)\n\n    # ----------------------------\n    # Output\n    # ----------------------------\n    print(f\"Coffee/Tea businesses in {city} with stars>={min_stars} and review_count>{min_review_count}\")\n    print(f\"Check-ins counted since {start_date}\\n\")\n\n    header = [\"name\", \"city\", \"state\", \"stars\", \"review_count\", f\"checkins_since_{start_date}\", \"business_id\"]\n    print(\"\\t\".join(header))\n    for (name, city_, state, stars, review_count, chk_cnt, business_id, categories) in results:\n        print(f\"{name}\\t{city_}\\t{state}\\t{stars}\\t{review_count}\\t{chk_cnt}\\t{business_id}\")\n\n\nif __name__ == \"__main__\":\n    # You can change city/start_date here if needed\n    main(city=\"Wilmington\", start_date=\"2023-01-01\", min_stars=4.5, min_review_count=150)\n"
+    }
+  },
+  {
+    "index": 289,
+    "question": "Show Sparks photos labeled 'food' or 'menu' where the business has stars >=4.0; return business name and photo caption.",
+    "success": true,
+    "result": {
+      "analysis": "该问题是典型的结构化筛选与跨表关联查询：在Sparks城市中，筛选stars>=4.0的商家，并取其photo中label为'food'或'menu'的记录，返回商家名称与照片caption。数据位于多个SQLite库（business.db与photo.db），需要跨库JOIN，可通过在photo连接上ATTACH business.db来完成。无需向量检索或图查询。",
+      "natural_question": "找出位于Sparks且评分>=4.0的商家的照片中，label为food或menu的照片；返回商家名称和照片caption。",
+      "difficulty": "easy",
+      "query_types": [
+        "sql"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "sqlite:photo.db",
+              "sqlite:business.db"
+            ],
+            "filter_condition": {
+              "business.city": {
+                "=": "Sparks"
+              },
+              "business.stars": {
+                ">=": 4.0
+              },
+              "photo.label": {
+                "IN": [
+                  "food",
+                  "menu"
+                ]
+              }
+            }
+          },
+          "result_var": "rows",
+          "description": {
+            "narrative": "在photo.db中连接并ATTACH business.db，通过business_id进行关联；筛选Sparks、stars>=4.0、label在(food, menu)；输出business.name与photo.caption。",
+            "example_query": "ATTACH DATABASE 'D:/Yelp-JSON/db/sqlite3/business.db' AS business_db;\nSELECT b.name AS business_name, p.caption AS photo_caption\nFROM photo p\nJOIN business_db.business b ON b.business_id = p.business_id\nWHERE b.city = 'Sparks'\n  AND b.stars >= 4.0\n  AND p.label IN ('food','menu');"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nfrom typing import List, Tuple, Optional\n\n# ---- Fixed configuration (as required) ----\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nmilvus_config = {\n    'milvus_collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    },\n    'milvus_host': 'localhost',\n    'milvus_port': '19530',\n}\n\nneo4j_config = {\n    'neo4j_uri': 'bolt://localhost:7687',\n    'neo4j_auth': ('neo4j', 'password')\n}\n\n\ndef get_sparks_food_menu_photos(min_stars: float = 4.0, limit: Optional[int] = None) -> List[Tuple[str, Optional[str]]]:\n    \"\"\"Return (business_name, photo_caption) for Sparks businesses with stars >= min_stars\n    and photo label in ('food','menu').\"\"\"\n\n    photo_db_path = sqlite_paths[\"photo\"]\n    business_db_path = sqlite_paths[\"business\"]\n\n    conn = sqlite3.connect(photo_db_path)\n    try:\n        conn.row_factory = sqlite3.Row\n        cur = conn.cursor()\n\n        # Attach business.db so we can JOIN across the two SQLite files\n        cur.execute(\"ATTACH DATABASE ? AS business_db\", (business_db_path,))\n\n        sql = \"\"\"\n        SELECT\n            b.name   AS business_name,\n            p.caption AS photo_caption\n        FROM photo AS p\n        JOIN business_db.business AS b\n          ON b.business_id = p.business_id\n        WHERE b.city = ?\n          AND b.stars >= ?\n          AND p.label IN ('food', 'menu')\n        \"\"\"\n        params = [\"Sparks\", float(min_stars)]\n\n        if limit is not None:\n            sql += \"\\nLIMIT ?\"\n            params.append(int(limit))\n\n        cur.execute(sql, params)\n        rows = cur.fetchall()\n\n        # Convert to plain tuples\n        return [(r[\"business_name\"], r[\"photo_caption\"]) for r in rows]\n\n    finally:\n        conn.close()\n\n\nif __name__ == \"__main__\":\n    try:\n        results = get_sparks_food_menu_photos(min_stars=4.0, limit=200)\n        print(f\"Returned {len(results)} rows\")\n        for business_name, caption in results[:50]:\n            # caption can be NULL\n            print({\"business_name\": business_name, \"photo_caption\": caption})\n    except sqlite3.OperationalError as e:\n        # Common causes: table name differs from assumed ('photo'/'business'), or DB file path issues.\n        print(\"SQLite OperationalError:\", e)\n        print(\"Verify table names in photo.db and business.db (e.g., 'photo', 'business') and that the file paths exist.\")\n"
+    }
+  },
+  {
+    "index": 290,
+    "question": "Find Metairie Japanese restaurants rated >=4.2 with at least 50 reviews; show photos labeled 'food' or 'inside'.",
+    "success": true,
+    "result": {
+      "analysis": "需求是结构化筛选：在Metairie城市内找到类别包含Japanese的餐厅，并按评分(stars)与评论数(review_count)阈值过滤；随后跨库到photo.db取对应商家的照片，且label限定为food或inside。主要是SQL关系查询 + 跨SQLite库的ID映射聚合输出。",
+      "natural_question": "查找Metairie的日本餐厅，评分>=4.2且review_count>=50，并展示这些餐厅的food或inside标签照片。",
+      "difficulty": "easy",
+      "query_types": [
+        "sql"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "sqlite:business.db (business表)"
+            ],
+            "filter_condition": {
+              "city": {
+                "=": "Metairie"
+              },
+              "stars": {
+                ">=": 4.2
+              },
+              "review_count": {
+                ">=": 50
+              },
+              "categories": {
+                "LIKE": "%Japanese%"
+              }
+            }
+          },
+          "result_var": "biz_rows",
+          "description": {
+            "narrative": "在business.db中筛选位于Metairie、类别包含Japanese、stars>=4.2且review_count>=50的商家记录，取出business_id、name、stars、review_count、address等字段。",
+            "example_query": "SELECT business_id, name, stars, review_count, address, city, state, categories\nFROM business\nWHERE city = 'Metairie'\n  AND stars >= 4.2\n  AND review_count >= 50\n  AND categories LIKE '%Japanese%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "sqlite:photo.db (photo表)"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "IN": "step1.business_id列表"
+              },
+              "label": {
+                "IN": [
+                  "food",
+                  "inside"
+                ]
+              }
+            }
+          },
+          "result_var": "photo_rows",
+          "description": {
+            "narrative": "在photo.db中按business_id列表查找照片，并只保留label为food或inside的记录，返回photo_id、business_id、label等字段。",
+            "example_query": "SELECT photo_id, business_id, label\nFROM photo\nWHERE business_id IN ('<id1>','<id2>',...)\n  AND label IN ('food','inside');"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "Python聚合处理"
+            ],
+            "filter_condition": {}
+          },
+          "result_var": "final_result",
+          "description": {
+            "narrative": "将步骤2照片按business_id聚合挂到对应餐厅下，输出每家店的基本信息与其food/inside照片列表。",
+            "example_query": "N/A (Python group-by business_id)"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nfrom collections import defaultdict\nimport json\n\n# ----- Fixed configuration (as required) -----\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\",\n}\n\n# (Not used in this task but kept for completeness of the provided architecture)\nconfig = {\n    'milvus_collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    },\n    'milvus_host': 'localhost',\n    'milvus_port': '19530',\n    'neo4j_uri': 'bolt://localhost:7687',\n    'neo4j_auth': ('neo4j', 'password')\n}\n\nCITY = \"Metairie\"\nMIN_STARS = 4.2\nMIN_REVIEW_COUNT = 50\nCATEGORY_KEYWORD = \"Japanese\"\nPHOTO_LABELS = (\"food\", \"inside\")\n\n\ndef fetch_metairie_japanese_restaurants():\n    sql = \"\"\"\n    SELECT business_id, name, stars, review_count, address, city, state, categories\n    FROM business\n    WHERE city = ?\n      AND stars >= ?\n      AND review_count >= ?\n      AND categories LIKE ?\n    ORDER BY stars DESC, review_count DESC;\n    \"\"\"\n    params = (CITY, MIN_STARS, MIN_REVIEW_COUNT, f\"%{CATEGORY_KEYWORD}%\")\n\n    with sqlite3.connect(sqlite_paths[\"business\"]) as conn:\n        conn.row_factory = sqlite3.Row\n        rows = conn.execute(sql, params).fetchall()\n\n    return [dict(r) for r in rows]\n\n\ndef fetch_photos_for_business_ids(business_ids, labels=(\"food\", \"inside\"), chunk_size=900):\n    \"\"\"Fetch photos in chunks to avoid SQLite parameter limits.\"\"\"\n    if not business_ids:\n        return []\n\n    all_rows = []\n    with sqlite3.connect(sqlite_paths[\"photo\"]) as conn:\n        conn.row_factory = sqlite3.Row\n\n        for i in range(0, len(business_ids), chunk_size):\n            chunk = business_ids[i:i + chunk_size]\n            placeholders_ids = \",\".join([\"?\"] * len(chunk))\n            placeholders_labels = \",\".join([\"?\"] * len(labels))\n\n            sql = f\"\"\"\n            SELECT photo_id, business_id, label\n            FROM photo\n            WHERE business_id IN ({placeholders_ids})\n              AND label IN ({placeholders_labels});\n            \"\"\"\n            params = tuple(chunk) + tuple(labels)\n            rows = conn.execute(sql, params).fetchall()\n            all_rows.extend([dict(r) for r in rows])\n\n    return all_rows\n\n\ndef main():\n    try:\n        businesses = fetch_metairie_japanese_restaurants()\n        business_ids = [b[\"business_id\"] for b in businesses]\n\n        photos = fetch_photos_for_business_ids(business_ids, labels=PHOTO_LABELS)\n\n        photos_by_biz = defaultdict(list)\n        for p in photos:\n            photos_by_biz[p[\"business_id\"]].append({\n                \"photo_id\": p.get(\"photo_id\"),\n                \"label\": p.get(\"label\")\n            })\n\n        final = []\n        for b in businesses:\n            final.append({\n                \"business_id\": b.get(\"business_id\"),\n                \"name\": b.get(\"name\"),\n                \"stars\": b.get(\"stars\"),\n                \"review_count\": b.get(\"review_count\"),\n                \"address\": b.get(\"address\"),\n                \"city\": b.get(\"city\"),\n                \"state\": b.get(\"state\"),\n                \"categories\": b.get(\"categories\"),\n                \"photos\": photos_by_biz.get(b.get(\"business_id\"), [])\n            })\n\n        print(json.dumps({\n            \"query\": {\n                \"city\": CITY,\n                \"min_stars\": MIN_STARS,\n                \"min_review_count\": MIN_REVIEW_COUNT,\n                \"category_contains\": CATEGORY_KEYWORD,\n                \"photo_labels\": list(PHOTO_LABELS)\n            },\n            \"count\": len(final),\n            \"results\": final\n        }, ensure_ascii=False, indent=2))\n\n    except sqlite3.Error as e:\n        raise SystemExit(f\"SQLite error: {e}\")\n    except Exception as e:\n        raise SystemExit(f\"Unexpected error: {e}\")\n\n\nif __name__ == \"__main__\":\n    main()\n"
+    }
+  }
+]

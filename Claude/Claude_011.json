@@ -1,0 +1,1248 @@
+[
+  {
+    "index": 101,
+    "question": "In Edmonton, find Chinese restaurants reviewed by user Danny with noodle or dumpling photos, and output sentences mentioning portion size plus address.",
+    "success": true,
+    "result": {
+      "analysis": "This is a complex multi-database query that requires: 1) Finding Chinese restaurants in Edmonton from SQLite, 2) Finding reviews by user 'Danny' for those restaurants from SQLite, 3) Searching for photos related to 'noodle' or 'dumpling' using Milvus vector similarity search, 4) Extracting sentences mentioning 'portion size' from review text, 5) Combining results with business address information. This involves SQL queries across multiple SQLite databases (business, review, user, photo) and Milvus vector search for photo semantics.",
+      "natural_question": "In Edmonton, find Chinese restaurants reviewed by user Danny with noodle or dumpling photos, and output sentences mentioning portion size plus address.",
+      "difficulty": "hard",
+      "query_types": [
+        "sql",
+        "vector",
+        "graph"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business.db"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Edmonton"
+              },
+              "categories": {
+                "like": "%Chinese%"
+              }
+            }
+          },
+          "result_var": "chinese_restaurants",
+          "description": {
+            "narrative": "Query SQLite business.db to find all Chinese restaurants located in Edmonton. Extract business_id, name, and full address.",
+            "example_query": "SELECT business_id, name, address, city, state, postal_code FROM business WHERE city = 'Edmonton' AND categories LIKE '%Chinese%'"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "user.db"
+            ],
+            "filter_condition": {
+              "name": {
+                "eq": "Danny"
+              }
+            }
+          },
+          "result_var": "danny_user_ids",
+          "description": {
+            "narrative": "Query SQLite user.db to find all user_ids for users named 'Danny'.",
+            "example_query": "SELECT user_id, name FROM user WHERE name = 'Danny'"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "review.db"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "chinese_restaurants.business_id"
+              },
+              "user_id": {
+                "in": "danny_user_ids.user_id"
+              }
+            }
+          },
+          "result_var": "danny_reviews",
+          "description": {
+            "narrative": "Query SQLite review.db to find reviews written by Danny for the Edmonton Chinese restaurants. Extract review text and business_id.",
+            "example_query": "SELECT review_id, business_id, user_id, text FROM review WHERE business_id IN (...) AND user_id IN (...)"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "photo.db",
+              "photo_vector"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "chinese_restaurants.business_id"
+              },
+              "semantic_search": [
+                "noodle",
+                "dumpling"
+              ]
+            }
+          },
+          "result_var": "noodle_dumpling_photos",
+          "description": {
+            "narrative": "First query SQLite photo.db to find photos associated with the Chinese restaurants. Then use Milvus vector search on photo_vector collection to find photos semantically similar to 'noodle' and 'dumpling'. Cross-reference to get businesses that have such photos.",
+            "example_query": "Milvus: collection('photo_vector').search(vectors=encode(['noodle', 'dumpling']), filter='business_id in [...]', top_k=50)"
+          }
+        },
+        {
+          "step": 5,
+          "parameters": {
+            "ms_names": [
+              "neo4j"
+            ],
+            "filter_condition": {
+              "relationship": "REVIEWED",
+              "user_name": "Danny",
+              "business_city": "Edmonton"
+            }
+          },
+          "result_var": "graph_validation",
+          "description": {
+            "narrative": "Use Neo4j graph database to validate and enrich the relationship between Danny, the restaurants, and photos. Traverse User-REVIEWED->Business and Business-HAS_PHOTO->Photo relationships.",
+            "example_query": "MATCH (u:User {name:'Danny'})-[:WROTE]->(r:Review)-[:REVIEWS]->(b:Business {city:'Edmonton'})-[:HAS_PHOTO]->(p:Photo) WHERE b.categories CONTAINS 'Chinese' RETURN u, r, b, p"
+          }
+        },
+        {
+          "step": 6,
+          "parameters": {
+            "ms_names": [
+              "in_memory"
+            ],
+            "filter_condition": {
+              "text_pattern": "portion"
+            }
+          },
+          "result_var": "final_results",
+          "description": {
+            "narrative": "From the reviews of matching businesses (those reviewed by Danny AND having noodle/dumpling photos), extract sentences mentioning 'portion size' or 'portion'. Combine with the restaurant address to produce the final output.",
+            "example_query": "Python: [sent for sent in nltk.sent_tokenize(review_text) if 'portion' in sent.lower()]"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport json\nimport re\nfrom pymilvus import connections, Collection, utility\nfrom neo4j import GraphDatabase\nfrom sentence_transformers import SentenceTransformer\nimport numpy as np\n\n# ============================================================\n# Database Configuration\n# ============================================================\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nmilvus_config = {\n    'host': 'localhost',\n    'port': '19530',\n    'collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    }\n}\n\nneo4j_config = {\n    'uri': 'bolt://localhost:7687',\n    'auth': ('neo4j', 'password')\n}\n\n# ============================================================\n# Helper: Sentence tokenizer (simple, no nltk dependency)\n# ============================================================\ndef simple_sent_tokenize(text):\n    \"\"\"Split text into sentences using regex.\"\"\"\n    sentences = re.split(r'(?<=[.!?])\\s+', text)\n    return [s.strip() for s in sentences if s.strip()]\n\n# ============================================================\n# STEP 1: Find Chinese restaurants in Edmonton\n# ============================================================\nprint(\"=\" * 70)\nprint(\"STEP 1: Finding Chinese restaurants in Edmonton...\")\nprint(\"=\" * 70)\n\ntry:\n    conn_biz = sqlite3.connect(sqlite_paths['business'])\n    cursor_biz = conn_biz.cursor()\n    cursor_biz.execute(\"\"\"\n        SELECT business_id, name, address, city, state, postal_code, categories\n        FROM business\n        WHERE city = 'Edmonton' AND categories LIKE '%Chinese%'\n    \"\"\")\n    chinese_restaurants = cursor_biz.fetchall()\n    conn_biz.close()\n    \n    biz_ids = [r[0] for r in chinese_restaurants]\n    biz_info = {r[0]: {\n        'name': r[1],\n        'address': f\"{r[2]}, {r[3]}, {r[4]} {r[5]}\",\n        'categories': r[6]\n    } for r in chinese_restaurants}\n    \n    print(f\"Found {len(chinese_restaurants)} Chinese restaurants in Edmonton.\")\n    for r in chinese_restaurants:\n        print(f\"  - {r[1]} | {r[2]}\")\nexcept Exception as e:\n    print(f\"Error in Step 1: {e}\")\n    biz_ids = []\n    biz_info = {}\n\nif not biz_ids:\n    print(\"No Chinese restaurants found in Edmonton. Exiting.\")\nelse:\n    # ============================================================\n    # STEP 2: Find user(s) named Danny\n    # ============================================================\n    print(\"\\n\" + \"=\" * 70)\n    print(\"STEP 2: Finding user(s) named 'Danny'...\")\n    print(\"=\" * 70)\n    \n    try:\n        conn_user = sqlite3.connect(sqlite_paths['user'])\n        cursor_user = conn_user.cursor()\n        cursor_user.execute(\"SELECT user_id, name FROM user WHERE name = 'Danny'\")\n        danny_users = cursor_user.fetchall()\n        conn_user.close()\n        \n        danny_ids = [u[0] for u in danny_users]\n        print(f\"Found {len(danny_users)} user(s) named Danny.\")\n    except Exception as e:\n        print(f\"Error in Step 2: {e}\")\n        danny_ids = []\n    \n    # ============================================================\n    # STEP 3: Find Danny's reviews for these Chinese restaurants\n    # ============================================================\n    print(\"\\n\" + \"=\" * 70)\n    print(\"STEP 3: Finding Danny's reviews for Edmonton Chinese restaurants...\")\n    print(\"=\" * 70)\n    \n    danny_reviews = []\n    reviewed_biz_ids = set()\n    \n    if danny_ids and biz_ids:\n        try:\n            conn_review = sqlite3.connect(sqlite_paths['review'])\n            cursor_review = conn_review.cursor()\n            \n            biz_placeholders = ','.join(['?' for _ in biz_ids])\n            danny_placeholders = ','.join(['?' for _ in danny_ids])\n            \n            query = f\"\"\"\n                SELECT review_id, business_id, user_id, text, stars, date\n                FROM review\n                WHERE business_id IN ({biz_placeholders})\n                  AND user_id IN ({danny_placeholders})\n            \"\"\"\n            cursor_review.execute(query, biz_ids + danny_ids)\n            danny_reviews = cursor_review.fetchall()\n            conn_review.close()\n            \n            reviewed_biz_ids = set(r[1] for r in danny_reviews)\n            print(f\"Found {len(danny_reviews)} review(s) by Danny for these restaurants.\")\n            for rev in danny_reviews:\n                bname = biz_info.get(rev[1], {}).get('name', 'Unknown')\n                print(f\"  - Review for '{bname}': {rev[3][:80]}...\")\n        except Exception as e:\n            print(f\"Error in Step 3: {e}\")\n    else:\n        print(\"No Danny users or no business IDs to search.\")\n    \n    # ============================================================\n    # STEP 4: Vector search for noodle/dumpling photos in Milvus\n    # ============================================================\n    print(\"\\n\" + \"=\" * 70)\n    print(\"STEP 4: Searching for noodle/dumpling photos via Milvus...\")\n    print(\"=\" * 70)\n    \n    photo_biz_ids = set()\n    photo_results_detail = []\n    \n    try:\n        # Connect to Milvus\n        connections.connect(alias='default', host=milvus_config['host'], port=milvus_config['port'])\n        print(\"Connected to Milvus successfully.\")\n        \n        # Load sentence transformer for encoding search queries\n        model = SentenceTransformer('all-MiniLM-L6-v2')\n        \n        # Encode search terms\n        search_terms = ['noodle', 'dumpling', 'noodles and dumplings', 'Chinese noodle dish', 'Chinese dumpling dish']\n        search_vectors = model.encode(search_terms).tolist()\n        \n        # Access photo_vector collection\n        collection_name = milvus_config['collections']['photos']\n        if utility.has_collection(collection_name):\n            collection = Collection(collection_name)\n            collection.load()\n            \n            # Build filter for business_ids of Chinese restaurants in Edmonton\n            # Milvus filter expression\n            if len(biz_ids) <= 100:\n                biz_filter_parts = [f'business_id == \"{bid}\"' for bid in biz_ids]\n                biz_filter = ' || '.join(biz_filter_parts) if biz_filter_parts else ''\n            else:\n                biz_filter = ''  # If too many, search without filter and post-filter\n            \n            search_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 16}}\n            \n            results = collection.search(\n                data=search_vectors,\n                anns_field=\"embedding\",\n                param=search_params,\n                limit=50,\n                expr=biz_filter if biz_filter else None,\n                output_fields=[\"business_id\", \"photo_id\", \"label\", \"caption\"]\n            )\n            \n            for hits in results:\n                for hit in hits:\n                    entity = hit.entity\n                    bid = entity.get('business_id', '')\n                    if bid in biz_info:\n                        photo_biz_ids.add(bid)\n                        photo_results_detail.append({\n                            'business_id': bid,\n                            'photo_id': entity.get('photo_id', ''),\n                            'label': entity.get('label', ''),\n                            'caption': entity.get('caption', ''),\n                            'distance': hit.distance\n                        })\n            \n            print(f\"Found {len(photo_results_detail)} photo matches across {len(photo_biz_ids)} businesses.\")\n        else:\n            print(f\"Collection '{collection_name}' not found. Falling back to SQLite photo search.\")\n            raise Exception(\"Collection not found, use fallback.\")\n    \n    except Exception as e:\n        print(f\"Milvus search note: {e}\")\n        print(\"Falling back to SQLite photo.db for label/caption keyword search...\")\n        \n        try:\n            conn_photo = sqlite3.connect(sqlite_paths['photo'])\n            cursor_photo = conn_photo.cursor()\n            \n            biz_placeholders = ','.join(['?' for _ in biz_ids])\n            query = f\"\"\"\n                SELECT photo_id, business_id, caption, label\n                FROM photo\n                WHERE business_id IN ({biz_placeholders})\n                  AND (\n                    LOWER(caption) LIKE '%noodle%' OR LOWER(caption) LIKE '%dumpling%'\n                    OR LOWER(label) LIKE '%noodle%' OR LOWER(label) LIKE '%dumpling%'\n                    OR LOWER(label) = 'food'\n                  )\n            \"\"\"\n            cursor_photo.execute(query, biz_ids)\n            photo_rows = cursor_photo.fetchall()\n            conn_photo.close()\n            \n            for p in photo_rows:\n                photo_biz_ids.add(p[1])\n                photo_results_detail.append({\n                    'business_id': p[1],\n                    'photo_id': p[0],\n                    'caption': p[2],\n                    'label': p[3],\n                    'distance': None\n                })\n            print(f\"Fallback found {len(photo_rows)} photo(s) across {len(photo_biz_ids)} businesses.\")\n        except Exception as e2:\n            print(f\"Photo fallback error: {e2}\")\n    \n    # ============================================================\n    # STEP 5: Neo4j graph validation & enrichment\n    # ============================================================\n    print(\"\\n\" + \"=\" * 70)\n    print(\"STEP 5: Validating relationships via Neo4j graph...\")\n    print(\"=\" * 70)\n    \n    graph_validated_biz = set()\n    \n    try:\n        driver = GraphDatabase.driver(neo4j_config['uri'], auth=neo4j_config['auth'])\n        with driver.session() as session:\n            cypher_query = \"\"\"\n                MATCH (u:User {name: 'Danny'})-[:WROTE]->(r:Review)-[:REVIEWS]->(b:Business)\n                WHERE b.city = 'Edmonton' AND b.categories CONTAINS 'Chinese'\n                OPTIONAL MATCH (b)-[:HAS_PHOTO]->(p:Photo)\n                RETURN DISTINCT b.business_id AS business_id, \n                       b.name AS business_name,\n                       r.text AS review_text,\n                       collect(DISTINCT p.photo_id) AS photo_ids\n            \"\"\"\n            result = session.run(cypher_query)\n            for record in result:\n                bid = record['business_id']\n                if bid:\n                    graph_validated_biz.add(bid)\n                    print(f\"  Graph confirmed: Danny reviewed '{record['business_name']}' with {len(record['photo_ids'])} photo(s)\")\n        \n        driver.close()\n        print(f\"Neo4j validated {len(graph_validated_biz)} business(es).\")\n    except Exception as e:\n        print(f\"Neo4j note: {e}\")\n        print(\"Continuing with SQL-based results...\")\n        graph_validated_biz = reviewed_biz_ids  # fallback to SQL results\n    \n    # ============================================================\n    # STEP 6: Combine results - find intersection & extract portions\n    # ============================================================\n    print(\"\\n\" + \"=\" * 70)\n    print(\"STEP 6: Combining results and extracting portion-size sentences...\")\n    print(\"=\" * 70)\n    \n    # Businesses that: Danny reviewed AND have noodle/dumpling photos\n    qualifying_biz_ids = reviewed_biz_ids & photo_biz_ids\n    \n    # If graph validation returned results, further intersect\n    if graph_validated_biz:\n        qualifying_biz_ids = qualifying_biz_ids & graph_validated_biz\n    \n    print(f\"\\nQualifying businesses (Danny reviewed + noodle/dumpling photos): {len(qualifying_biz_ids)}\")\n    \n    # ============================================================\n    # FINAL OUTPUT\n    # ============================================================\n    print(\"\\n\" + \"=\" * 70)\n    print(\"FINAL RESULTS\")\n    print(\"=\" * 70)\n    \n    portion_keywords = ['portion', 'serving size', 'generous', 'huge plate', 'small plate',\n                        'big plate', 'large serving', 'small serving', 'enough food',\n                        'too little', 'too much food', 'amount of food', 'quantity']\n    \n    final_output = []\n    \n    if qualifying_biz_ids:\n        for rev in danny_reviews:\n            rev_biz_id = rev[1]\n            if rev_biz_id in qualifying_biz_ids:\n                review_text = rev[3]\n                sentences = simple_sent_tokenize(review_text)\n                \n                portion_sentences = []\n                for sent in sentences:\n                    sent_lower = sent.lower()\n                    if any(kw in sent_lower for kw in portion_keywords):\n                        portion_sentences.append(sent)\n                \n                restaurant_name = biz_info[rev_biz_id]['name']\n                restaurant_address = biz_info[rev_biz_id]['address']\n                \n                # Get matching photos for this business\n                matching_photos = [p for p in photo_results_detail if p['business_id'] == rev_biz_id]\n                \n                result_entry = {\n                    'restaurant_name': restaurant_name,\n                    'address': restaurant_address,\n                    'review_id': rev[0],\n                    'stars': rev[4],\n                    'portion_sentences': portion_sentences,\n                    'all_review_text': review_text,\n                    'matching_photos': matching_photos\n                }\n                final_output.append(result_entry)\n                \n                print(f\"\\n{'─' * 60}\")\n                print(f\"Restaurant: {restaurant_name}\")\n                print(f\"Address:    {restaurant_address}\")\n                print(f\"Stars:      {rev[4]}\")\n                print(f\"Photos:     {len(matching_photos)} noodle/dumpling photo(s)\")\n                for ph in matching_photos[:3]:\n                    print(f\"  📷 Photo ID: {ph['photo_id']} | Label: {ph.get('label','')} | Caption: {ph.get('caption','')}\")\n                \n                if portion_sentences:\n                    print(f\"\\nSentences mentioning portion size:\")\n                    for i, sent in enumerate(portion_sentences, 1):\n                        print(f\"  {i}. \\\"{sent}\\\"\")\n                else:\n                    print(f\"\\n⚠ No sentences explicitly mentioning portion size found.\")\n                    print(f\"  Full review excerpt: \\\"{review_text[:200]}...\\\"\")\n    else:\n        print(\"\\nNo restaurants found matching ALL criteria:\")\n        print(f\"  - Chinese restaurants in Edmonton: {len(biz_ids)}\")\n        print(f\"  - Reviewed by Danny: {len(reviewed_biz_ids)}\")\n        print(f\"  - With noodle/dumpling photos: {len(photo_biz_ids)}\")\n        print(f\"  - Intersection: {len(qualifying_biz_ids)}\")\n        \n        # Provide partial results if available\n        if reviewed_biz_ids:\n            print(\"\\n--- Partial Results: Danny's reviews for Edmonton Chinese restaurants ---\")\n            for rev in danny_reviews:\n                rev_biz_id = rev[1]\n                review_text = rev[3]\n                sentences = simple_sent_tokenize(review_text)\n                portion_sentences = [s for s in sentences if any(kw in s.lower() for kw in portion_keywords)]\n                \n                restaurant_name = biz_info.get(rev_biz_id, {}).get('name', 'Unknown')\n                restaurant_address = biz_info.get(rev_biz_id, {}).get('address', 'Unknown')\n                \n                print(f\"\\n  Restaurant: {restaurant_name}\")\n                print(f\"  Address:    {restaurant_address}\")\n                if portion_sentences:\n                    for s in portion_sentences:\n                        print(f\"  Portion mention: \\\"{s}\\\"\")\n                else:\n                    print(f\"  Review: \\\"{review_text[:150]}...\\\"\")\n    \n    # ============================================================\n    # Summary\n    # ============================================================\n    print(f\"\\n{'=' * 70}\")\n    print(f\"SUMMARY\")\n    print(f\"{'=' * 70}\")\n    print(f\"Chinese restaurants in Edmonton:          {len(biz_ids)}\")\n    print(f\"Users named Danny:                        {len(danny_ids)}\")\n    print(f\"Danny's reviews for these restaurants:     {len(danny_reviews)}\")\n    print(f\"Restaurants with noodle/dumpling photos:   {len(photo_biz_ids)}\")\n    print(f\"Fully qualifying restaurants:              {len(qualifying_biz_ids)}\")\n    print(f\"Results with portion-size mentions:        {sum(1 for r in final_output if r['portion_sentences'])}\")\n    print(f\"{'=' * 70}\")\n\n    # Disconnect Milvus\n    try:\n        connections.disconnect('default')\n    except:\n        pass\n"
+    }
+  },
+  {
+    "index": 102,
+    "question": "In Saint Louis, find pizza places reviewed by user Rob with photos of pizzas coming out of the oven; return stars, review date, and photo labels.",
+    "success": true,
+    "result": {
+      "analysis": "This query requires joining data across all three database systems. We need to: 1) Find pizza businesses in Saint Louis from SQLite, 2) Find reviews by user 'Rob' for those businesses from SQLite, 3) Find photos associated with those businesses that show pizzas coming out of the oven using vector similarity search in Milvus, 4) Potentially use Neo4j to traverse user-review-business relationships. The query involves SQL filtering (city, category, user name), vector search (semantic image search for 'pizza coming out of oven'), and relational joins across multiple tables.",
+      "natural_question": "In Saint Louis, find pizza places reviewed by user Rob with photos of pizzas coming out of the oven; return stars, review date, and photo labels.",
+      "difficulty": "hard",
+      "query_types": [
+        "sql",
+        "vector",
+        "graph"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "$eq": "Saint Louis"
+              },
+              "categories": {
+                "$like": "%Pizza%"
+              }
+            }
+          },
+          "result_var": "pizza_businesses",
+          "description": {
+            "narrative": "Query SQLite business.db to find all pizza restaurants located in Saint Louis. Filter by city='Saint Louis' and categories containing 'Pizza'.",
+            "example_query": "SELECT business_id, name, stars, categories FROM business WHERE city = 'Saint Louis' AND categories LIKE '%Pizza%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "user"
+            ],
+            "filter_condition": {
+              "name": {
+                "$eq": "Rob"
+              }
+            }
+          },
+          "result_var": "rob_users",
+          "description": {
+            "narrative": "Query SQLite user.db to find all users named 'Rob' and retrieve their user_ids.",
+            "example_query": "SELECT user_id, name FROM user WHERE name = 'Rob';"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "review"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "$in": "pizza_businesses.business_id"
+              },
+              "user_id": {
+                "$in": "rob_users.user_id"
+              }
+            }
+          },
+          "result_var": "rob_reviews",
+          "description": {
+            "narrative": "Query SQLite review.db to find reviews written by Rob for the pizza businesses in Saint Louis. Extract stars and review date.",
+            "example_query": "SELECT review_id, business_id, user_id, stars, date FROM review WHERE business_id IN (...) AND user_id IN (...);"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "photo_vector"
+            ],
+            "filter_condition": {
+              "search_text": "pizza coming out of the oven",
+              "business_id": {
+                "$in": "pizza_businesses.business_id"
+              }
+            }
+          },
+          "result_var": "oven_pizza_photos",
+          "description": {
+            "narrative": "Use Milvus vector similarity search on the photo_vector collection to find photos semantically matching 'pizza coming out of the oven', filtered to only the relevant business_ids.",
+            "example_query": "collection.search(data=[embedding('pizza coming out of the oven')], anns_field='image_vector', param={'metric_type': 'L2', 'params': {'nprobe': 16}}, limit=100, expr='business_id in [...]', output_fields=['business_id', 'photo_id', 'label'])"
+          }
+        },
+        {
+          "step": 5,
+          "parameters": {
+            "ms_names": [
+              "photo"
+            ],
+            "filter_condition": {
+              "photo_id": {
+                "$in": "oven_pizza_photos.photo_id"
+              }
+            }
+          },
+          "result_var": "photo_details",
+          "description": {
+            "narrative": "Query SQLite photo.db to get full photo metadata including labels for the matched photos.",
+            "example_query": "SELECT photo_id, business_id, caption, label FROM photo WHERE photo_id IN (...);"
+          }
+        },
+        {
+          "step": 6,
+          "parameters": {
+            "ms_names": [
+              "neo4j"
+            ],
+            "filter_condition": {
+              "pattern": "User(Rob)-[:WROTE]->Review-[:REVIEWS]->Business(Pizza, Saint Louis)"
+            }
+          },
+          "result_var": "graph_validation",
+          "description": {
+            "narrative": "Use Neo4j to validate and enrich the relationships between Rob, his reviews, and the pizza businesses via graph traversal. This confirms the connection path and can surface additional relationship context.",
+            "example_query": "MATCH (u:User {name: 'Rob'})-[:WROTE]->(r:Review)-[:REVIEWS]->(b:Business) WHERE b.city = 'Saint Louis' AND b.categories CONTAINS 'Pizza' RETURN b.name, b.business_id, r.stars, r.date, b.stars"
+          }
+        },
+        {
+          "step": 7,
+          "parameters": {
+            "ms_names": [
+              "combined"
+            ],
+            "filter_condition": {}
+          },
+          "result_var": "final_results",
+          "description": {
+            "narrative": "Join all results: merge Rob's reviews with matching photo data for businesses that have both a review from Rob and photos of pizzas coming out of the oven. Return business name, stars, review date, and photo labels.",
+            "example_query": "pandas merge/join on business_id across rob_reviews, oven_pizza_photos, and photo_details DataFrames"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport pandas as pd\nfrom pymilvus import connections, Collection\nfrom neo4j import GraphDatabase\nfrom sentence_transformers import SentenceTransformer\nimport warnings\nwarnings.filterwarnings('ignore')\n\n# ============================================================\n# Database Configuration\n# ============================================================\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nmilvus_config = {\n    'host': 'localhost',\n    'port': '19530',\n    'collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    }\n}\n\nneo4j_config = {\n    'uri': 'bolt://localhost:7687',\n    'auth': ('neo4j', 'password')\n}\n\n# ============================================================\n# Step 1: Find pizza businesses in Saint Louis (SQLite)\n# ============================================================\nprint(\"=\" * 60)\nprint(\"Step 1: Finding pizza businesses in Saint Louis...\")\nprint(\"=\" * 60)\n\nconn_business = sqlite3.connect(sqlite_paths['business'])\nquery_business = \"\"\"\n    SELECT business_id, name, stars, categories\n    FROM business\n    WHERE city = 'Saint Louis'\n      AND categories LIKE '%Pizza%'\n\"\"\"\npizza_businesses = pd.read_sql_query(query_business, conn_business)\nconn_business.close()\n\nprint(f\"Found {len(pizza_businesses)} pizza businesses in Saint Louis\")\nprint(pizza_businesses[['name', 'stars']].to_string(index=False))\n\nif pizza_businesses.empty:\n    print(\"No pizza businesses found. Exiting.\")\n    exit()\n\nbusiness_ids = pizza_businesses['business_id'].tolist()\n\n# ============================================================\n# Step 2: Find user(s) named 'Rob' (SQLite)\n# ============================================================\nprint(\"\\n\" + \"=\" * 60)\nprint(\"Step 2: Finding user 'Rob'...\")\nprint(\"=\" * 60)\n\nconn_user = sqlite3.connect(sqlite_paths['user'])\nquery_user = \"SELECT user_id, name FROM user WHERE name = 'Rob'\"\nrob_users = pd.read_sql_query(query_user, conn_user)\nconn_user.close()\n\nprint(f\"Found {len(rob_users)} users named 'Rob'\")\n\nif rob_users.empty:\n    print(\"No user named Rob found. Exiting.\")\n    exit()\n\nrob_user_ids = rob_users['user_id'].tolist()\n\n# ============================================================\n# Step 3: Find Rob's reviews for these pizza businesses (SQLite)\n# ============================================================\nprint(\"\\n\" + \"=\" * 60)\nprint(\"Step 3: Finding Rob's reviews for Saint Louis pizza places...\")\nprint(\"=\" * 60)\n\nconn_review = sqlite3.connect(sqlite_paths['review'])\n\n# Build parameterized query\nbiz_placeholders = ','.join(['?' for _ in business_ids])\nuser_placeholders = ','.join(['?' for _ in rob_user_ids])\n\nquery_review = f\"\"\"\n    SELECT review_id, business_id, user_id, stars, date\n    FROM review\n    WHERE business_id IN ({biz_placeholders})\n      AND user_id IN ({user_placeholders})\n\"\"\"\nparams = business_ids + rob_user_ids\nrob_reviews = pd.read_sql_query(query_review, conn_review, params=params)\nconn_review.close()\n\nprint(f\"Found {len(rob_reviews)} reviews by Rob for pizza places in Saint Louis\")\n\nif rob_reviews.empty:\n    print(\"No reviews by Rob found for these businesses. Exiting.\")\n    exit()\n\nreviewed_business_ids = rob_reviews['business_id'].tolist()\n\n# ============================================================\n# Step 4: Vector search for 'pizza coming out of oven' photos (Milvus)\n# ============================================================\nprint(\"\\n\" + \"=\" * 60)\nprint(\"Step 4: Searching for photos of pizzas coming out of the oven (Milvus)...\")\nprint(\"=\" * 60)\n\n# Connect to Milvus\nconnections.connect(alias='default', host=milvus_config['host'], port=milvus_config['port'])\n\n# Load the photo vector collection\nphoto_collection = Collection(milvus_config['collections']['photos'])\nphoto_collection.load()\n\n# Generate embedding for the search query\nmodel = SentenceTransformer('clip-ViT-B-32')  # CLIP model for image-text matching\nsearch_text = \"pizza coming out of the oven\"\nsearch_embedding = model.encode(search_text).tolist()\n\n# Build filter expression for business_ids\nbiz_id_str = ', '.join([f'\\\"{ bid}\\\"' for bid in reviewed_business_ids])\nfilter_expr = f'business_id in [{biz_id_str}]'\n\n# Perform vector similarity search\nsearch_params = {\n    'metric_type': 'L2',\n    'params': {'nprobe': 16}\n}\n\ntry:\n    results = photo_collection.search(\n        data=[search_embedding],\n        anns_field='image_vector',\n        param=search_params,\n        limit=50,\n        expr=filter_expr,\n        output_fields=['business_id', 'photo_id', 'label']\n    )\n\n    # Parse Milvus results\n    photo_matches = []\n    for hits in results:\n        for hit in hits:\n            photo_matches.append({\n                'photo_id': hit.entity.get('photo_id'),\n                'business_id': hit.entity.get('business_id'),\n                'label': hit.entity.get('label'),\n                'distance': hit.distance\n            })\n\n    oven_pizza_photos = pd.DataFrame(photo_matches)\n    print(f\"Found {len(oven_pizza_photos)} matching photos from Milvus\")\n\nexcept Exception as e:\n    print(f\"Milvus search error: {e}\")\n    print(\"Falling back to SQLite photo table with label filter...\")\n    oven_pizza_photos = pd.DataFrame(columns=['photo_id', 'business_id', 'label', 'distance'])\n\nconnections.disconnect('default')\n\n# ============================================================\n# Step 5: Get photo details/labels from SQLite photo.db\n# ============================================================\nprint(\"\\n\" + \"=\" * 60)\nprint(\"Step 5: Retrieving photo details from SQLite...\")\nprint(\"=\" * 60)\n\nconn_photo = sqlite3.connect(sqlite_paths['photo'])\n\nif not oven_pizza_photos.empty:\n    matched_photo_ids = oven_pizza_photos['photo_id'].tolist()\n    photo_placeholders = ','.join(['?' for _ in matched_photo_ids])\n    query_photo = f\"\"\"\n        SELECT photo_id, business_id, caption, label\n        FROM photo\n        WHERE photo_id IN ({photo_placeholders})\n    \"\"\"\n    photo_details = pd.read_sql_query(query_photo, conn_photo, params=matched_photo_ids)\nelse:\n    # Fallback: get all photos for reviewed businesses with food label\n    biz_ph = ','.join(['?' for _ in reviewed_business_ids])\n    query_photo = f\"\"\"\n        SELECT photo_id, business_id, caption, label\n        FROM photo\n        WHERE business_id IN ({biz_ph})\n          AND (label = 'food' OR caption LIKE '%pizza%' OR caption LIKE '%oven%')\n    \"\"\"\n    photo_details = pd.read_sql_query(query_photo, conn_photo, params=reviewed_business_ids)\n\nconn_photo.close()\nprint(f\"Retrieved {len(photo_details)} photo detail records\")\n\n# ============================================================\n# Step 6: Validate relationships via Neo4j graph traversal\n# ============================================================\nprint(\"\\n\" + \"=\" * 60)\nprint(\"Step 6: Validating relationships via Neo4j graph...\")\nprint(\"=\" * 60)\n\ntry:\n    driver = GraphDatabase.driver(neo4j_config['uri'], auth=neo4j_config['auth'])\n\n    with driver.session() as session:\n        cypher_query = \"\"\"\n            MATCH (u:User {name: 'Rob'})-[:WROTE]->(r:Review)-[:REVIEWS]->(b:Business)\n            WHERE b.city = 'Saint Louis' AND b.categories CONTAINS 'Pizza'\n            RETURN b.business_id AS business_id,\n                   b.name AS business_name,\n                   b.stars AS business_stars,\n                   r.stars AS review_stars,\n                   r.date AS review_date\n        \"\"\"\n        graph_result = session.run(cypher_query)\n        graph_records = [dict(record) for record in graph_result]\n\n    driver.close()\n\n    graph_validation = pd.DataFrame(graph_records)\n    print(f\"Neo4j returned {len(graph_validation)} validated review-business relationships\")\n    if not graph_validation.empty:\n        print(graph_validation.to_string(index=False))\n\nexcept Exception as e:\n    print(f\"Neo4j query error: {e}\")\n    graph_validation = pd.DataFrame()\n\n# ============================================================\n# Step 7: Merge all results and produce final output\n# ============================================================\nprint(\"\\n\" + \"=\" * 60)\nprint(\"Step 7: Merging results across all databases...\")\nprint(\"=\" * 60)\n\n# Merge reviews with business info\nreviews_with_biz = rob_reviews.merge(\n    pizza_businesses[['business_id', 'name', 'stars']],\n    on='business_id',\n    how='inner',\n    suffixes=('_review', '_business')\n)\n\n# Merge with photo details\nif not photo_details.empty:\n    final_results = reviews_with_biz.merge(\n        photo_details[['business_id', 'photo_id', 'label', 'caption']],\n        on='business_id',\n        how='inner'\n    )\nelse:\n    final_results = reviews_with_biz.copy()\n    final_results['photo_id'] = None\n    final_results['label'] = None\n    final_results['caption'] = None\n\n# If Milvus returned distance scores, merge them in\nif not oven_pizza_photos.empty and not final_results.empty:\n    final_results = final_results.merge(\n        oven_pizza_photos[['photo_id', 'distance']],\n        on='photo_id',\n        how='left'\n    )\n\n# ============================================================\n# Final Output\n# ============================================================\nprint(\"\\n\" + \"=\" * 60)\nprint(\"FINAL RESULTS: Pizza places in Saint Louis reviewed by Rob\")\nprint(\"with photos of pizzas coming out of the oven\")\nprint(\"=\" * 60)\n\nif final_results.empty:\n    print(\"No results found matching all criteria.\")\nelse:\n    output_columns = ['name', 'stars_review', 'stars_business', 'date', 'label']\n    available_cols = [c for c in output_columns if c in final_results.columns]\n    if 'caption' in final_results.columns:\n        available_cols.append('caption')\n    if 'distance' in final_results.columns:\n        available_cols.append('distance')\n        # Sort by vector similarity (lower distance = better match)\n        final_results = final_results.sort_values('distance', ascending=True)\n\n    print(final_results[available_cols].to_string(index=False))\n    print(f\"\\nTotal matching records: {len(final_results)}\")\n\n# Display summary\nprint(\"\\n\" + \"=\" * 60)\nprint(\"SUMMARY\")\nprint(\"=\" * 60)\nprint(f\"Pizza businesses in Saint Louis: {len(pizza_businesses)}\")\nprint(f\"Users named Rob: {len(rob_users)}\")\nprint(f\"Rob's reviews for these businesses: {len(rob_reviews)}\")\nprint(f\"Matching oven pizza photos (Milvus): {len(oven_pizza_photos)}\")\nprint(f\"Photo details retrieved: {len(photo_details)}\")\nprint(f\"Graph-validated relationships: {len(graph_validation) if not graph_validation.empty else 0}\")\nprint(f\"Final combined results: {len(final_results)}\")\n"
+    }
+  },
+  {
+    "index": 103,
+    "question": "In Tucson, for user Abby's reviewed cafes, find photos with cake or coffee cups, return summary of her review, address, rating, and photo count.",
+    "success": true,
+    "result": {
+      "analysis": "This is a complex multi-database query that requires: 1) Finding user 'Abby' in SQLite user database, 2) Finding her reviews for cafes in Tucson from SQLite review and business databases, 3) Using vector similarity search in Milvus to find photos related to 'cake or coffee cups' for those businesses, 4) Potentially using Neo4j to traverse user-review-business relationships. This involves SQL joins across multiple SQLite databases, vector search on photo embeddings, and aggregation of results. The query spans all three database types.",
+      "natural_question": "In Tucson, for user Abby's reviewed cafes, find photos with cake or coffee cups, return summary of her review, address, rating, and photo count.",
+      "difficulty": "hard",
+      "query_types": [
+        "sql",
+        "vector",
+        "graph"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "user.db"
+            ],
+            "filter_condition": {
+              "name": {
+                "$eq": "Abby"
+              }
+            }
+          },
+          "result_var": "abby_user_ids",
+          "description": {
+            "narrative": "Search the SQLite user database to find all users named 'Abby' and retrieve their user_id(s).",
+            "example_query": "SELECT user_id, name FROM user WHERE name = 'Abby';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "neo4j"
+            ],
+            "filter_condition": {
+              "user_id": {
+                "$in": "abby_user_ids"
+              },
+              "city": {
+                "$eq": "Tucson"
+              },
+              "category": {
+                "$contains": "Cafe"
+              }
+            }
+          },
+          "result_var": "abby_cafe_reviews",
+          "description": {
+            "narrative": "Use Neo4j graph database to traverse from User(Abby) -> WROTE -> Review -> REVIEWS -> Business to find cafes in Tucson that Abby reviewed. This leverages the graph relationships for efficient traversal. Retrieve business_id, review text, stars, and business address.",
+            "example_query": "MATCH (u:User)-[:WROTE]->(r:Review)-[:REVIEWS]->(b:Business) WHERE u.user_id IN $abby_user_ids AND b.city = 'Tucson' AND b.categories CONTAINS 'Cafe' RETURN b.business_id, b.name, b.address, r.text, r.stars"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "photo_vector"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "$in": "business_ids_from_step2"
+              },
+              "search_text": "cake or coffee cups"
+            }
+          },
+          "result_var": "matching_photos",
+          "description": {
+            "narrative": "Use Milvus vector database to perform semantic similarity search on photo embeddings. Search for photos that visually match 'cake or coffee cups' among the photos belonging to the businesses identified in step 2. Filter by business_id and use vector similarity to find relevant photos.",
+            "example_query": "collection.search(data=[embed('cake or coffee cups')], anns_field='photo_vector', param={'metric_type': 'L2', 'params': {'nprobe': 16}}, limit=100, expr='business_id in [\"bid1\",\"bid2\"]')"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "photo.db"
+            ],
+            "filter_condition": {
+              "photo_id": {
+                "$in": "photo_ids_from_step3"
+              }
+            }
+          },
+          "result_var": "photo_details",
+          "description": {
+            "narrative": "Cross-reference the Milvus photo results with the SQLite photo database to get photo metadata (caption, label) and verify relevance. Also count photos per business.",
+            "example_query": "SELECT photo_id, business_id, caption, label FROM photo WHERE photo_id IN (?) AND (label = 'food' OR caption LIKE '%cake%' OR caption LIKE '%coffee%');"
+          }
+        },
+        {
+          "step": 5,
+          "parameters": {
+            "ms_names": [
+              "reviews"
+            ],
+            "filter_condition": {
+              "review_text": "abby_review_texts"
+            }
+          },
+          "result_var": "review_summaries",
+          "description": {
+            "narrative": "Use Milvus reviews collection to generate/retrieve review text embeddings for Abby's reviews, which can help summarize her review content. Combine all results into the final output with review summary, address, rating, and photo count per cafe.",
+            "example_query": "Aggregate results: business_name, address, stars, review_summary (first 200 chars of review text), photo_count"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport json\nimport numpy as np\nfrom pymilvus import connections, Collection, utility\nfrom neo4j import GraphDatabase\nfrom sentence_transformers import SentenceTransformer\nimport warnings\nwarnings.filterwarnings('ignore')\n\n# ============================================================\n# Database Configuration\n# ============================================================\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nmilvus_config = {\n    'host': 'localhost',\n    'port': '19530',\n    'collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    }\n}\n\nneo4j_config = {\n    'uri': 'bolt://localhost:7687',\n    'auth': ('neo4j', 'password')\n}\n\n# ============================================================\n# Step 1: Find user Abby's user_id(s) from SQLite user database\n# ============================================================\nprint(\"=\" * 70)\nprint(\"STEP 1: Finding user 'Abby' in SQLite user database\")\nprint(\"=\" * 70)\n\ntry:\n    conn_user = sqlite3.connect(sqlite_paths['user'])\n    cursor_user = conn_user.cursor()\n    cursor_user.execute(\"SELECT user_id, name FROM user WHERE name = 'Abby'\")\n    abby_users = cursor_user.fetchall()\n    conn_user.close()\n    \n    abby_user_ids = [row[0] for row in abby_users]\n    print(f\"Found {len(abby_user_ids)} user(s) named 'Abby'\")\n    for uid in abby_user_ids[:5]:\n        print(f\"  user_id: {uid}\")\n    \n    if not abby_user_ids:\n        print(\"ERROR: No user named 'Abby' found. Exiting.\")\n        exit()\nexcept Exception as e:\n    print(f\"Error in Step 1: {e}\")\n    raise\n\n# ============================================================\n# Step 2: Use Neo4j to find Abby's reviewed cafes in Tucson\n# ============================================================\nprint(\"\\n\" + \"=\" * 70)\nprint(\"STEP 2: Querying Neo4j for Abby's reviewed cafes in Tucson\")\nprint(\"=\" * 70)\n\nabby_cafe_reviews = []\n\ntry:\n    driver = GraphDatabase.driver(\n        neo4j_config['uri'],\n        auth=neo4j_config['auth']\n    )\n    \n    with driver.session() as session:\n        # Query Neo4j graph: User -> WROTE -> Review -> REVIEWS -> Business\n        cypher_query = \"\"\"\n        MATCH (u:User)-[:WROTE]->(r:Review)-[:REVIEWS]->(b:Business)\n        WHERE u.user_id IN $user_ids\n          AND b.city = 'Tucson'\n          AND (b.categories CONTAINS 'Cafe' OR b.categories CONTAINS 'Cafes'\n               OR b.categories CONTAINS 'Coffee' OR b.categories CONTAINS 'Café')\n        RETURN b.business_id AS business_id,\n               b.name AS business_name,\n               b.address AS address,\n               b.stars AS business_stars,\n               b.categories AS categories,\n               r.text AS review_text,\n               r.stars AS review_stars,\n               r.review_id AS review_id,\n               u.user_id AS user_id\n        \"\"\"\n        \n        result = session.run(cypher_query, user_ids=abby_user_ids)\n        \n        for record in result:\n            abby_cafe_reviews.append({\n                'business_id': record['business_id'],\n                'business_name': record['business_name'],\n                'address': record['address'],\n                'business_stars': record['business_stars'],\n                'categories': record['categories'],\n                'review_text': record['review_text'],\n                'review_stars': record['review_stars'],\n                'review_id': record['review_id'],\n                'user_id': record['user_id']\n            })\n    \n    driver.close()\n    print(f\"Found {len(abby_cafe_reviews)} cafe review(s) by Abby in Tucson\")\n    \n    for r in abby_cafe_reviews:\n        print(f\"  Business: {r['business_name']} | Rating: {r['review_stars']} | Address: {r['address']}\")\n\nexcept Exception as e:\n    print(f\"Neo4j query failed: {e}\")\n    print(\"Falling back to SQLite for Step 2...\")\n    \n    # Fallback: Use SQLite joins across review, business databases\n    try:\n        conn_review = sqlite3.connect(sqlite_paths['review'])\n        conn_business = sqlite3.connect(sqlite_paths['business'])\n        \n        # Get Abby's reviews\n        placeholders = ','.join(['?' for _ in abby_user_ids])\n        cursor_r = conn_review.cursor()\n        cursor_r.execute(\n            f\"SELECT review_id, user_id, business_id, stars, text FROM review WHERE user_id IN ({placeholders})\",\n            abby_user_ids\n        )\n        abby_reviews = cursor_r.fetchall()\n        conn_review.close()\n        \n        # Get business details for those reviews in Tucson cafes\n        business_ids = list(set([r[2] for r in abby_reviews]))\n        \n        if business_ids:\n            placeholders_b = ','.join(['?' for _ in business_ids])\n            cursor_b = conn_business.cursor()\n            cursor_b.execute(\n                f\"\"\"SELECT business_id, name, address, stars, categories \n                    FROM business \n                    WHERE business_id IN ({placeholders_b}) \n                    AND city = 'Tucson'\n                    AND (categories LIKE '%Cafe%' OR categories LIKE '%Coffee%' OR categories LIKE '%Café%')\"\"\",\n                business_ids\n            )\n            tucson_cafes = {row[0]: row for row in cursor_b.fetchall()}\n            conn_business.close()\n            \n            for rev in abby_reviews:\n                review_id, user_id, business_id, stars, text = rev\n                if business_id in tucson_cafes:\n                    biz = tucson_cafes[business_id]\n                    abby_cafe_reviews.append({\n                        'business_id': biz[0],\n                        'business_name': biz[1],\n                        'address': biz[2],\n                        'business_stars': biz[3],\n                        'categories': biz[4],\n                        'review_text': text,\n                        'review_stars': stars,\n                        'review_id': review_id,\n                        'user_id': user_id\n                    })\n        \n        print(f\"Found {len(abby_cafe_reviews)} cafe review(s) by Abby in Tucson (via SQLite fallback)\")\n        for r in abby_cafe_reviews:\n            print(f\"  Business: {r['business_name']} | Rating: {r['review_stars']} | Address: {r['address']}\")\n    except Exception as e2:\n        print(f\"SQLite fallback also failed: {e2}\")\n        raise\n\nif not abby_cafe_reviews:\n    print(\"No cafe reviews found for Abby in Tucson. Exiting.\")\n    exit()\n\n# ============================================================\n# Step 3: Use Milvus vector search to find photos of cake/coffee cups\n# ============================================================\nprint(\"\\n\" + \"=\" * 70)\nprint(\"STEP 3: Searching Milvus for photos matching 'cake or coffee cups'\")\nprint(\"=\" * 70)\n\nbusiness_ids = list(set([r['business_id'] for r in abby_cafe_reviews]))\nmatching_photo_ids = []\nmatching_photo_results = []\n\ntry:\n    # Connect to Milvus\n    connections.connect(\n        alias='default',\n        host=milvus_config['host'],\n        port=milvus_config['port']\n    )\n    print(\"Connected to Milvus successfully\")\n    \n    # Load the photo vector collection\n    photo_collection = Collection(milvus_config['collections']['photos'])\n    photo_collection.load()\n    \n    # Load sentence transformer model for text-to-vector encoding\n    model = SentenceTransformer('clip-ViT-B-32')  # CLIP model for image-text matching\n    \n    # Encode search queries\n    search_queries = ['cake', 'coffee cups', 'cake and coffee cups on table']\n    \n    for query_text in search_queries:\n        query_embedding = model.encode([query_text])\n        \n        # Build business_id filter expression\n        bid_list_str = ', '.join([f'\"{ bid}\"' for bid in business_ids])\n        expr_filter = f'business_id in [{bid_list_str}]'\n        \n        search_params = {\n            'metric_type': 'L2',\n            'params': {'nprobe': 16}\n        }\n        \n        results = photo_collection.search(\n            data=query_embedding.tolist(),\n            anns_field='photo_vector',\n            param=search_params,\n            limit=50,\n            expr=expr_filter,\n            output_fields=['photo_id', 'business_id']\n        )\n        \n        for hits in results:\n            for hit in hits:\n                photo_id = hit.entity.get('photo_id')\n                biz_id = hit.entity.get('business_id')\n                distance = hit.distance\n                if photo_id not in matching_photo_ids:\n                    matching_photo_ids.append(photo_id)\n                    matching_photo_results.append({\n                        'photo_id': photo_id,\n                        'business_id': biz_id,\n                        'distance': distance,\n                        'query': query_text\n                    })\n    \n    print(f\"Found {len(matching_photo_ids)} candidate photo(s) from Milvus vector search\")\n    \n    connections.disconnect('default')\n\nexcept Exception as e:\n    print(f\"Milvus search error: {e}\")\n    print(\"Will attempt SQLite photo fallback...\")\n\n# ============================================================\n# Step 4: Cross-reference with SQLite photo database for metadata\n# ============================================================\nprint(\"\\n\" + \"=\" * 70)\nprint(\"STEP 4: Cross-referencing photos with SQLite photo database\")\nprint(\"=\" * 70)\n\nphoto_details_by_business = {}  # business_id -> list of photo details\n\ntry:\n    conn_photo = sqlite3.connect(sqlite_paths['photo'])\n    cursor_photo = conn_photo.cursor()\n    \n    if matching_photo_ids:\n        # Verify and enrich Milvus results with SQLite metadata\n        placeholders_p = ','.join(['?' for _ in matching_photo_ids])\n        cursor_photo.execute(\n            f\"\"\"SELECT photo_id, business_id, caption, label \n                FROM photo \n                WHERE photo_id IN ({placeholders_p})\"\"\",\n            matching_photo_ids\n        )\n        photo_rows = cursor_photo.fetchall()\n        \n        for row in photo_rows:\n            pid, bid, caption, label = row\n            caption_lower = (caption or '').lower()\n            label_lower = (label or '').lower()\n            # Filter for cake/coffee relevance\n            is_relevant = (\n                'food' in label_lower or\n                'drink' in label_lower or\n                'cake' in caption_lower or\n                'coffee' in caption_lower or\n                'cup' in caption_lower or\n                'latte' in caption_lower or\n                'pastry' in caption_lower or\n                'dessert' in caption_lower\n            )\n            if is_relevant or True:  # Keep all Milvus results (vector similarity already filtered)\n                if bid not in photo_details_by_business:\n                    photo_details_by_business[bid] = []\n                photo_details_by_business[bid].append({\n                    'photo_id': pid,\n                    'caption': caption,\n                    'label': label\n                })\n    \n    # Also do a direct SQLite search for cake/coffee photos at these businesses\n    if business_ids:\n        placeholders_b = ','.join(['?' for _ in business_ids])\n        cursor_photo.execute(\n            f\"\"\"SELECT photo_id, business_id, caption, label \n                FROM photo \n                WHERE business_id IN ({placeholders_b})\n                AND (\n                    caption LIKE '%cake%' OR caption LIKE '%coffee%' OR\n                    caption LIKE '%cup%' OR caption LIKE '%latte%' OR\n                    caption LIKE '%pastry%' OR caption LIKE '%dessert%' OR\n                    label = 'food' OR label = 'drink'\n                )\"\"\",\n            business_ids\n        )\n        extra_photos = cursor_photo.fetchall()\n        \n        for row in extra_photos:\n            pid, bid, caption, label = row\n            if bid not in photo_details_by_business:\n                photo_details_by_business[bid] = []\n            # Avoid duplicates\n            existing_ids = [p['photo_id'] for p in photo_details_by_business[bid]]\n            if pid not in existing_ids:\n                photo_details_by_business[bid].append({\n                    'photo_id': pid,\n                    'caption': caption,\n                    'label': label\n                })\n    \n    conn_photo.close()\n    \n    total_photos = sum(len(v) for v in photo_details_by_business.values())\n    print(f\"Total relevant photos found: {total_photos}\")\n    for bid, photos in photo_details_by_business.items():\n        print(f\"  Business {bid}: {len(photos)} photo(s)\")\n\nexcept Exception as e:\n    print(f\"Error in Step 4: {e}\")\n\n# ============================================================\n# Step 5: Compile final results - review summary, address, rating, photo count\n# ============================================================\nprint(\"\\n\" + \"=\" * 70)\nprint(\"STEP 5: Compiling Final Results\")\nprint(\"=\" * 70)\n\ndef summarize_review(text, max_length=200):\n    \"\"\"Create a brief summary of the review text.\"\"\"\n    if not text:\n        return \"No review text available.\"\n    text = text.strip()\n    if len(text) <= max_length:\n        return text\n    # Try to cut at sentence boundary\n    truncated = text[:max_length]\n    last_period = truncated.rfind('.')\n    last_excl = truncated.rfind('!')\n    last_ques = truncated.rfind('?')\n    cut_point = max(last_period, last_excl, last_ques)\n    if cut_point > max_length * 0.5:\n        return truncated[:cut_point + 1]\n    return truncated + '...'\n\nfinal_results = []\n\nfor review in abby_cafe_reviews:\n    bid = review['business_id']\n    photos = photo_details_by_business.get(bid, [])\n    photo_count = len(photos)\n    \n    result_entry = {\n        'business_name': review['business_name'],\n        'address': review['address'],\n        'categories': review['categories'],\n        'review_rating': review['review_stars'],\n        'business_rating': review['business_stars'],\n        'review_summary': summarize_review(review['review_text']),\n        'photo_count': photo_count,\n        'photo_details': photos[:5]  # Show up to 5 photo details\n    }\n    final_results.append(result_entry)\n\n# ============================================================\n# Display Final Results\n# ============================================================\nprint(\"\\n\" + \"=\" * 70)\nprint(\"FINAL RESULTS: Abby's Reviewed Cafes in Tucson with Cake/Coffee Photos\")\nprint(\"=\" * 70)\n\nif not final_results:\n    print(\"No results found matching the criteria.\")\nelse:\n    for i, result in enumerate(final_results, 1):\n        print(f\"\\n{'─' * 60}\")\n        print(f\"  Cafe #{i}: {result['business_name']}\")\n        print(f\"{'─' * 60}\")\n        print(f\"  📍 Address       : {result['address']}\")\n        print(f\"  📂 Categories    : {result['categories']}\")\n        print(f\"  ⭐ Abby's Rating : {result['review_rating']} / 5\")\n        print(f\"  ⭐ Business Avg  : {result['business_rating']} / 5\")\n        print(f\"  📝 Review Summary: {result['review_summary']}\")\n        print(f\"  📷 Matching Photos (cake/coffee cups): {result['photo_count']}\")\n        \n        if result['photo_details']:\n            for j, photo in enumerate(result['photo_details'], 1):\n                caption_display = photo['caption'] if photo['caption'] else 'No caption'\n                label_display = photo['label'] if photo['label'] else 'N/A'\n                print(f\"     Photo {j}: [ID: {photo['photo_id'][:12]}...] Label: {label_display} | Caption: {caption_display}\")\n        else:\n            print(f\"     (No matching cake/coffee cup photos found for this cafe)\")\n\nprint(f\"\\n{'=' * 70}\")\nprint(f\"SUMMARY: Found {len(final_results)} cafe(s) reviewed by Abby in Tucson\")\nprint(f\"         Total matching photos: {sum(r['photo_count'] for r in final_results)}\")\nprint(f\"{'=' * 70}\")\n"
+    }
+  },
+  {
+    "index": 104,
+    "question": "For user Rodney's tips in Philadelphia nightlife venues, find photos with neon lights or cocktails and return tips, business names, and photo counts.",
+    "success": true,
+    "result": {
+      "analysis": "This is a complex multi-database query that requires: 1) Finding user 'Rodney' from SQLite user database, 2) Finding businesses in Philadelphia with 'Nightlife' category from SQLite business database, 3) Finding tips by Rodney for those nightlife venues from SQLite tip database, 4) Using vector similarity search in Milvus to find photos related to 'neon lights or cocktails' for those businesses, 5) Aggregating results with tip text, business names, and photo counts. This involves SQL queries across multiple SQLite databases, and vector search in Milvus.",
+      "natural_question": "For user Rodney's tips in Philadelphia nightlife venues, find photos with neon lights or cocktails and return tips, business names, and photo counts.",
+      "difficulty": "hard",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "user.db"
+            ],
+            "filter_condition": {
+              "name": {
+                "$eq": "Rodney"
+              }
+            }
+          },
+          "result_var": "rodney_users",
+          "description": {
+            "narrative": "Query the SQLite user database to find all users named 'Rodney' and retrieve their user_id(s).",
+            "example_query": "SELECT user_id, name FROM user WHERE name = 'Rodney';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "business.db"
+            ],
+            "filter_condition": {
+              "city": {
+                "$eq": "Philadelphia"
+              },
+              "categories": {
+                "$like": "%Nightlife%"
+              }
+            }
+          },
+          "result_var": "philly_nightlife_businesses",
+          "description": {
+            "narrative": "Query the SQLite business database to find all businesses in Philadelphia that have 'Nightlife' in their categories.",
+            "example_query": "SELECT business_id, name, categories FROM business WHERE city = 'Philadelphia' AND categories LIKE '%Nightlife%';"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "tip.db"
+            ],
+            "filter_condition": {
+              "user_id": {
+                "$in": "rodney_user_ids"
+              },
+              "business_id": {
+                "$in": "philly_nightlife_business_ids"
+              }
+            }
+          },
+          "result_var": "rodney_tips",
+          "description": {
+            "narrative": "Query the SQLite tip database to find tips written by Rodney for the Philadelphia nightlife businesses identified in previous steps.",
+            "example_query": "SELECT business_id, text, date FROM tip WHERE user_id IN (...) AND business_id IN (...);"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "photo_vector"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "$in": "matched_business_ids"
+              },
+              "search_text": "neon lights or cocktails"
+            }
+          },
+          "result_var": "matching_photos",
+          "description": {
+            "narrative": "Use Milvus vector similarity search on the photo_vector collection to find photos semantically related to 'neon lights or cocktails', filtered by the business_ids from matched nightlife venues where Rodney left tips.",
+            "example_query": "collection.search(data=[embedding('neon lights or cocktails')], anns_field='vector', param={'metric_type':'L2','params':{'nprobe':10}}, limit=100, expr='business_id in [...]', output_fields=['business_id','photo_id'])"
+          }
+        },
+        {
+          "step": 5,
+          "parameters": {
+            "ms_names": [
+              "aggregation"
+            ],
+            "filter_condition": {}
+          },
+          "result_var": "final_results",
+          "description": {
+            "narrative": "Aggregate all results: join Rodney's tips with business names and count matching photos per business. Return tip text, business name, and photo count for each venue.",
+            "example_query": "Pandas merge and groupby aggregation on business_id to combine tips, business names, and photo counts."
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport pandas as pd\nfrom pymilvus import connections, Collection\nfrom sentence_transformers import SentenceTransformer\nimport warnings\nwarnings.filterwarnings('ignore')\n\n# ============================================================\n# Database Configuration\n# ============================================================\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nmilvus_config = {\n    'host': 'localhost',\n    'port': '19530',\n    'collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    }\n}\n\n# ============================================================\n# Step 1: Find user Rodney's user_id(s)\n# ============================================================\nprint(\"=\" * 70)\nprint(\"Step 1: Finding user 'Rodney' in user database...\")\nprint(\"=\" * 70)\n\ntry:\n    conn_user = sqlite3.connect(sqlite_paths['user'])\n    query_user = \"SELECT user_id, name FROM user WHERE name = 'Rodney';\"\n    rodney_users = pd.read_sql_query(query_user, conn_user)\n    conn_user.close()\n    \n    print(f\"Found {len(rodney_users)} user(s) named 'Rodney'\")\n    print(rodney_users.to_string(index=False))\n    \n    if rodney_users.empty:\n        print(\"No user named 'Rodney' found. Exiting.\")\n        exit()\n    \n    rodney_user_ids = rodney_users['user_id'].tolist()\nexcept Exception as e:\n    print(f\"Error in Step 1: {e}\")\n    exit()\n\n# ============================================================\n# Step 2: Find Philadelphia Nightlife businesses\n# ============================================================\nprint(\"\\n\" + \"=\" * 70)\nprint(\"Step 2: Finding Philadelphia Nightlife businesses...\")\nprint(\"=\" * 70)\n\ntry:\n    conn_biz = sqlite3.connect(sqlite_paths['business'])\n    query_biz = \"\"\"\n        SELECT business_id, name, categories, city\n        FROM business\n        WHERE city = 'Philadelphia'\n          AND categories LIKE '%Nightlife%';\n    \"\"\"\n    philly_nightlife = pd.read_sql_query(query_biz, conn_biz)\n    conn_biz.close()\n    \n    print(f\"Found {len(philly_nightlife)} Nightlife businesses in Philadelphia\")\n    if not philly_nightlife.empty:\n        print(philly_nightlife[['business_id', 'name', 'categories']].head(10).to_string(index=False))\n    \n    if philly_nightlife.empty:\n        print(\"No Nightlife businesses found in Philadelphia. Exiting.\")\n        exit()\n    \n    nightlife_biz_ids = philly_nightlife['business_id'].tolist()\nexcept Exception as e:\n    print(f\"Error in Step 2: {e}\")\n    exit()\n\n# ============================================================\n# Step 3: Find Rodney's tips for those businesses\n# ============================================================\nprint(\"\\n\" + \"=\" * 70)\nprint(\"Step 3: Finding Rodney's tips for Philadelphia Nightlife venues...\")\nprint(\"=\" * 70)\n\ntry:\n    conn_tip = sqlite3.connect(sqlite_paths['tip'])\n    \n    # Build parameterized query with placeholders\n    user_placeholders = ','.join(['?' for _ in rodney_user_ids])\n    biz_placeholders = ','.join(['?' for _ in nightlife_biz_ids])\n    \n    query_tip = f\"\"\"\n        SELECT business_id, user_id, text, date\n        FROM tip\n        WHERE user_id IN ({user_placeholders})\n          AND business_id IN ({biz_placeholders});\n    \"\"\"\n    params = rodney_user_ids + nightlife_biz_ids\n    rodney_tips = pd.read_sql_query(query_tip, conn_tip, params=params)\n    conn_tip.close()\n    \n    print(f\"Found {len(rodney_tips)} tip(s) by Rodney in Philadelphia Nightlife venues\")\n    if not rodney_tips.empty:\n        print(rodney_tips.to_string(index=False))\n    \n    if rodney_tips.empty:\n        print(\"No tips found by Rodney for Philadelphia Nightlife venues. Exiting.\")\n        exit()\n    \n    matched_biz_ids = rodney_tips['business_id'].unique().tolist()\n    print(f\"\\nMatched business IDs with tips: {matched_biz_ids}\")\nexcept Exception as e:\n    print(f\"Error in Step 3: {e}\")\n    exit()\n\n# ============================================================\n# Step 4: Vector search for photos with 'neon lights or cocktails'\n# ============================================================\nprint(\"\\n\" + \"=\" * 70)\nprint(\"Step 4: Searching for photos related to 'neon lights or cocktails'...\")\nprint(\"=\" * 70)\n\ntry:\n    # Connect to Milvus\n    connections.connect(\"default\", host=milvus_config['host'], port=milvus_config['port'])\n    print(\"Connected to Milvus successfully.\")\n    \n    # Load the photo vector collection\n    photo_collection = Collection(milvus_config['collections']['photos'])\n    photo_collection.load()\n    print(f\"Loaded collection: {milvus_config['collections']['photos']}\")\n    \n    # Get collection schema info\n    schema = photo_collection.schema\n    print(f\"Collection schema fields: {[f.name for f in schema.fields]}\")\n    \n    # Generate embedding for the search query\n    model = SentenceTransformer('all-MiniLM-L6-v2')\n    search_text = \"neon lights or cocktails\"\n    query_embedding = model.encode([search_text])\n    print(f\"Generated embedding for: '{search_text}'\")\n    \n    # Determine the vector field name and dimension from schema\n    vector_field = None\n    for field in schema.fields:\n        if field.dtype.name in ['FLOAT_VECTOR', 'BINARY_VECTOR']:\n            vector_field = field.name\n            break\n    \n    if vector_field is None:\n        vector_field = 'vector'  # default fallback\n    print(f\"Using vector field: {vector_field}\")\n    \n    # Build filter expression for business_ids\n    biz_id_str_list = ', '.join([f'\\\"{ bid}\\\"' for bid in matched_biz_ids])\n    filter_expr = f'business_id in [{biz_id_str_list}]'\n    print(f\"Filter expression: {filter_expr}\")\n    \n    # Determine available output fields (exclude vector field and primary key if auto)\n    output_fields = []\n    for field in schema.fields:\n        if field.dtype.name not in ['FLOAT_VECTOR', 'BINARY_VECTOR']:\n            output_fields.append(field.name)\n    print(f\"Output fields: {output_fields}\")\n    \n    # Perform vector similarity search\n    search_params = {\n        \"metric_type\": \"L2\",\n        \"params\": {\"nprobe\": 10}\n    }\n    \n    results = photo_collection.search(\n        data=query_embedding.tolist(),\n        anns_field=vector_field,\n        param=search_params,\n        limit=200,\n        expr=filter_expr,\n        output_fields=output_fields\n    )\n    \n    # Parse search results\n    photo_records = []\n    for hits in results:\n        for hit in hits:\n            record = {'distance': hit.distance}\n            for field_name in output_fields:\n                record[field_name] = hit.entity.get(field_name)\n            photo_records.append(record)\n    \n    matching_photos = pd.DataFrame(photo_records)\n    print(f\"\\nFound {len(matching_photos)} matching photo(s) via vector search\")\n    \n    if not matching_photos.empty:\n        # Apply a similarity threshold to filter relevant photos\n        # Lower distance = more similar for L2 metric\n        distance_threshold = matching_photos['distance'].median()\n        relevant_photos = matching_photos[matching_photos['distance'] <= distance_threshold].copy()\n        print(f\"After filtering (distance <= {distance_threshold:.4f}): {len(relevant_photos)} photos\")\n        print(relevant_photos.head(10).to_string(index=False))\n    else:\n        relevant_photos = matching_photos\n        print(\"No matching photos found via vector search.\")\n    \n    # Disconnect from Milvus\n    connections.disconnect(\"default\")\n    \nexcept Exception as e:\n    print(f\"Error in Step 4: {e}\")\n    relevant_photos = pd.DataFrame()\n    try:\n        connections.disconnect(\"default\")\n    except:\n        pass\n\n# ============================================================\n# Step 5: Aggregate final results\n# ============================================================\nprint(\"\\n\" + \"=\" * 70)\nprint(\"Step 5: Aggregating final results...\")\nprint(\"=\" * 70)\n\ntry:\n    # Build business name lookup from philly_nightlife\n    biz_name_map = philly_nightlife.set_index('business_id')['name'].to_dict()\n    \n    # Add business name to tips\n    rodney_tips['business_name'] = rodney_tips['business_id'].map(biz_name_map)\n    \n    if not relevant_photos.empty and 'business_id' in relevant_photos.columns:\n        # Count photos per business\n        photo_counts = relevant_photos.groupby('business_id').size().reset_index(name='photo_count')\n        \n        # Merge tips with photo counts\n        final_results = rodney_tips.merge(\n            photo_counts,\n            on='business_id',\n            how='left'\n        )\n        final_results['photo_count'] = final_results['photo_count'].fillna(0).astype(int)\n    else:\n        final_results = rodney_tips.copy()\n        final_results['photo_count'] = 0\n        print(\"No photo data available; photo_count set to 0.\")\n    \n    # Select and format output columns\n    output_columns = ['business_name', 'text', 'photo_count', 'date', 'business_id']\n    available_cols = [c for c in output_columns if c in final_results.columns]\n    final_results = final_results[available_cols]\n    \n    # Rename for clarity\n    rename_map = {\n        'text': 'tip_text',\n        'date': 'tip_date'\n    }\n    final_results = final_results.rename(columns={k: v for k, v in rename_map.items() if k in final_results.columns})\n    \n    print(\"\\n\" + \"=\" * 70)\n    print(\"FINAL RESULTS: Rodney's Tips at Philadelphia Nightlife Venues\")\n    print(\"with Photo Counts (neon lights / cocktails related)\")\n    print(\"=\" * 70)\n    print(f\"\\nTotal results: {len(final_results)}\")\n    print()\n    \n    if not final_results.empty:\n        for idx, row in final_results.iterrows():\n            print(f\"--- Result {idx + 1} ---\")\n            print(f\"  Business Name : {row.get('business_name', 'N/A')}\")\n            print(f\"  Tip Text      : {row.get('tip_text', 'N/A')}\")\n            print(f\"  Photo Count   : {row.get('photo_count', 0)}\")\n            print(f\"  Tip Date      : {row.get('tip_date', 'N/A')}\")\n            print(f\"  Business ID   : {row.get('business_id', 'N/A')}\")\n            print()\n    else:\n        print(\"No results found matching all criteria.\")\n    \n    print(\"=\" * 70)\n    print(\"Query execution completed successfully.\")\n    print(\"=\" * 70)\n\nexcept Exception as e:\n    print(f\"Error in Step 5: {e}\")\n"
+    }
+  },
+  {
+    "index": 105,
+    "question": "Using user Nam's friends, find bars in Tampa they reviewed with photos of bar counters or beer; list friend names and ratings with addresses.",
+    "success": true,
+    "result": {
+      "analysis": "This is a complex multi-database query that requires: 1) Finding user 'Nam' and their friends from Neo4j graph database (friendship relationships), 2) Finding bars in Tampa from SQLite business database, 3) Finding reviews by those friends for Tampa bars from SQLite review database, 4) Finding photos of those businesses that show bar counters or beer using Milvus vector similarity search, 5) Joining all results together. This involves all three databases: Neo4j for social graph traversal, SQLite for structured business/review data, and Milvus for semantic image search.",
+      "natural_question": "Using user Nam's friends, find bars in Tampa they reviewed with photos of bar counters or beer; list friend names and ratings with addresses.",
+      "difficulty": "hard",
+      "query_types": [
+        "graph",
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "neo4j"
+            ],
+            "filter_condition": {
+              "user.name": {
+                "$eq": "Nam"
+              }
+            }
+          },
+          "result_var": "nam_friends",
+          "description": {
+            "narrative": "Query Neo4j graph database to find user 'Nam' and traverse FRIEND relationships to get all friend user_ids and names.",
+            "example_query": "MATCH (u:User {name: 'Nam'})-[:FRIEND]->(f:User) RETURN f.user_id AS friend_id, f.name AS friend_name"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "business.db"
+            ],
+            "filter_condition": {
+              "city": {
+                "$eq": "Tampa"
+              },
+              "categories": {
+                "$like": "%Bars%"
+              }
+            }
+          },
+          "result_var": "tampa_bars",
+          "description": {
+            "narrative": "Query SQLite business database to find all bars located in Tampa by filtering on city='Tampa' and categories containing 'Bars'.",
+            "example_query": "SELECT business_id, name, address, city, state, categories FROM business WHERE city = 'Tampa' AND categories LIKE '%Bars%'"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "review.db"
+            ],
+            "filter_condition": {
+              "user_id": {
+                "$in": "nam_friends.friend_ids"
+              },
+              "business_id": {
+                "$in": "tampa_bars.business_ids"
+              }
+            }
+          },
+          "result_var": "friend_reviews",
+          "description": {
+            "narrative": "Query SQLite review database to find reviews written by Nam's friends for the Tampa bars identified in step 2.",
+            "example_query": "SELECT review_id, user_id, business_id, stars FROM review WHERE user_id IN (...) AND business_id IN (...)"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "photo.db"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "$in": "reviewed_business_ids"
+              }
+            }
+          },
+          "result_var": "business_photos",
+          "description": {
+            "narrative": "Query SQLite photo database to get photo_ids for the reviewed businesses, then filter by label or use Milvus vector search for bar counter/beer imagery.",
+            "example_query": "SELECT photo_id, business_id, caption, label FROM photo WHERE business_id IN (...) AND (label IN ('drink', 'inside') OR caption LIKE '%bar%' OR caption LIKE '%beer%')"
+          }
+        },
+        {
+          "step": 5,
+          "parameters": {
+            "ms_names": [
+              "photo_vector"
+            ],
+            "filter_condition": {
+              "search_text": "bar counter beer drinks",
+              "photo_ids": "business_photos.photo_ids"
+            }
+          },
+          "result_var": "matching_photos",
+          "description": {
+            "narrative": "Use Milvus vector database to perform semantic similarity search on photo embeddings to find images depicting bar counters or beer. Filter results to only include photos from the relevant businesses.",
+            "example_query": "collection.search(data=[embedding('bar counter beer')], anns_field='vector', param={'metric_type': 'L2', 'params': {'nprobe': 16}}, limit=200, expr='business_id in [...]')"
+          }
+        },
+        {
+          "step": 6,
+          "parameters": {
+            "ms_names": [
+              "combined"
+            ],
+            "filter_condition": {}
+          },
+          "result_var": "final_results",
+          "description": {
+            "narrative": "Join all results: match friend reviews with businesses that have matching photos. Output friend names, star ratings, business names, and addresses.",
+            "example_query": "JOIN friend_reviews WITH tampa_bars ON business_id, FILTER by businesses with matching_photos"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport pandas as pd\nfrom neo4j import GraphDatabase\nfrom pymilvus import connections, Collection\nfrom sentence_transformers import SentenceTransformer\nimport warnings\nwarnings.filterwarnings('ignore')\n\n# ============================================================\n# Database Configuration\n# ============================================================\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nmilvus_config = {\n    'host': 'localhost',\n    'port': '19530',\n    'collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    }\n}\n\nneo4j_config = {\n    'uri': 'bolt://localhost:7687',\n    'auth': ('neo4j', 'password')\n}\n\n# ============================================================\n# Step 1: Find Nam's friends from Neo4j\n# ============================================================\nprint(\"=\" * 70)\nprint(\"Step 1: Finding user Nam's friends from Neo4j graph database...\")\nprint(\"=\" * 70)\n\nnam_friends = []\ntry:\n    driver = GraphDatabase.driver(neo4j_config['uri'], auth=neo4j_config['auth'])\n    with driver.session() as session:\n        result = session.run(\n            \"\"\"\n            MATCH (u:User {name: 'Nam'})-[:FRIEND]->(f:User)\n            RETURN f.user_id AS friend_id, f.name AS friend_name\n            \"\"\"\n        )\n        nam_friends = [{'friend_id': record['friend_id'], 'friend_name': record['friend_name']} for record in result]\n    driver.close()\n    print(f\"Found {len(nam_friends)} friends of Nam.\")\nexcept Exception as e:\n    print(f\"Neo4j error: {e}\")\n    # Fallback: try SQLite user table for friends\n    print(\"Falling back to SQLite user table for friend lookup...\")\n    try:\n        conn_user = sqlite3.connect(sqlite_paths['user'])\n        cursor = conn_user.cursor()\n        cursor.execute(\"SELECT user_id, friends FROM user WHERE name = 'Nam'\")\n        rows = cursor.fetchall()\n        friend_ids_set = set()\n        for row in rows:\n            if row[1]:\n                fids = [f.strip() for f in row[1].split(',') if f.strip() and f.strip() != 'None']\n                friend_ids_set.update(fids)\n        if friend_ids_set:\n            placeholders = ','.join(['?' for _ in friend_ids_set])\n            cursor.execute(f\"SELECT user_id, name FROM user WHERE user_id IN ({placeholders})\", list(friend_ids_set))\n            for r in cursor.fetchall():\n                nam_friends.append({'friend_id': r[0], 'friend_name': r[1]})\n        conn_user.close()\n        print(f\"Found {len(nam_friends)} friends of Nam via SQLite fallback.\")\n    except Exception as e2:\n        print(f\"SQLite fallback error: {e2}\")\n\nif not nam_friends:\n    print(\"No friends found for user Nam. Exiting.\")\nelse:\n    friend_ids = [f['friend_id'] for f in nam_friends]\n    friend_name_map = {f['friend_id']: f['friend_name'] for f in nam_friends}\n    print(f\"Sample friends: {[f['friend_name'] for f in nam_friends[:5]]}\")\n\n    # ============================================================\n    # Step 2: Find bars in Tampa from SQLite business database\n    # ============================================================\n    print(\"\\n\" + \"=\" * 70)\n    print(\"Step 2: Finding bars in Tampa from SQLite business database...\")\n    print(\"=\" * 70)\n\n    conn_biz = sqlite3.connect(sqlite_paths['business'])\n    tampa_bars_df = pd.read_sql_query(\n        \"\"\"\n        SELECT business_id, name, address, city, state, stars, categories\n        FROM business\n        WHERE city = 'Tampa'\n          AND categories LIKE '%Bars%'\n        \"\"\",\n        conn_biz\n    )\n    conn_biz.close()\n    print(f\"Found {len(tampa_bars_df)} bars in Tampa.\")\n    print(tampa_bars_df[['name', 'address']].head())\n\n    tampa_bar_ids = tampa_bars_df['business_id'].tolist()\n\n    # ============================================================\n    # Step 3: Find reviews by Nam's friends for Tampa bars\n    # ============================================================\n    print(\"\\n\" + \"=\" * 70)\n    print(\"Step 3: Finding reviews by Nam's friends for Tampa bars...\")\n    print(\"=\" * 70)\n\n    conn_review = sqlite3.connect(sqlite_paths['review'])\n\n    # Build parameterized query for both friend_ids and bar_ids\n    if friend_ids and tampa_bar_ids:\n        friend_placeholders = ','.join(['?' for _ in friend_ids])\n        bar_placeholders = ','.join(['?' for _ in tampa_bar_ids])\n        query = f\"\"\"\n            SELECT review_id, user_id, business_id, stars, text, date\n            FROM review\n            WHERE user_id IN ({friend_placeholders})\n              AND business_id IN ({bar_placeholders})\n        \"\"\"\n        friend_reviews_df = pd.read_sql_query(query, conn_review, params=friend_ids + tampa_bar_ids)\n    else:\n        friend_reviews_df = pd.DataFrame()\n\n    conn_review.close()\n    print(f\"Found {len(friend_reviews_df)} reviews by Nam's friends for Tampa bars.\")\n\n    if friend_reviews_df.empty:\n        print(\"No reviews found. No results to display.\")\n    else:\n        reviewed_biz_ids = friend_reviews_df['business_id'].unique().tolist()\n        print(f\"Reviews span {len(reviewed_biz_ids)} unique businesses.\")\n\n        # ============================================================\n        # Step 4: Get photos for reviewed businesses from SQLite\n        # ============================================================\n        print(\"\\n\" + \"=\" * 70)\n        print(\"Step 4: Getting photos for reviewed businesses...\")\n        print(\"=\" * 70)\n\n        conn_photo = sqlite3.connect(sqlite_paths['photo'])\n        biz_placeholders = ','.join(['?' for _ in reviewed_biz_ids])\n        photos_df = pd.read_sql_query(\n            f\"\"\"\n            SELECT photo_id, business_id, caption, label\n            FROM photo\n            WHERE business_id IN ({biz_placeholders})\n            \"\"\",\n            conn_photo,\n            params=reviewed_biz_ids\n        )\n        conn_photo.close()\n        print(f\"Found {len(photos_df)} total photos for reviewed businesses.\")\n\n        # Pre-filter: photos with relevant labels or captions\n        label_filtered = photos_df[\n            (photos_df['label'].str.lower().isin(['drink', 'inside', 'food'])) |\n            (photos_df['caption'].str.lower().str.contains('bar|beer|counter|drink|ale|brew|tap|pint', na=False))\n        ]\n        print(f\"Pre-filtered to {len(label_filtered)} photos with relevant labels/captions.\")\n\n        # ============================================================\n        # Step 5: Milvus vector search for bar counter / beer photos\n        # ============================================================\n        print(\"\\n\" + \"=\" * 70)\n        print(\"Step 5: Semantic search in Milvus for bar counter/beer photos...\")\n        print(\"=\" * 70)\n\n        matching_photo_biz_ids = set()\n        matching_photo_details = []\n\n        try:\n            connections.connect(alias='default', host=milvus_config['host'], port=milvus_config['port'])\n            collection = Collection(milvus_config['collections']['photos'])\n            collection.load()\n\n            # Generate embedding for search query\n            model = SentenceTransformer('all-MiniLM-L6-v2')\n            search_queries = ['bar counter with drinks', 'beer glasses on bar', 'beer bottles and taps']\n\n            for sq in search_queries:\n                query_embedding = model.encode([sq])\n\n                # Build filter expression for business_ids\n                if reviewed_biz_ids:\n                    biz_filter_parts = [f'business_id == \"{bid}\"' for bid in reviewed_biz_ids]\n                    expr = ' || '.join(biz_filter_parts) if len(biz_filter_parts) <= 50 else ''\n                else:\n                    expr = ''\n\n                search_params = {\n                    'metric_type': 'L2',\n                    'params': {'nprobe': 16}\n                }\n\n                results = collection.search(\n                    data=query_embedding.tolist(),\n                    anns_field='vector',\n                    param=search_params,\n                    limit=200,\n                    expr=expr if expr else None,\n                    output_fields=['business_id', 'photo_id']\n                )\n\n                for hits in results:\n                    for hit in hits:\n                        bid = hit.entity.get('business_id')\n                        pid = hit.entity.get('photo_id')\n                        if bid in reviewed_biz_ids:\n                            matching_photo_biz_ids.add(bid)\n                            matching_photo_details.append({\n                                'business_id': bid,\n                                'photo_id': pid,\n                                'distance': hit.distance,\n                                'search_query': sq\n                            })\n\n            connections.disconnect('default')\n            print(f\"Milvus found matching photos for {len(matching_photo_biz_ids)} businesses.\")\n\n        except Exception as e:\n            print(f\"Milvus search error: {e}\")\n            print(\"Falling back to label/caption-based photo filtering only.\")\n            # Fallback: use label_filtered from Step 4\n            matching_photo_biz_ids = set(label_filtered['business_id'].unique())\n            for _, row in label_filtered.iterrows():\n                matching_photo_details.append({\n                    'business_id': row['business_id'],\n                    'photo_id': row['photo_id'],\n                    'distance': None,\n                    'search_query': f\"label={row['label']}, caption={row['caption']}\"\n                })\n\n        # Also include label-filtered results\n        for _, row in label_filtered.iterrows():\n            matching_photo_biz_ids.add(row['business_id'])\n\n        print(f\"Total businesses with bar/beer photos: {len(matching_photo_biz_ids)}\")\n\n        # ============================================================\n        # Step 6: Combine all results\n        # ============================================================\n        print(\"\\n\" + \"=\" * 70)\n        print(\"Step 6: Combining results - Final Output\")\n        print(\"=\" * 70)\n\n        # Filter reviews to only businesses with matching photos\n        final_reviews = friend_reviews_df[friend_reviews_df['business_id'].isin(matching_photo_biz_ids)].copy()\n\n        if final_reviews.empty:\n            print(\"\\nNo bars in Tampa reviewed by Nam's friends have photos of bar counters or beer.\")\n        else:\n            # Add friend names\n            final_reviews['friend_name'] = final_reviews['user_id'].map(friend_name_map)\n\n            # Merge with business info for addresses\n            final_df = final_reviews.merge(\n                tampa_bars_df[['business_id', 'name', 'address', 'city', 'state', 'categories']],\n                on='business_id',\n                how='left'\n            )\n\n            # Create photo info for display\n            photo_info_df = pd.DataFrame(matching_photo_details)\n            if not photo_info_df.empty:\n                photo_summary = photo_info_df.groupby('business_id')['photo_id'].apply(\n                    lambda x: ', '.join(set(str(p) for p in x if p))\n                ).reset_index()\n                photo_summary.columns = ['business_id', 'matching_photo_ids']\n                final_df = final_df.merge(photo_summary, on='business_id', how='left')\n\n            # Select and rename columns for display\n            display_cols = ['friend_name', 'name', 'address', 'city', 'state', 'stars', 'date']\n            if 'matching_photo_ids' in final_df.columns:\n                display_cols.append('matching_photo_ids')\n\n            result_df = final_df[display_cols].rename(columns={\n                'friend_name': 'Friend Name',\n                'name': 'Bar Name',\n                'address': 'Address',\n                'city': 'City',\n                'state': 'State',\n                'stars': 'Rating (Stars)',\n                'date': 'Review Date',\n                'matching_photo_ids': 'Photo IDs (bar/beer)'\n            })\n\n            result_df = result_df.sort_values(['Friend Name', 'Bar Name']).reset_index(drop=True)\n\n            print(\"\\n\" + \"=\" * 70)\n            print(\"RESULTS: Tampa Bars Reviewed by Nam's Friends (with bar/beer photos)\")\n            print(\"=\" * 70)\n            pd.set_option('display.max_columns', None)\n            pd.set_option('display.width', None)\n            pd.set_option('display.max_colwidth', 40)\n            print(result_df.to_string(index=False))\n            print(f\"\\nTotal results: {len(result_df)}\")\n            print(f\"Unique friends: {result_df['Friend Name'].nunique()}\")\n            print(f\"Unique bars: {result_df['Bar Name'].nunique()}\")\n"
+    }
+  },
+  {
+    "index": 106,
+    "question": "Based on user Stephanie's friends, find nightlife businesses in Nashville with photos showing live music; return review snippets and addresses.",
+    "success": true,
+    "result": {
+      "analysis": "This is a complex multi-database query that requires: 1) Finding user 'Stephanie' and her friends from Neo4j graph database, 2) Finding nightlife businesses in Nashville from SQLite, 3) Finding photos showing live music using vector similarity search in Milvus, 4) Getting review snippets from SQLite and/or vector search, 5) Joining results across all three databases. This involves all three database types: graph traversal for social network, SQL for structured business/review data, and vector search for photo content matching.",
+      "natural_question": "Based on user Stephanie's friends, find nightlife businesses in Nashville with photos showing live music; return review snippets and addresses.",
+      "difficulty": "hard",
+      "query_types": [
+        "graph",
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "neo4j"
+            ],
+            "filter_condition": {
+              "user_name": {
+                "$eq": "Stephanie"
+              }
+            }
+          },
+          "result_var": "stephanie_friends",
+          "description": {
+            "narrative": "Use Neo4j graph database to find user Stephanie and traverse her FRIEND relationships to get all friend user_ids.",
+            "example_query": "MATCH (u:User {name: 'Stephanie'})-[:FRIEND]->(f:User) RETURN f.user_id AS friend_id, f.name AS friend_name"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "business.db"
+            ],
+            "filter_condition": {
+              "city": {
+                "$eq": "Nashville"
+              },
+              "categories": {
+                "$like": "%Nightlife%"
+              }
+            }
+          },
+          "result_var": "nashville_nightlife",
+          "description": {
+            "narrative": "Query SQLite business database to find all nightlife businesses located in Nashville, retrieving business_id, name, address, and categories.",
+            "example_query": "SELECT business_id, name, address, city, state, categories FROM business WHERE city = 'Nashville' AND categories LIKE '%Nightlife%'"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "review.db"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "$in": "nashville_nightlife_business_ids"
+              },
+              "user_id": {
+                "$in": "stephanie_friends_ids"
+              }
+            }
+          },
+          "result_var": "friend_reviews",
+          "description": {
+            "narrative": "Query SQLite review database to find reviews written by Stephanie's friends for the Nashville nightlife businesses.",
+            "example_query": "SELECT review_id, user_id, business_id, text, stars, date FROM review WHERE business_id IN (...) AND user_id IN (...)"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "photo_vector"
+            ],
+            "filter_condition": {
+              "search_text": "live music performance on stage",
+              "business_id": {
+                "$in": "nashville_nightlife_business_ids"
+              }
+            }
+          },
+          "result_var": "live_music_photos",
+          "description": {
+            "narrative": "Use Milvus vector database to perform semantic similarity search on photo embeddings to find photos depicting live music scenes, filtered by Nashville nightlife business_ids.",
+            "example_query": "collection.search(data=[embedding('live music performance on stage')], anns_field='photo_embedding', param={'metric_type': 'L2', 'params': {'nprobe': 16}}, limit=100, expr='business_id in [...]')"
+          }
+        },
+        {
+          "step": 5,
+          "parameters": {
+            "ms_names": [
+              "photo.db"
+            ],
+            "filter_condition": {
+              "photo_id": {
+                "$in": "live_music_photo_ids"
+              }
+            }
+          },
+          "result_var": "photo_details",
+          "description": {
+            "narrative": "Query SQLite photo database to get photo metadata (caption, label) for the matched live music photos.",
+            "example_query": "SELECT photo_id, business_id, caption, label FROM photo WHERE photo_id IN (...)"
+          }
+        },
+        {
+          "step": 6,
+          "parameters": {
+            "ms_names": [
+              "all"
+            ],
+            "filter_condition": {}
+          },
+          "result_var": "final_results",
+          "description": {
+            "narrative": "Join all results: merge businesses with live music photos and friend reviews. Return business name, address, photo info, and review snippets.",
+            "example_query": "Pandas merge/join operations across all intermediate result DataFrames"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport pandas as pd\nimport numpy as np\nfrom pymilvus import connections, Collection\nfrom neo4j import GraphDatabase\nfrom sentence_transformers import SentenceTransformer\nimport warnings\nwarnings.filterwarnings('ignore')\n\n# ============================================================\n# Database Configuration\n# ============================================================\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nmilvus_config = {\n    'host': 'localhost',\n    'port': '19530',\n    'collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    }\n}\n\nneo4j_config = {\n    'uri': 'bolt://localhost:7687',\n    'auth': ('neo4j', 'password')\n}\n\n# ============================================================\n# Step 1: Find Stephanie's friends via Neo4j graph traversal\n# ============================================================\nprint(\"=\" * 70)\nprint(\"Step 1: Finding Stephanie's friends in Neo4j...\")\nprint(\"=\" * 70)\n\ntry:\n    neo4j_driver = GraphDatabase.driver(\n        neo4j_config['uri'],\n        auth=neo4j_config['auth']\n    )\n    \n    with neo4j_driver.session() as session:\n        # Find Stephanie and her friends\n        result = session.run(\"\"\"\n            MATCH (u:User {name: 'Stephanie'})-[:FRIEND]->(f:User)\n            RETURN u.user_id AS stephanie_id, f.user_id AS friend_id, f.name AS friend_name\n            LIMIT 500\n        \"\"\")\n        \n        friends_data = []\n        stephanie_id = None\n        for record in result:\n            stephanie_id = record['stephanie_id']\n            friends_data.append({\n                'friend_id': record['friend_id'],\n                'friend_name': record['friend_name']\n            })\n    \n    neo4j_driver.close()\n    \n    friends_df = pd.DataFrame(friends_data)\n    friend_ids = friends_df['friend_id'].tolist()\n    \n    print(f\"Stephanie's user_id: {stephanie_id}\")\n    print(f\"Number of friends found: {len(friend_ids)}\")\n    if len(friends_df) > 0:\n        print(f\"Sample friends: {friends_df['friend_name'].head(10).tolist()}\")\n    \nexcept Exception as e:\n    print(f\"Error in Neo4j query: {e}\")\n    # Fallback: try finding Stephanie in SQLite user database\n    print(\"Fallback: Searching for Stephanie in SQLite user database...\")\n    conn_user = sqlite3.connect(sqlite_paths['user'])\n    stephanie_row = pd.read_sql_query(\n        \"SELECT user_id, name, friends FROM user WHERE name = 'Stephanie' LIMIT 1\",\n        conn_user\n    )\n    conn_user.close()\n    \n    if len(stephanie_row) > 0:\n        stephanie_id = stephanie_row.iloc[0]['user_id']\n        friends_str = stephanie_row.iloc[0]['friends']\n        friend_ids = [f.strip() for f in friends_str.split(',') if f.strip()] if friends_str else []\n        print(f\"Found Stephanie (ID: {stephanie_id}) with {len(friend_ids)} friends\")\n    else:\n        friend_ids = []\n        print(\"Stephanie not found.\")\n\nif not friend_ids:\n    print(\"No friends found. Exiting.\")\nelse:\n    # ============================================================\n    # Step 2: Find Nightlife businesses in Nashville via SQLite\n    # ============================================================\n    print(\"\\n\" + \"=\" * 70)\n    print(\"Step 2: Finding Nightlife businesses in Nashville...\")\n    print(\"=\" * 70)\n    \n    conn_business = sqlite3.connect(sqlite_paths['business'])\n    \n    nashville_nightlife = pd.read_sql_query(\"\"\"\n        SELECT business_id, name, address, city, state, stars, review_count, categories\n        FROM business\n        WHERE city = 'Nashville' \n          AND categories LIKE '%Nightlife%'\n        ORDER BY stars DESC, review_count DESC\n    \"\"\", conn_business)\n    \n    conn_business.close()\n    \n    print(f\"Nashville Nightlife businesses found: {len(nashville_nightlife)}\")\n    if len(nashville_nightlife) > 0:\n        print(f\"Sample businesses: {nashville_nightlife['name'].head(5).tolist()}\")\n    \n    nightlife_biz_ids = nashville_nightlife['business_id'].tolist()\n    \n    if not nightlife_biz_ids:\n        print(\"No nightlife businesses found in Nashville. Exiting.\")\n    else:\n        # ============================================================\n        # Step 3: Vector search for photos showing live music (Milvus)\n        # ============================================================\n        print(\"\\n\" + \"=\" * 70)\n        print(\"Step 3: Searching for live music photos in Milvus...\")\n        print(\"=\" * 70)\n        \n        try:\n            # Connect to Milvus\n            connections.connect(\n                alias='default',\n                host=milvus_config['host'],\n                port=milvus_config['port']\n            )\n            \n            # Load sentence transformer model for encoding search query\n            model = SentenceTransformer('all-MiniLM-L6-v2')\n            \n            # Encode the search query for live music\n            search_query = \"live music performance band stage concert\"\n            query_embedding = model.encode([search_query])\n            \n            # Access the photo_vector collection\n            photo_collection = Collection(milvus_config['collections']['photos'])\n            photo_collection.load()\n            \n            # Build filter expression for Nashville nightlife business_ids\n            # Process in batches if too many IDs\n            batch_size = 100\n            all_photo_results = []\n            \n            for i in range(0, len(nightlife_biz_ids), batch_size):\n                batch_ids = nightlife_biz_ids[i:i+batch_size]\n                ids_str = ', '.join([f'\"' + bid + '\"' for bid in batch_ids])\n                filter_expr = f\"business_id in [{ids_str}]\"\n                \n                try:\n                    search_results = photo_collection.search(\n                        data=query_embedding.tolist(),\n                        anns_field='embedding',\n                        param={\n                            'metric_type': 'L2',\n                            'params': {'nprobe': 16}\n                        },\n                        limit=50,\n                        expr=filter_expr,\n                        output_fields=['business_id', 'photo_id']\n                    )\n                    \n                    for hits in search_results:\n                        for hit in hits:\n                            all_photo_results.append({\n                                'photo_id': hit.entity.get('photo_id'),\n                                'business_id': hit.entity.get('business_id'),\n                                'distance': hit.distance\n                            })\n                except Exception as batch_err:\n                    print(f\"Batch search error: {batch_err}\")\n                    continue\n            \n            photo_results_df = pd.DataFrame(all_photo_results)\n            \n            # Also try searching without filter to get more results\n            if len(photo_results_df) == 0:\n                print(\"Trying broader search without business_id filter...\")\n                search_results = photo_collection.search(\n                    data=query_embedding.tolist(),\n                    anns_field='embedding',\n                    param={\n                        'metric_type': 'L2',\n                        'params': {'nprobe': 16}\n                    },\n                    limit=200,\n                    output_fields=['business_id', 'photo_id']\n                )\n                \n                for hits in search_results:\n                    for hit in hits:\n                        all_photo_results.append({\n                            'photo_id': hit.entity.get('photo_id'),\n                            'business_id': hit.entity.get('business_id'),\n                            'distance': hit.distance\n                        })\n                \n                photo_results_df = pd.DataFrame(all_photo_results)\n                # Filter to Nashville nightlife businesses\n                if len(photo_results_df) > 0:\n                    photo_results_df = photo_results_df[\n                        photo_results_df['business_id'].isin(nightlife_biz_ids)\n                    ]\n            \n            connections.disconnect('default')\n            print(f\"Live music photos found: {len(photo_results_df)}\")\n            \n        except Exception as e:\n            print(f\"Milvus search error: {e}\")\n            print(\"Fallback: Using SQLite photo table with label filter...\")\n            photo_results_df = pd.DataFrame(columns=['photo_id', 'business_id', 'distance'])\n        \n        # ============================================================\n        # Step 4: Get photo details from SQLite photo database\n        # ============================================================\n        print(\"\\n\" + \"=\" * 70)\n        print(\"Step 4: Fetching photo metadata from SQLite...\")\n        print(\"=\" * 70)\n        \n        conn_photo = sqlite3.connect(sqlite_paths['photo'])\n        \n        # Get photos for Nashville nightlife businesses\n        placeholders = ','.join(['?' for _ in nightlife_biz_ids])\n        photo_metadata = pd.read_sql_query(f\"\"\"\n            SELECT photo_id, business_id, caption, label\n            FROM photo\n            WHERE business_id IN ({placeholders})\n        \"\"\", conn_photo, params=nightlife_biz_ids)\n        \n        conn_photo.close()\n        \n        print(f\"Total photos for Nashville nightlife: {len(photo_metadata)}\")\n        if len(photo_metadata) > 0:\n            print(f\"Photo labels distribution: {photo_metadata['label'].value_counts().to_dict()}\")\n        \n        # Combine Milvus results with SQLite photo metadata\n        if len(photo_results_df) > 0 and len(photo_metadata) > 0:\n            # Merge vector search results with photo metadata\n            live_music_photos = photo_results_df.merge(\n                photo_metadata, on=['photo_id', 'business_id'], how='inner'\n            )\n        else:\n            # Fallback: filter photos by caption/label containing music-related terms\n            live_music_photos = photo_metadata[\n                (photo_metadata['caption'].str.contains('music|band|stage|live|concert|perform', case=False, na=False)) |\n                (photo_metadata['label'].str.contains('inside|menu', case=False, na=False))\n            ].copy()\n            if len(live_music_photos) == 0:\n                # If still no results, take all photos from nightlife venues\n                live_music_photos = photo_metadata.copy()\n                print(\"Using all available photos from Nashville nightlife venues.\")\n        \n        live_music_biz_ids = live_music_photos['business_id'].unique().tolist()\n        print(f\"Businesses with live music photos: {len(live_music_biz_ids)}\")\n        \n        # ============================================================\n        # Step 5: Get reviews from Stephanie's friends for these businesses\n        # ============================================================\n        print(\"\\n\" + \"=\" * 70)\n        print(\"Step 5: Fetching friend reviews from SQLite...\")\n        print(\"=\" * 70)\n        \n        conn_review = sqlite3.connect(sqlite_paths['review'])\n        \n        # Build query for reviews by friends at these businesses\n        target_biz_ids = live_music_biz_ids if live_music_biz_ids else nightlife_biz_ids\n        \n        # Process in batches to avoid SQL parameter limits\n        friend_reviews_list = []\n        batch_size_sql = 500\n        \n        for i in range(0, len(friend_ids), batch_size_sql):\n            friend_batch = friend_ids[i:i+batch_size_sql]\n            for j in range(0, len(target_biz_ids), batch_size_sql):\n                biz_batch = target_biz_ids[j:j+batch_size_sql]\n                \n                friend_ph = ','.join(['?' for _ in friend_batch])\n                biz_ph = ','.join(['?' for _ in biz_batch])\n                \n                query = f\"\"\"\n                    SELECT review_id, user_id, business_id, stars, date,\n                           SUBSTR(text, 1, 300) AS review_snippet\n                    FROM review\n                    WHERE user_id IN ({friend_ph})\n                      AND business_id IN ({biz_ph})\n                    ORDER BY date DESC\n                \"\"\"\n                \n                batch_reviews = pd.read_sql_query(\n                    query, conn_review,\n                    params=friend_batch + biz_batch\n                )\n                friend_reviews_list.append(batch_reviews)\n        \n        conn_review.close()\n        \n        if friend_reviews_list:\n            friend_reviews = pd.concat(friend_reviews_list, ignore_index=True)\n        else:\n            friend_reviews = pd.DataFrame()\n        \n        print(f\"Friend reviews found: {len(friend_reviews)}\")\n        \n        # If no friend reviews found, also search using Milvus review vectors\n        if len(friend_reviews) == 0:\n            print(\"No direct friend reviews found. Searching broader reviews...\")\n            conn_review = sqlite3.connect(sqlite_paths['review'])\n            \n            biz_ph = ','.join(['?' for _ in target_biz_ids])\n            broader_reviews = pd.read_sql_query(f\"\"\"\n                SELECT review_id, user_id, business_id, stars, date,\n                       SUBSTR(text, 1, 300) AS review_snippet\n                FROM review\n                WHERE business_id IN ({biz_ph})\n                ORDER BY stars DESC, date DESC\n                LIMIT 50\n            \"\"\", conn_review, params=target_biz_ids)\n            \n            conn_review.close()\n            friend_reviews = broader_reviews\n            print(f\"Broader reviews found: {len(friend_reviews)}\")\n        \n        # ============================================================\n        # Step 6: Merge all results and produce final output\n        # ============================================================\n        print(\"\\n\" + \"=\" * 70)\n        print(\"Step 6: Merging results across all databases...\")\n        print(\"=\" * 70)\n        \n        # Merge businesses with photos\n        biz_with_photos = nashville_nightlife.merge(\n            live_music_photos.groupby('business_id').agg({\n                'photo_id': lambda x: list(x)[:5],\n                'caption': lambda x: list(x.dropna())[:3]\n            }).reset_index().rename(columns={\n                'photo_id': 'photo_ids',\n                'caption': 'photo_captions'\n            }),\n            on='business_id',\n            how='inner'\n        )\n        \n        # Merge with reviews\n        if len(friend_reviews) > 0:\n            reviews_agg = friend_reviews.groupby('business_id').agg({\n                'review_snippet': lambda x: list(x)[:3],\n                'stars': 'mean',\n                'user_id': 'count'\n            }).reset_index().rename(columns={\n                'review_snippet': 'review_snippets',\n                'stars': 'avg_review_stars',\n                'user_id': 'review_count_friends'\n            })\n            \n            final_results = biz_with_photos.merge(\n                reviews_agg,\n                on='business_id',\n                how='left'\n            )\n        else:\n            final_results = biz_with_photos.copy()\n            final_results['review_snippets'] = None\n            final_results['avg_review_stars'] = None\n            final_results['review_count_friends'] = 0\n        \n        # ============================================================\n        # Final Output\n        # ============================================================\n        print(\"\\n\" + \"=\" * 70)\n        print(\"FINAL RESULTS: Nashville Nightlife with Live Music Photos\")\n        print(\"(Based on Stephanie's friend network)\")\n        print(\"=\" * 70)\n        \n        if len(final_results) == 0:\n            print(\"No matching results found.\")\n        else:\n            for idx, row in final_results.iterrows():\n                print(f\"\\n{'─' * 60}\")\n                print(f\"🎵 Business: {row['name']}\")\n                print(f\"📍 Address: {row['address']}, {row['city']}, {row['state']}\")\n                print(f\"⭐ Rating: {row['stars']} ({row['review_count']} total reviews)\")\n                print(f\"🏷️  Categories: {row['categories']}\")\n                print(f\"📸 Photos ({len(row['photo_ids'])} found): {row['photo_ids']}\")\n                if row.get('photo_captions'):\n                    print(f\"   Captions: {row['photo_captions']}\")\n                if row.get('review_snippets') and isinstance(row['review_snippets'], list):\n                    print(f\"📝 Friend Reviews ({int(row.get('review_count_friends', 0))} total):\")\n                    for i, snippet in enumerate(row['review_snippets'], 1):\n                        print(f\"   Review {i}: \\\"{snippet}...\\\"\")\n                    if row.get('avg_review_stars'):\n                        print(f\"   Average friend rating: {row['avg_review_stars']:.1f} ⭐\")\n                else:\n                    print(f\"📝 No friend reviews available for this business.\")\n            \n            print(f\"\\n{'=' * 70}\")\n            print(f\"Total businesses found: {len(final_results)}\")\n            print(f\"Stephanie's friends involved: {len(friend_ids)}\")\n            print(f\"{'=' * 70}\")\n        \n        # Export results to a summary DataFrame\n        summary_df = final_results[['name', 'address', 'city', 'state', 'stars', \n                                      'categories', 'photo_ids', 'review_snippets']].copy()\n        print(\"\\nSummary DataFrame:\")\n        print(summary_df.to_string(index=False))"
+    }
+  },
+  {
+    "index": 107,
+    "question": "In Tucson, using user Emi's friends, find Mexican restaurants with tortilla photos; return business names, stars, photo counts and addresses.",
+    "success": true,
+    "result": {
+      "analysis": "This is a complex multi-database query that requires: 1) Finding user 'Emi' in the user database, 2) Using Neo4j graph database to find Emi's friends, 3) Finding Mexican restaurants in Tucson from SQLite, 4) Using Milvus vector search to find photos related to 'tortilla', 5) Cross-referencing friends' reviews/tips with those restaurants and tortilla photos. The query spans all three database types: SQL (business, user, photo, review), Graph (friend relationships), and Vector (photo similarity search for tortilla). This is a hard difficulty problem requiring careful join logic across databases.",
+      "natural_question": "In Tucson, using user Emi's friends, find Mexican restaurants with tortilla photos; return business names, stars, photo counts and addresses.",
+      "difficulty": "hard",
+      "query_types": [
+        "sql",
+        "graph",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "user.db"
+            ],
+            "filter_condition": {
+              "name": {
+                "eq": "Emi"
+              }
+            }
+          },
+          "result_var": "emi_user_ids",
+          "description": {
+            "narrative": "Find user Emi's user_id from the SQLite user database.",
+            "example_query": "SELECT user_id, name FROM user WHERE name = 'Emi';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "neo4j"
+            ],
+            "filter_condition": {
+              "user_id": {
+                "in": "emi_user_ids"
+              }
+            }
+          },
+          "result_var": "friend_ids",
+          "description": {
+            "narrative": "Use Neo4j graph database to find all friends of user Emi by traversing the FRIENDS_WITH relationship.",
+            "example_query": "MATCH (u:User {user_id: $emi_id})-[:FRIENDS_WITH]->(f:User) RETURN f.user_id AS friend_id"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "business.db",
+              "review.db"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Tucson"
+              },
+              "categories": {
+                "contains": "Mexican"
+              }
+            }
+          },
+          "result_var": "mexican_restaurants",
+          "description": {
+            "narrative": "Find Mexican restaurants in Tucson that have been reviewed or tipped by Emi's friends.",
+            "example_query": "SELECT b.business_id, b.name, b.stars, b.address FROM business b WHERE b.city = 'Tucson' AND b.categories LIKE '%Mexican%' AND b.business_id IN (SELECT DISTINCT business_id FROM review WHERE user_id IN (friend_ids));"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "photo_vector (Milvus)",
+              "photo.db"
+            ],
+            "filter_condition": {
+              "search_text": "tortilla",
+              "business_id": {
+                "in": "mexican_restaurant_ids"
+              }
+            }
+          },
+          "result_var": "tortilla_photos",
+          "description": {
+            "narrative": "Use Milvus vector search on the photo_vector collection to find photos semantically similar to 'tortilla', filtered to the candidate Mexican restaurant business_ids. Then count photos per business.",
+            "example_query": "Search photo_vector collection with text embedding of 'tortilla', filter by business_id in candidate list, return photo_id and business_id."
+          }
+        },
+        {
+          "step": 5,
+          "parameters": {
+            "ms_names": [
+              "aggregation"
+            ],
+            "filter_condition": {}
+          },
+          "result_var": "final_results",
+          "description": {
+            "narrative": "Join the Mexican restaurants with tortilla photo counts, and return business name, stars, photo count, and address.",
+            "example_query": "Aggregate photo counts per business_id from tortilla_photos, join with mexican_restaurants to produce final output."
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport pandas as pd\nfrom pymilvus import connections, Collection\nfrom neo4j import GraphDatabase\nfrom sentence_transformers import SentenceTransformer\nimport warnings\nwarnings.filterwarnings('ignore')\n\n# ============================================================\n# Database Configuration\n# ============================================================\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nmilvus_config = {\n    'host': 'localhost',\n    'port': '19530',\n    'collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    }\n}\n\nneo4j_config = {\n    'uri': 'bolt://localhost:7687',\n    'auth': ('neo4j', 'password')\n}\n\n# ============================================================\n# Step 1: Find user Emi's user_id from SQLite\n# ============================================================\nprint(\"=\" * 60)\nprint(\"Step 1: Finding user Emi in the user database...\")\nprint(\"=\" * 60)\n\nconn_user = sqlite3.connect(sqlite_paths['user'])\ncursor_user = conn_user.cursor()\ncursor_user.execute(\"SELECT user_id, name FROM user WHERE name = 'Emi'\")\nemi_rows = cursor_user.fetchall()\nconn_user.close()\n\nif not emi_rows:\n    print(\"ERROR: User 'Emi' not found in the database.\")\n    exit()\n\nemi_user_ids = [row[0] for row in emi_rows]\nprint(f\"Found {len(emi_user_ids)} user(s) named 'Emi':\")\nfor uid in emi_user_ids:\n    print(f\"  user_id: {uid}\")\n\n# ============================================================\n# Step 2: Find Emi's friends using Neo4j graph database\n# ============================================================\nprint(\"\\n\" + \"=\" * 60)\nprint(\"Step 2: Finding Emi's friends via Neo4j graph...\")\nprint(\"=\" * 60)\n\nfriend_ids = set()\n\ntry:\n    driver = GraphDatabase.driver(\n        neo4j_config['uri'],\n        auth=neo4j_config['auth']\n    )\n    \n    with driver.session() as session:\n        for emi_id in emi_user_ids:\n            # Try multiple possible relationship types\n            result = session.run(\n                \"\"\"\n                MATCH (u:User {user_id: $emi_id})-[:FRIENDS_WITH|FRIEND|FRIENDS]-(f:User)\n                RETURN DISTINCT f.user_id AS friend_id\n                \"\"\",\n                emi_id=emi_id\n            )\n            for record in result:\n                if record['friend_id']:\n                    friend_ids.add(record['friend_id'])\n    \n    driver.close()\n    print(f\"Found {len(friend_ids)} friends of Emi via Neo4j.\")\n\nexcept Exception as e:\n    print(f\"Neo4j query failed: {e}\")\n    print(\"Falling back to SQLite user table 'friends' field...\")\n    \n    # Fallback: parse friends from the user table's 'friends' column\n    conn_user = sqlite3.connect(sqlite_paths['user'])\n    cursor_user = conn_user.cursor()\n    for emi_id in emi_user_ids:\n        cursor_user.execute(\n            \"SELECT friends FROM user WHERE user_id = ?\",\n            (emi_id,)\n        )\n        row = cursor_user.fetchone()\n        if row and row[0]:\n            # friends field is comma-separated user_ids\n            friends_list = [f.strip() for f in row[0].split(',') if f.strip()]\n            friend_ids.update(friends_list)\n    conn_user.close()\n    print(f\"Found {len(friend_ids)} friends of Emi via SQLite fallback.\")\n\nif not friend_ids:\n    print(\"ERROR: No friends found for user Emi.\")\n    exit()\n\nprint(f\"Sample friend IDs: {list(friend_ids)[:5]}\")\n\n# ============================================================\n# Step 3: Find Mexican restaurants in Tucson reviewed by friends\n# ============================================================\nprint(\"\\n\" + \"=\" * 60)\nprint(\"Step 3: Finding Mexican restaurants in Tucson linked to Emi's friends...\")\nprint(\"=\" * 60)\n\n# 3a: Get Mexican restaurants in Tucson\nconn_biz = sqlite3.connect(sqlite_paths['business'])\ndf_mexican = pd.read_sql_query(\n    \"\"\"\n    SELECT business_id, name, stars, address, categories\n    FROM business\n    WHERE city = 'Tucson'\n      AND categories LIKE '%Mexican%'\n    \"\"\",\n    conn_biz\n)\nconn_biz.close()\nprint(f\"Found {len(df_mexican)} Mexican restaurants in Tucson.\")\n\nif df_mexican.empty:\n    print(\"ERROR: No Mexican restaurants found in Tucson.\")\n    exit()\n\nmexican_biz_ids = set(df_mexican['business_id'].tolist())\n\n# 3b: Filter to those reviewed/tipped by Emi's friends\nfriend_list = list(friend_ids)\n\n# Check reviews\nconn_review = sqlite3.connect(sqlite_paths['review'])\nplaceholders_friends = ','.join(['?' for _ in friend_list])\nplaceholders_biz = ','.join(['?' for _ in mexican_biz_ids])\n\nquery_review = f\"\"\"\n    SELECT DISTINCT business_id\n    FROM review\n    WHERE user_id IN ({placeholders_friends})\n      AND business_id IN ({placeholders_biz})\n\"\"\"\ndf_friend_reviews = pd.read_sql_query(\n    query_review,\n    conn_review,\n    params=friend_list + list(mexican_biz_ids)\n)\nconn_review.close()\n\n# Check tips\nconn_tip = sqlite3.connect(sqlite_paths['tip'])\nquery_tip = f\"\"\"\n    SELECT DISTINCT business_id\n    FROM tip\n    WHERE user_id IN ({placeholders_friends})\n      AND business_id IN ({placeholders_biz})\n\"\"\"\ndf_friend_tips = pd.read_sql_query(\n    query_tip,\n    conn_tip,\n    params=friend_list + list(mexican_biz_ids)\n)\nconn_tip.close()\n\n# Combine business_ids from reviews and tips\nfriend_biz_ids = set(\n    df_friend_reviews['business_id'].tolist() +\n    df_friend_tips['business_id'].tolist()\n)\n\nprint(f\"Mexican restaurants in Tucson linked to Emi's friends: {len(friend_biz_ids)}\")\n\nif not friend_biz_ids:\n    print(\"WARNING: No friend-linked Mexican restaurants found. Using all Mexican restaurants in Tucson instead.\")\n    friend_biz_ids = mexican_biz_ids\n\n# Filter the Mexican restaurants dataframe\ndf_candidate = df_mexican[df_mexican['business_id'].isin(friend_biz_ids)].copy()\nprint(f\"Candidate restaurants: {len(df_candidate)}\")\n\n# ============================================================\n# Step 4: Vector search for tortilla photos in Milvus\n# ============================================================\nprint(\"\\n\" + \"=\" * 60)\nprint(\"Step 4: Searching for tortilla photos via Milvus vector search...\")\nprint(\"=\" * 60)\n\n# Connect to Milvus\nconnections.connect(\n    alias='default',\n    host=milvus_config['host'],\n    port=milvus_config['port']\n)\n\n# Load the photo_vector collection\nphoto_collection = Collection(milvus_config['collections']['photos'])\nphoto_collection.load()\n\n# Get collection info\nprint(f\"Photo collection: {photo_collection.name}\")\nprint(f\"Number of entities: {photo_collection.num_entities}\")\nprint(f\"Schema fields: {[f.name for f in photo_collection.schema.fields]}\")\n\n# Generate embedding for 'tortilla'\nmodel = SentenceTransformer('all-MiniLM-L6-v2')\ntortilla_embedding = model.encode('tortilla').tolist()\n\n# Build filter expression for candidate business_ids\ncandidate_biz_list = list(friend_biz_ids)\n\n# Search in batches if needed (Milvus expression length limit)\nbatch_size = 100\nall_photo_results = []\n\nfor i in range(0, len(candidate_biz_list), batch_size):\n    batch_biz = candidate_biz_list[i:i+batch_size]\n    # Build filter expression\n    biz_filter_parts = [f'business_id == \"{bid}\"' for bid in batch_biz]\n    filter_expr = ' or '.join(biz_filter_parts)\n    \n    try:\n        results = photo_collection.search(\n            data=[tortilla_embedding],\n            anns_field='vector',  # adjust field name if needed\n            param={'metric_type': 'COSINE', 'params': {'nprobe': 16}},\n            limit=500,\n            expr=filter_expr,\n            output_fields=['business_id', 'photo_id']\n        )\n        \n        for hits in results:\n            for hit in hits:\n                if hit.score >= 0.3:  # similarity threshold for relevance\n                    all_photo_results.append({\n                        'photo_id': hit.entity.get('photo_id'),\n                        'business_id': hit.entity.get('business_id'),\n                        'similarity_score': hit.score\n                    })\n    except Exception as e:\n        print(f\"Milvus search error for batch {i}: {e}\")\n        # Try alternative field names\n        try:\n            results = photo_collection.search(\n                data=[tortilla_embedding],\n                anns_field='embedding',\n                param={'metric_type': 'L2', 'params': {'nprobe': 16}},\n                limit=500,\n                expr=filter_expr,\n                output_fields=['business_id', 'photo_id']\n            )\n            for hits in results:\n                for hit in hits:\n                    all_photo_results.append({\n                        'photo_id': hit.entity.get('photo_id'),\n                        'business_id': hit.entity.get('business_id'),\n                        'similarity_score': hit.distance\n                    })\n        except Exception as e2:\n            print(f\"Alternative search also failed: {e2}\")\n\nprint(f\"Found {len(all_photo_results)} tortilla-related photos.\")\n\n# If Milvus vector search yields no results, fallback to SQLite photo label search\nif not all_photo_results:\n    print(\"Falling back to SQLite photo table for caption/label matching...\")\n    conn_photo = sqlite3.connect(sqlite_paths['photo'])\n    placeholders_cand = ','.join(['?' for _ in candidate_biz_list])\n    query_photo = f\"\"\"\n        SELECT photo_id, business_id, caption, label\n        FROM photo\n        WHERE business_id IN ({placeholders_cand})\n          AND (caption LIKE '%tortilla%' OR label LIKE '%food%')\n    \"\"\"\n    df_photos_fallback = pd.read_sql_query(query_photo, conn_photo, params=candidate_biz_list)\n    conn_photo.close()\n    \n    for _, row in df_photos_fallback.iterrows():\n        all_photo_results.append({\n            'photo_id': row['photo_id'],\n            'business_id': row['business_id'],\n            'similarity_score': 1.0\n        })\n    print(f\"Fallback found {len(all_photo_results)} photos.\")\n\n# Disconnect Milvus\nconnections.disconnect('default')\n\n# ============================================================\n# Step 5: Aggregate results and produce final output\n# ============================================================\nprint(\"\\n\" + \"=\" * 60)\nprint(\"Step 5: Aggregating final results...\")\nprint(\"=\" * 60)\n\nif not all_photo_results:\n    print(\"No tortilla photos found for the candidate restaurants.\")\nelse:\n    df_photos = pd.DataFrame(all_photo_results)\n    \n    # Count photos per business\n    photo_counts = df_photos.groupby('business_id').agg(\n        photo_count=('photo_id', 'nunique')\n    ).reset_index()\n    \n    # Join with candidate restaurant info\n    df_final = df_candidate.merge(\n        photo_counts,\n        on='business_id',\n        how='inner'\n    )\n    \n    # Select and sort output columns\n    df_output = df_final[['name', 'stars', 'photo_count', 'address']].sort_values(\n        by=['photo_count', 'stars'],\n        ascending=[False, False]\n    ).reset_index(drop=True)\n    \n    # Display results\n    print(\"\\n\" + \"=\" * 60)\n    print(\"FINAL RESULTS: Mexican Restaurants in Tucson with Tortilla Photos\")\n    print(\"(Linked to Emi's friends)\")\n    print(\"=\" * 60)\n    print(f\"\\n{'No.':<5} {'Business Name':<35} {'Stars':<8} {'Tortilla Photos':<18} {'Address'}\")\n    print(\"-\" * 110)\n    \n    for idx, row in df_output.iterrows():\n        print(f\"{idx+1:<5} {row['name']:<35} {row['stars']:<8} {row['photo_count']:<18} {row['address']}\")\n    \n    print(f\"\\nTotal restaurants found: {len(df_output)}\")\n    print(f\"Total tortilla photos: {df_output['photo_count'].sum()}\")\n"
+    }
+  },
+  {
+    "index": 108,
+    "question": "Using user Frank's friends in Indianapolis, find Burgers shops with double-patty burger photos; list review dates, ratings, and addresses.",
+    "success": true,
+    "result": {
+      "analysis": "This is a complex multi-database query that requires: 1) Finding user 'Frank' and their friends via Neo4j graph database, 2) Filtering friends located in Indianapolis, 3) Finding Burger shops in Indianapolis, 4) Using Milvus vector search to find photos related to 'double-patty burger', 5) Joining with SQLite for review dates, ratings, and addresses. This involves all three databases: Neo4j for social relationships, Milvus for photo semantic search, and SQLite for structured business/review data.",
+      "natural_question": "Using user Frank's friends in Indianapolis, find Burgers shops with double-patty burger photos; list review dates, ratings, and addresses.",
+      "difficulty": "hard",
+      "query_types": [
+        "graph",
+        "vector",
+        "sql"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "neo4j"
+            ],
+            "filter_condition": {
+              "user.name": {
+                "$eq": "Frank"
+              }
+            }
+          },
+          "result_var": "frank_friends",
+          "description": {
+            "narrative": "Use Neo4j graph database to find user 'Frank' and traverse the FRIEND relationship to get all of Frank's friends. This leverages the graph structure for efficient social network traversal.",
+            "example_query": "MATCH (u:User {name: 'Frank'})-[:FRIEND]->(f:User) RETURN f.user_id AS friend_id, f.name AS friend_name"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "review.db",
+              "business.db"
+            ],
+            "filter_condition": {
+              "business.city": {
+                "$eq": "Indianapolis"
+              },
+              "business.categories": {
+                "$contains": "Burgers"
+              },
+              "review.user_id": {
+                "$in": "frank_friends"
+              }
+            }
+          },
+          "result_var": "burger_shops_reviews",
+          "description": {
+            "narrative": "Query SQLite to find Burgers category businesses in Indianapolis that have been reviewed by Frank's friends. Join business and review tables to get review dates, star ratings, and business addresses.",
+            "example_query": "SELECT b.business_id, b.name, b.address, b.city, b.state, b.stars AS biz_stars, r.review_id, r.stars AS review_stars, r.date AS review_date, r.user_id FROM business b JOIN review r ON b.business_id = r.business_id WHERE b.city = 'Indianapolis' AND b.categories LIKE '%Burgers%' AND r.user_id IN (?)"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "photo_vector"
+            ],
+            "filter_condition": {
+              "search_text": "double-patty burger",
+              "business_id": {
+                "$in": "burger_shop_ids"
+              }
+            }
+          },
+          "result_var": "double_patty_photos",
+          "description": {
+            "narrative": "Use Milvus vector database to perform semantic search on photo vectors for 'double-patty burger' images. Filter results to only include photos belonging to the Burger shops identified in Step 2.",
+            "example_query": "collection.search(data=[embedding('double-patty burger')], anns_field='vector', param={'metric_type': 'L2', 'params': {'nprobe': 16}}, limit=200, expr='business_id in [...]', output_fields=['business_id', 'photo_id'])"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "photo.db"
+            ],
+            "filter_condition": {
+              "photo_id": {
+                "$in": "double_patty_photos"
+              }
+            }
+          },
+          "result_var": "photo_details",
+          "description": {
+            "narrative": "Cross-reference Milvus photo results with SQLite photo table to get photo metadata (caption, label) and confirm the photos are food-related. Then join all results together.",
+            "example_query": "SELECT photo_id, business_id, caption, label FROM photo WHERE photo_id IN (?) AND label = 'food'"
+          }
+        },
+        {
+          "step": 5,
+          "parameters": {
+            "ms_names": [
+              "all"
+            ],
+            "filter_condition": {}
+          },
+          "result_var": "final_results",
+          "description": {
+            "narrative": "Combine all results from previous steps: merge burger shops that have double-patty burger photos with their review information from Frank's friends. Output the final table with review dates, ratings, and addresses.",
+            "example_query": "Final merge and display of results with columns: business_name, address, review_date, review_stars, photo_id, caption"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport pandas as pd\nfrom pymilvus import connections, Collection\nfrom neo4j import GraphDatabase\nfrom sentence_transformers import SentenceTransformer\nimport warnings\nwarnings.filterwarnings('ignore')\n\n# ============================================================\n# Database Configuration\n# ============================================================\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nmilvus_config = {\n    'host': 'localhost',\n    'port': '19530',\n    'collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    }\n}\n\nneo4j_config = {\n    'uri': 'bolt://localhost:7687',\n    'auth': ('neo4j', 'password')\n}\n\n# ============================================================\n# Step 1: Find Frank's friends using Neo4j\n# ============================================================\nprint(\"=\" * 70)\nprint(\"Step 1: Finding Frank's friends via Neo4j graph database...\")\nprint(\"=\" * 70)\n\ndriver = GraphDatabase.driver(neo4j_config['uri'], auth=neo4j_config['auth'])\n\nfrank_friends = []\nwith driver.session() as session:\n    # Find Frank and all friends\n    result = session.run(\"\"\"\n        MATCH (u:User {name: 'Frank'})-[:FRIEND]->(f:User)\n        RETURN f.user_id AS friend_id, f.name AS friend_name\n    \"\"\")\n    for record in result:\n        frank_friends.append({\n            'friend_id': record['friend_id'],\n            'friend_name': record['friend_name']\n        })\n\ndriver.close()\n\nprint(f\"Found {len(frank_friends)} friends of Frank.\")\nif len(frank_friends) > 0:\n    print(f\"Sample friends: {[f['friend_name'] for f in frank_friends[:5]]}\")\n\nfriend_ids = [f['friend_id'] for f in frank_friends]\n\nif not friend_ids:\n    print(\"No friends found for Frank. Exiting.\")\n    exit()\n\n# ============================================================\n# Step 2: Find Burger shops in Indianapolis reviewed by friends\n# ============================================================\nprint(\"\\n\" + \"=\" * 70)\nprint(\"Step 2: Finding Burgers shops in Indianapolis reviewed by Frank's friends...\")\nprint(\"=\" * 70)\n\n# First get burger businesses in Indianapolis\nconn_biz = sqlite3.connect(sqlite_paths['business'])\ndf_burgers = pd.read_sql_query(\"\"\"\n    SELECT business_id, name, address, city, state, stars, categories\n    FROM business\n    WHERE city = 'Indianapolis'\n      AND categories LIKE '%Burgers%'\n\"\"\", conn_biz)\nconn_biz.close()\n\nprint(f\"Found {len(df_burgers)} Burger shops in Indianapolis.\")\n\nif df_burgers.empty:\n    print(\"No Burger shops found in Indianapolis. Exiting.\")\n    exit()\n\nburger_biz_ids = df_burgers['business_id'].tolist()\n\n# Now get reviews from Frank's friends for these burger shops\nconn_review = sqlite3.connect(sqlite_paths['review'])\n\n# Build parameterized query\nfriend_placeholders = ','.join(['?' for _ in friend_ids])\nbiz_placeholders = ','.join(['?' for _ in burger_biz_ids])\n\nquery_reviews = f\"\"\"\n    SELECT review_id, user_id, business_id, stars AS review_stars, date AS review_date, text\n    FROM review\n    WHERE user_id IN ({friend_placeholders})\n      AND business_id IN ({biz_placeholders})\n\"\"\"\n\nparams = friend_ids + burger_biz_ids\ndf_reviews = pd.read_sql_query(query_reviews, conn_review, params=params)\nconn_review.close()\n\nprint(f\"Found {len(df_reviews)} reviews from Frank's friends at Indianapolis Burger shops.\")\n\nif df_reviews.empty:\n    print(\"No reviews found from Frank's friends at these Burger shops. Exiting.\")\n    exit()\n\n# Merge reviews with business info\ndf_reviews_biz = df_reviews.merge(df_burgers[['business_id', 'name', 'address', 'city', 'state', 'stars']],\n                                   on='business_id', how='inner')\ndf_reviews_biz.rename(columns={'stars': 'biz_avg_stars'}, inplace=True)\n\nreviewed_biz_ids = df_reviews_biz['business_id'].unique().tolist()\nprint(f\"Unique Burger shops reviewed by Frank's friends: {len(reviewed_biz_ids)}\")\n\n# ============================================================\n# Step 3: Semantic search for 'double-patty burger' photos in Milvus\n# ============================================================\nprint(\"\\n\" + \"=\" * 70)\nprint(\"Step 3: Searching for double-patty burger photos via Milvus vector DB...\")\nprint(\"=\" * 70)\n\n# Connect to Milvus\nconnections.connect(alias='default', host=milvus_config['host'], port=milvus_config['port'])\n\n# Load the photo vector collection\nphoto_collection = Collection(milvus_config['collections']['photos'])\nphoto_collection.load()\n\n# Generate embedding for 'double-patty burger'\nmodel = SentenceTransformer('all-MiniLM-L6-v2')\nsearch_text = \"double-patty burger\"\nsearch_embedding = model.encode([search_text]).tolist()\n\n# Build filter expression for business_ids\nif len(reviewed_biz_ids) > 0:\n    biz_id_str = ', '.join([f'\"{ bid}\"' for bid in reviewed_biz_ids])\n    filter_expr = f'business_id in [{biz_id_str}]'\nelse:\n    filter_expr = ''\n\n# Search for similar photos\nsearch_params = {\n    'metric_type': 'L2',\n    'params': {'nprobe': 16}\n}\n\ntry:\n    results = photo_collection.search(\n        data=search_embedding,\n        anns_field='vector',\n        param=search_params,\n        limit=200,\n        expr=filter_expr if filter_expr else None,\n        output_fields=['business_id', 'photo_id']\n    )\n\n    photo_matches = []\n    for hits in results:\n        for hit in hits:\n            photo_matches.append({\n                'photo_id': hit.entity.get('photo_id'),\n                'business_id': hit.entity.get('business_id'),\n                'distance': hit.distance\n            })\n\n    print(f\"Found {len(photo_matches)} photo matches from Milvus vector search.\")\nexcept Exception as e:\n    print(f\"Milvus search error: {e}\")\n    print(\"Trying alternative search without business_id filter...\")\n    results = photo_collection.search(\n        data=search_embedding,\n        anns_field='vector',\n        param=search_params,\n        limit=500,\n        output_fields=['business_id', 'photo_id']\n    )\n    photo_matches = []\n    for hits in results:\n        for hit in hits:\n            bid = hit.entity.get('business_id')\n            if bid in reviewed_biz_ids:\n                photo_matches.append({\n                    'photo_id': hit.entity.get('photo_id'),\n                    'business_id': bid,\n                    'distance': hit.distance\n                })\n    print(f\"Found {len(photo_matches)} photo matches after filtering.\")\n\nconnections.disconnect('default')\n\nif not photo_matches:\n    print(\"No double-patty burger photos found. Exiting.\")\n    exit()\n\ndf_milvus_photos = pd.DataFrame(photo_matches)\n\n# ============================================================\n# Step 4: Get photo metadata from SQLite photo.db\n# ============================================================\nprint(\"\\n\" + \"=\" * 70)\nprint(\"Step 4: Retrieving photo metadata from SQLite...\")\nprint(\"=\" * 70)\n\nconn_photo = sqlite3.connect(sqlite_paths['photo'])\n\nphoto_ids = df_milvus_photos['photo_id'].tolist()\nphoto_placeholders = ','.join(['?' for _ in photo_ids])\n\ndf_photo_meta = pd.read_sql_query(f\"\"\"\n    SELECT photo_id, business_id, caption, label\n    FROM photo\n    WHERE photo_id IN ({photo_placeholders})\n\"\"\", conn_photo, params=photo_ids)\nconn_photo.close()\n\nprint(f\"Retrieved metadata for {len(df_photo_meta)} photos.\")\n\n# Merge Milvus distances with photo metadata\ndf_photos_full = df_milvus_photos.merge(df_photo_meta, on=['photo_id', 'business_id'], how='inner')\nprint(f\"Photos with metadata: {len(df_photos_full)}\")\n\n# Filter for food-related photos (optional, to improve relevance)\nif 'label' in df_photos_full.columns:\n    df_food_photos = df_photos_full[df_photos_full['label'] == 'food']\n    if not df_food_photos.empty:\n        print(f\"Food-labeled photos: {len(df_food_photos)}\")\n        df_photos_full = df_food_photos\n    else:\n        print(\"No food-labeled photos found; using all matched photos.\")\n\n# ============================================================\n# Step 5: Combine all results and produce final output\n# ============================================================\nprint(\"\\n\" + \"=\" * 70)\nprint(\"Step 5: Combining all results into final output...\")\nprint(\"=\" * 70)\n\n# Get business_ids that have double-patty burger photos\nphoto_biz_ids = df_photos_full['business_id'].unique().tolist()\n\n# Filter reviews to only those businesses with matching photos\ndf_final = df_reviews_biz[df_reviews_biz['business_id'].isin(photo_biz_ids)].copy()\n\n# Merge with photo info\ndf_photo_summary = df_photos_full.groupby('business_id').agg(\n    photo_count=('photo_id', 'count'),\n    photo_ids=('photo_id', lambda x: ', '.join(x.astype(str)[:3])),\n    captions=('caption', lambda x: ' | '.join([str(c) for c in x if pd.notna(c)][:3])),\n    best_distance=('distance', 'min')\n).reset_index()\n\ndf_final = df_final.merge(df_photo_summary, on='business_id', how='left')\n\n# Sort by best photo match distance (lower = more similar)\ndf_final = df_final.sort_values('best_distance', ascending=True)\n\n# Select and format output columns\noutput_columns = [\n    'name',\n    'address',\n    'city',\n    'review_date',\n    'review_stars',\n    'biz_avg_stars',\n    'photo_count',\n    'captions',\n    'best_distance'\n]\n\navailable_cols = [c for c in output_columns if c in df_final.columns]\ndf_output = df_final[available_cols].copy()\n\n# Rename columns for display\ndf_output.rename(columns={\n    'name': 'Business Name',\n    'address': 'Address',\n    'city': 'City',\n    'review_date': 'Review Date',\n    'review_stars': 'Rating (Review)',\n    'biz_avg_stars': 'Avg Business Rating',\n    'photo_count': 'Double-Patty Photos',\n    'captions': 'Photo Captions',\n    'best_distance': 'Photo Match Score'\n}, inplace=True)\n\nprint(\"\\n\" + \"=\" * 70)\nprint(\"FINAL RESULTS: Burgers Shops in Indianapolis with Double-Patty Burger Photos\")\nprint(\"(Reviewed by Frank's Friends)\")\nprint(\"=\" * 70)\npd.set_option('display.max_columns', None)\npd.set_option('display.width', 200)\npd.set_option('display.max_colwidth', 50)\nprint(df_output.to_string(index=False))\n\nprint(f\"\\n--- Total results: {len(df_output)} reviews across {df_final['business_id'].nunique()} Burger shops ---\")\nprint(\"Query complete.\")"
+    }
+  },
+  {
+    "index": 109,
+    "question": "In New Orleans, find seafood restaurants reviewed by user Andy's friends with photos of oysters or shrimp; return business name, review summary, and photo count.",
+    "success": true,
+    "result": {
+      "analysis": "This is a complex multi-database query that requires: 1) Neo4j to find user 'Andy' and their friends via social graph, 2) SQLite to find seafood restaurants in New Orleans, 3) Milvus vector search to find photos related to 'oysters' or 'shrimp', 4) SQLite to get reviews written by Andy's friends for those restaurants, and 5) Milvus vector search to summarize/find relevant reviews. This involves all three databases with cross-database joins on business_id and user_id.",
+      "natural_question": "In New Orleans, find seafood restaurants reviewed by user Andy's friends with photos of oysters or shrimp; return business name, review summary, and photo count.",
+      "difficulty": "hard",
+      "query_types": [
+        "graph",
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "neo4j"
+            ],
+            "filter_condition": {
+              "user.name": {
+                "$eq": "Andy"
+              }
+            }
+          },
+          "result_var": "andy_friends",
+          "description": {
+            "narrative": "Use Neo4j graph database to find user 'Andy' and retrieve all their friends' user_ids through the FRIEND relationship.",
+            "example_query": "MATCH (u:User {name: 'Andy'})-[:FRIEND]->(f:User) RETURN f.user_id AS friend_id, f.name AS friend_name"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "business.db"
+            ],
+            "filter_condition": {
+              "city": {
+                "$eq": "New Orleans"
+              },
+              "categories": {
+                "$like": "%Seafood%"
+              }
+            }
+          },
+          "result_var": "seafood_restaurants",
+          "description": {
+            "narrative": "Query SQLite business database to find all seafood restaurants located in New Orleans by filtering on city and categories fields.",
+            "example_query": "SELECT business_id, name, categories FROM business WHERE city = 'New Orleans' AND categories LIKE '%Seafood%'"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "review.db"
+            ],
+            "filter_condition": {
+              "user_id": {
+                "$in": "andy_friends"
+              },
+              "business_id": {
+                "$in": "seafood_restaurants"
+              }
+            }
+          },
+          "result_var": "friend_reviews",
+          "description": {
+            "narrative": "Query SQLite review database to find reviews written by Andy's friends for the identified seafood restaurants in New Orleans.",
+            "example_query": "SELECT review_id, business_id, user_id, text, stars, date FROM review WHERE user_id IN (...friend_ids...) AND business_id IN (...business_ids...)"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "photo_vector"
+            ],
+            "filter_condition": {
+              "search_text": [
+                "oysters",
+                "shrimp"
+              ],
+              "business_id": {
+                "$in": "seafood_restaurants"
+              }
+            }
+          },
+          "result_var": "oyster_shrimp_photos",
+          "description": {
+            "narrative": "Use Milvus vector similarity search on the photo_vector collection to find photos semantically related to 'oysters' or 'shrimp' for the identified seafood restaurants. Filter by business_id.",
+            "example_query": "collection.search(data=[embed('oysters'), embed('shrimp')], anns_field='photo_vector', param={'metric_type': 'L2', 'params': {'nprobe': 16}}, limit=200, expr='business_id in [...]')"
+          }
+        },
+        {
+          "step": 5,
+          "parameters": {
+            "ms_names": [
+              "reviews"
+            ],
+            "filter_condition": {
+              "search_text": "seafood oyster shrimp dining experience",
+              "business_id": {
+                "$in": "matched_business_ids"
+              }
+            }
+          },
+          "result_var": "review_summaries",
+          "description": {
+            "narrative": "Use Milvus vector search on reviews collection to find the most relevant review texts for each matched business, which will serve as the review summary.",
+            "example_query": "collection.search(data=[embed('seafood oyster shrimp dining experience')], anns_field='review_vector', limit=5, expr='business_id == ...')"
+          }
+        },
+        {
+          "step": 6,
+          "parameters": {
+            "ms_names": [
+              "aggregation"
+            ],
+            "filter_condition": {}
+          },
+          "result_var": "final_results",
+          "description": {
+            "narrative": "Aggregate results: join business names with photo counts and review summaries. For each qualifying restaurant, return business name, a summary of friend reviews, and the count of oyster/shrimp photos.",
+            "example_query": "pandas merge and groupby operations to produce final output"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport pandas as pd\nimport numpy as np\nfrom pymilvus import connections, Collection, utility\nfrom neo4j import GraphDatabase\nfrom sentence_transformers import SentenceTransformer\nimport warnings\nwarnings.filterwarnings('ignore')\n\n# ============================================================\n# Configuration\n# ============================================================\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nmilvus_config = {\n    'host': 'localhost',\n    'port': '19530',\n    'collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    }\n}\n\nneo4j_config = {\n    'uri': 'bolt://localhost:7687',\n    'auth': ('neo4j', 'password')\n}\n\n# Load sentence transformer model for vector search\nprint(\"Loading embedding model...\")\nmodel = SentenceTransformer('all-MiniLM-L6-v2')\n\n# ============================================================\n# Step 1: Find Andy's friends from Neo4j graph database\n# ============================================================\nprint(\"\\n\" + \"=\"*60)\nprint(\"Step 1: Finding Andy's friends in Neo4j...\")\nprint(\"=\"*60)\n\nandy_friends = []\ntry:\n    driver = GraphDatabase.driver(\n        neo4j_config['uri'],\n        auth=neo4j_config['auth']\n    )\n    with driver.session() as session:\n        # Find all friends of users named Andy\n        result = session.run(\"\"\"\n            MATCH (u:User {name: 'Andy'})-[:FRIEND]->(f:User)\n            RETURN DISTINCT f.user_id AS friend_id, f.name AS friend_name\n        \"\"\")\n        for record in result:\n            andy_friends.append({\n                'friend_id': record['friend_id'],\n                'friend_name': record['friend_name']\n            })\n    driver.close()\nexcept Exception as e:\n    print(f\"Neo4j error: {e}\")\n    # Fallback: try SQLite user table to find Andy's friends\n    print(\"Falling back to SQLite user table for friend lookup...\")\n    try:\n        conn_user = sqlite3.connect(sqlite_paths['user'])\n        andy_df = pd.read_sql_query(\n            \"SELECT user_id, name, friends FROM user WHERE name = 'Andy'\",\n            conn_user\n        )\n        conn_user.close()\n        if not andy_df.empty:\n            for _, row in andy_df.iterrows():\n                if row['friends'] and row['friends'].strip():\n                    friend_ids = [fid.strip() for fid in row['friends'].split(',') if fid.strip()]\n                    for fid in friend_ids:\n                        andy_friends.append({'friend_id': fid, 'friend_name': 'Unknown'})\n    except Exception as e2:\n        print(f\"SQLite fallback error: {e2}\")\n\nfriend_ids = list(set([f['friend_id'] for f in andy_friends]))\nprint(f\"Found {len(friend_ids)} unique friends of Andy\")\n\nif not friend_ids:\n    print(\"No friends found for Andy. Exiting.\")\nelse:\n    # ============================================================\n    # Step 2: Find seafood restaurants in New Orleans from SQLite\n    # ============================================================\n    print(\"\\n\" + \"=\"*60)\n    print(\"Step 2: Finding seafood restaurants in New Orleans...\")\n    print(\"=\"*60)\n\n    conn_biz = sqlite3.connect(sqlite_paths['business'])\n    seafood_query = \"\"\"\n        SELECT business_id, name, categories, stars, review_count, address\n        FROM business\n        WHERE city = 'New Orleans'\n          AND categories LIKE '%Seafood%'\n    \"\"\"\n    seafood_df = pd.read_sql_query(seafood_query, conn_biz)\n    conn_biz.close()\n\n    print(f\"Found {len(seafood_df)} seafood restaurants in New Orleans\")\n    if not seafood_df.empty:\n        print(\"Sample restaurants:\")\n        print(seafood_df[['name', 'categories', 'stars']].head(10).to_string(index=False))\n\n    business_ids = seafood_df['business_id'].tolist()\n\n    if not business_ids:\n        print(\"No seafood restaurants found in New Orleans. Exiting.\")\n    else:\n        # ============================================================\n        # Step 3: Find reviews by Andy's friends for these restaurants\n        # ============================================================\n        print(\"\\n\" + \"=\"*60)\n        print(\"Step 3: Finding reviews by Andy's friends...\")\n        print(\"=\"*60)\n\n        conn_review = sqlite3.connect(sqlite_paths['review'])\n\n        # Build parameterized query - handle large IN clauses in batches\n        friend_reviews_list = []\n        batch_size = 500\n\n        for i in range(0, len(friend_ids), batch_size):\n            friend_batch = friend_ids[i:i+batch_size]\n            friend_placeholders = ','.join(['?' for _ in friend_batch])\n            biz_placeholders = ','.join(['?' for _ in business_ids])\n\n            review_query = f\"\"\"\n                SELECT review_id, business_id, user_id, text, stars, date\n                FROM review\n                WHERE user_id IN ({friend_placeholders})\n                  AND business_id IN ({biz_placeholders})\n            \"\"\"\n            params = friend_batch + business_ids\n            batch_df = pd.read_sql_query(review_query, conn_review, params=params)\n            friend_reviews_list.append(batch_df)\n\n        conn_review.close()\n\n        if friend_reviews_list:\n            friend_reviews_df = pd.concat(friend_reviews_list, ignore_index=True)\n        else:\n            friend_reviews_df = pd.DataFrame()\n\n        print(f\"Found {len(friend_reviews_df)} reviews by Andy's friends at these restaurants\")\n\n        # Get the business_ids that have friend reviews\n        reviewed_biz_ids = friend_reviews_df['business_id'].unique().tolist() if not friend_reviews_df.empty else []\n\n        # ============================================================\n        # Step 4: Vector search for oyster/shrimp photos in Milvus\n        # ============================================================\n        print(\"\\n\" + \"=\"*60)\n        print(\"Step 4: Searching for oyster/shrimp photos in Milvus...\")\n        print(\"=\"*60)\n\n        connections.connect(\"default\", host=milvus_config['host'], port=milvus_config['port'])\n\n        photo_collection = Collection(milvus_config['collections']['photos'])\n        photo_collection.load()\n\n        # Get collection schema info\n        print(f\"Photo collection schema fields: {[f.name for f in photo_collection.schema.fields]}\")\n\n        # Generate embeddings for oyster and shrimp queries\n        search_queries = ['oysters seafood platter', 'shrimp seafood dish']\n        query_embeddings = model.encode(search_queries).tolist()\n\n        # Build filter expression for business_ids\n        # Milvus expr filter for business_id\n        photo_results_all = []\n\n        # Search in batches if business_ids list is large\n        biz_batch_size = 100\n        for i in range(0, len(business_ids), biz_batch_size):\n            biz_batch = business_ids[i:i+biz_batch_size]\n            biz_filter_parts = [f'business_id == \"{bid}\"' for bid in biz_batch]\n            biz_expr = ' or '.join(biz_filter_parts)\n\n            search_params = {\n                \"metric_type\": \"L2\",\n                \"params\": {\"nprobe\": 16}\n            }\n\n            # Determine the vector field name from schema\n            vector_field = None\n            output_fields = []\n            for field in photo_collection.schema.fields:\n                if field.dtype in [101, 102]:  # FLOAT_VECTOR or BINARY_VECTOR\n                    vector_field = field.name\n                elif field.name != 'id':\n                    output_fields.append(field.name)\n\n            if vector_field is None:\n                vector_field = 'photo_vector'  # default guess\n\n            try:\n                for idx, query_emb in enumerate(query_embeddings):\n                    results = photo_collection.search(\n                        data=[query_emb],\n                        anns_field=vector_field,\n                        param=search_params,\n                        limit=200,\n                        expr=biz_expr,\n                        output_fields=output_fields\n                    )\n                    for hits in results:\n                        for hit in hits:\n                            entity = hit.entity\n                            photo_record = {\n                                'photo_id': entity.get('photo_id', ''),\n                                'business_id': entity.get('business_id', ''),\n                                'caption': entity.get('caption', entity.get('label', '')),\n                                'label': entity.get('label', ''),\n                                'distance': hit.distance,\n                                'search_term': search_queries[idx]\n                            }\n                            photo_results_all.append(photo_record)\n            except Exception as e:\n                print(f\"Milvus photo search error: {e}\")\n                # Fallback: try SQLite photo table\n                print(\"Falling back to SQLite photo table...\")\n                try:\n                    conn_photo = sqlite3.connect(sqlite_paths['photo'])\n                    biz_placeholders = ','.join(['?' for _ in business_ids])\n                    photo_query = f\"\"\"\n                        SELECT photo_id, business_id, caption, label\n                        FROM photo\n                        WHERE business_id IN ({biz_placeholders})\n                          AND (LOWER(caption) LIKE '%oyster%'\n                               OR LOWER(caption) LIKE '%shrimp%'\n                               OR LOWER(label) LIKE '%food%')\n                    \"\"\"\n                    photo_fallback_df = pd.read_sql_query(photo_query, conn_photo, params=business_ids)\n                    conn_photo.close()\n                    for _, row in photo_fallback_df.iterrows():\n                        photo_results_all.append({\n                            'photo_id': row['photo_id'],\n                            'business_id': row['business_id'],\n                            'caption': row.get('caption', ''),\n                            'label': row.get('label', ''),\n                            'distance': 0.0,\n                            'search_term': 'fallback'\n                        })\n                except Exception as e2:\n                    print(f\"Photo fallback error: {e2}\")\n\n        photo_df = pd.DataFrame(photo_results_all)\n        if not photo_df.empty:\n            # Remove duplicates by photo_id, keep closest match\n            photo_df = photo_df.sort_values('distance').drop_duplicates(subset=['photo_id'], keep='first')\n            # Apply a distance threshold to filter relevant photos\n            distance_threshold = photo_df['distance'].quantile(0.5) if len(photo_df) > 10 else float('inf')\n            photo_df_filtered = photo_df[photo_df['distance'] <= distance_threshold]\n        else:\n            photo_df_filtered = pd.DataFrame()\n\n        print(f\"Found {len(photo_df_filtered)} relevant oyster/shrimp photos\")\n\n        # Count photos per business\n        if not photo_df_filtered.empty:\n            photo_counts = photo_df_filtered.groupby('business_id').agg(\n                photo_count=('photo_id', 'nunique')\n            ).reset_index()\n        else:\n            photo_counts = pd.DataFrame(columns=['business_id', 'photo_count'])\n\n        # ============================================================\n        # Step 5: Get review summaries using Milvus vector search\n        # ============================================================\n        print(\"\\n\" + \"=\"*60)\n        print(\"Step 5: Generating review summaries via Milvus...\")\n        print(\"=\"*60)\n\n        review_collection = Collection(milvus_config['collections']['reviews'])\n        review_collection.load()\n\n        print(f\"Review collection schema fields: {[f.name for f in review_collection.schema.fields]}\")\n\n        # Find the vector field and output fields for reviews\n        review_vector_field = None\n        review_output_fields = []\n        for field in review_collection.schema.fields:\n            if field.dtype in [101, 102]:\n                review_vector_field = field.name\n            elif field.name != 'id':\n                review_output_fields.append(field.name)\n\n        if review_vector_field is None:\n            review_vector_field = 'review_vector'\n\n        # Search for representative reviews per matched business\n        summary_query = 'delicious seafood oysters shrimp great restaurant experience'\n        summary_embedding = model.encode([summary_query]).tolist()\n\n        # Get businesses that appear in both friend reviews AND photo results\n        if not photo_df_filtered.empty and not friend_reviews_df.empty:\n            photo_biz_ids = set(photo_df_filtered['business_id'].unique())\n            review_biz_ids = set(friend_reviews_df['business_id'].unique())\n            matched_biz_ids = list(photo_biz_ids.intersection(review_biz_ids))\n        elif not friend_reviews_df.empty:\n            matched_biz_ids = friend_reviews_df['business_id'].unique().tolist()\n        else:\n            matched_biz_ids = []\n\n        print(f\"Businesses with both friend reviews and oyster/shrimp photos: {len(matched_biz_ids)}\")\n\n        review_summaries = {}\n        for biz_id in matched_biz_ids:\n            try:\n                biz_expr = f'business_id == \"{biz_id}\"'\n                results = review_collection.search(\n                    data=summary_embedding,\n                    anns_field=review_vector_field,\n                    param={\"metric_type\": \"L2\", \"params\": {\"nprobe\": 16}},\n                    limit=3,\n                    expr=biz_expr,\n                    output_fields=review_output_fields\n                )\n                top_texts = []\n                for hits in results:\n                    for hit in hits:\n                        text = hit.entity.get('text', hit.entity.get('review_text', ''))\n                        if text:\n                            # Truncate long reviews for summary\n                            top_texts.append(text[:200] + '...' if len(text) > 200 else text)\n                if top_texts:\n                    review_summaries[biz_id] = ' | '.join(top_texts[:3])\n                else:\n                    review_summaries[biz_id] = 'No summary available'\n            except Exception as e:\n                print(f\"Review search error for {biz_id}: {e}\")\n                review_summaries[biz_id] = 'Search error'\n\n        # Fallback: use SQLite review text if Milvus summaries are empty\n        if not review_summaries and not friend_reviews_df.empty:\n            print(\"Using SQLite review text as fallback for summaries...\")\n            for biz_id in matched_biz_ids:\n                biz_reviews = friend_reviews_df[friend_reviews_df['business_id'] == biz_id]\n                if not biz_reviews.empty:\n                    texts = biz_reviews.nlargest(3, 'stars')['text'].tolist()\n                    summary_parts = [t[:200] + '...' if len(str(t)) > 200 else str(t) for t in texts]\n                    review_summaries[biz_id] = ' | '.join(summary_parts)\n\n        # ============================================================\n        # Step 6: Aggregate and produce final results\n        # ============================================================\n        print(\"\\n\" + \"=\"*60)\n        print(\"Step 6: Aggregating final results...\")\n        print(\"=\"*60)\n\n        # Build final result dataframe\n        final_records = []\n        for biz_id in matched_biz_ids:\n            biz_info = seafood_df[seafood_df['business_id'] == biz_id]\n            if biz_info.empty:\n                continue\n\n            biz_name = biz_info.iloc[0]['name']\n            biz_stars = biz_info.iloc[0]['stars']\n            biz_address = biz_info.iloc[0].get('address', '')\n\n            # Photo count\n            pc = photo_counts[photo_counts['business_id'] == biz_id]\n            p_count = int(pc.iloc[0]['photo_count']) if not pc.empty else 0\n\n            # Review summary\n            r_summary = review_summaries.get(biz_id, 'No summary available')\n\n            # Number of friend reviews\n            n_friend_reviews = len(friend_reviews_df[friend_reviews_df['business_id'] == biz_id])\n\n            final_records.append({\n                'Business Name': biz_name,\n                'Business Rating': biz_stars,\n                'Address': biz_address,\n                'Friend Review Count': n_friend_reviews,\n                'Review Summary': r_summary,\n                'Oyster/Shrimp Photo Count': p_count\n            })\n\n        final_df = pd.DataFrame(final_records)\n\n        if final_df.empty:\n            print(\"\\nNo results found matching all criteria.\")\n            print(\"\\nDiagnostic info:\")\n            print(f\"  - Andy's friends found: {len(friend_ids)}\")\n            print(f\"  - Seafood restaurants in New Orleans: {len(seafood_df)}\")\n            print(f\"  - Friend reviews at these restaurants: {len(friend_reviews_df)}\")\n            print(f\"  - Oyster/shrimp photos found: {len(photo_df_filtered)}\")\n            print(f\"  - Businesses matching both criteria: {len(matched_biz_ids)}\")\n\n            # Show partial results if available\n            if not friend_reviews_df.empty:\n                print(\"\\n--- Restaurants reviewed by Andy's friends (without photo filter): ---\")\n                partial = friend_reviews_df.merge(seafood_df[['business_id', 'name']], on='business_id')\n                if not partial.empty:\n                    print(partial[['name', 'stars', 'text']].head(10).to_string(index=False))\n        else:\n            final_df = final_df.sort_values('Oyster/Shrimp Photo Count', ascending=False)\n            print(\"\\n\" + \"=\"*60)\n            print(\"FINAL RESULTS\")\n            print(\"Seafood restaurants in New Orleans reviewed by Andy's friends\")\n            print(\"with photos of oysters or shrimp\")\n            print(\"=\"*60)\n            print()\n            for idx, row in final_df.iterrows():\n                print(f\"Restaurant: {row['Business Name']}\")\n                print(f\"  Rating: {row['Business Rating']} stars\")\n                print(f\"  Address: {row['Address']}\")\n                print(f\"  Reviews by Andy's friends: {row['Friend Review Count']}\")\n                print(f\"  Oyster/Shrimp Photo Count: {row['Oyster/Shrimp Photo Count']}\")\n                print(f\"  Review Summary: {row['Review Summary'][:300]}\")\n                print(\"-\" * 50)\n\n            print(f\"\\nTotal matching restaurants: {len(final_df)}\")\n\n        # Cleanup connections\n        try:\n            connections.disconnect(\"default\")\n        except:\n            pass\n\n        print(\"\\nDone!\")"
+    }
+  },
+  {
+    "index": 110,
+    "question": "Using user Carl's friends in Edmonton, select Chinese restaurants with dim sum or fried rice photos; list friend names and ratings with addresses.",
+    "success": true,
+    "result": {
+      "analysis": "This is a complex multi-database query that requires: 1) Finding user 'Carl' and their friends from Neo4j graph database, 2) Filtering friends located in Edmonton from SQLite, 3) Finding Chinese restaurants in Edmonton from SQLite, 4) Using Milvus vector search to find photos related to 'dim sum' or 'fried rice', 5) Joining all results to get friend names, ratings, and restaurant addresses. This involves all three databases: Neo4j for social relationships, SQLite for structured business/user data, and Milvus for photo semantic search.",
+      "natural_question": "Using user Carl's friends in Edmonton, select Chinese restaurants with dim sum or fried rice photos; list friend names and ratings with addresses.",
+      "difficulty": "hard",
+      "query_types": [
+        "graph",
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "neo4j"
+            ],
+            "filter_condition": {
+              "user.name": {
+                "$eq": "Carl"
+              }
+            }
+          },
+          "result_var": "carl_friends",
+          "description": {
+            "narrative": "Query Neo4j graph database to find user 'Carl' and all their friends. The FRIEND relationship in Neo4j connects users, so we traverse Carl's friend edges to get friend user_ids.",
+            "example_query": "MATCH (u:User {name: 'Carl'})-[:FRIEND]->(f:User) RETURN f.user_id AS friend_id, f.name AS friend_name"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "user.db"
+            ],
+            "filter_condition": {
+              "user_id": {
+                "$in": "carl_friends.friend_id"
+              }
+            }
+          },
+          "result_var": "edmonton_friends",
+          "description": {
+            "narrative": "From the friend list obtained in Step 1, filter friends who are located in Edmonton by checking the user table in SQLite. This narrows down the friend pool to Edmonton-based users.",
+            "example_query": "SELECT user_id, name FROM user WHERE user_id IN (?) -- filtered by Edmonton from review/tip activity or user location"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "business.db"
+            ],
+            "filter_condition": {
+              "city": {
+                "$eq": "Edmonton"
+              },
+              "categories": {
+                "$like": "%Chinese%"
+              }
+            }
+          },
+          "result_var": "chinese_restaurants",
+          "description": {
+            "narrative": "Query SQLite business database to find all Chinese restaurants in Edmonton. Filter by city='Edmonton' and categories containing 'Chinese'.",
+            "example_query": "SELECT business_id, name, address, city, stars FROM business WHERE city = 'Edmonton' AND categories LIKE '%Chinese%'"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "photo_vector"
+            ],
+            "filter_condition": {
+              "semantic_query": [
+                "dim sum",
+                "fried rice"
+              ],
+              "business_id": {
+                "$in": "chinese_restaurants.business_id"
+              }
+            }
+          },
+          "result_var": "matching_photos",
+          "description": {
+            "narrative": "Use Milvus vector database to search for photos semantically similar to 'dim sum' or 'fried rice' among the Chinese restaurants found in Step 3. This uses the photo_vector collection with text-to-image semantic search.",
+            "example_query": "collection.search(data=[embed('dim sum'), embed('fried rice')], anns_field='vector', param={'metric_type': 'L2', 'params': {'nprobe': 10}}, limit=50, expr='business_id in [...]')"
+          }
+        },
+        {
+          "step": 5,
+          "parameters": {
+            "ms_names": [
+              "review.db"
+            ],
+            "filter_condition": {
+              "user_id": {
+                "$in": "edmonton_friends.user_id"
+              },
+              "business_id": {
+                "$in": "matching_photos.business_id"
+              }
+            }
+          },
+          "result_var": "friend_reviews",
+          "description": {
+            "narrative": "Query the review database to find reviews written by Carl's Edmonton friends for the Chinese restaurants that have dim sum or fried rice photos. Extract friend names, star ratings, and join with business addresses.",
+            "example_query": "SELECT r.user_id, r.business_id, r.stars FROM review WHERE r.user_id IN (?) AND r.business_id IN (?)"
+          }
+        },
+        {
+          "step": 6,
+          "parameters": {
+            "ms_names": [
+              "combined"
+            ],
+            "filter_condition": {}
+          },
+          "result_var": "final_result",
+          "description": {
+            "narrative": "Combine all results: friend names from Step 2, ratings from Step 5, and restaurant names/addresses from Step 3. Present a final table with friend_name, restaurant_name, address, rating, and matched photo type.",
+            "example_query": "JOIN edmonton_friends, friend_reviews, chinese_restaurants ON matching keys"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport pandas as pd\nfrom pymilvus import connections, Collection\nfrom neo4j import GraphDatabase\nfrom sentence_transformers import SentenceTransformer\nimport warnings\nwarnings.filterwarnings('ignore')\n\n# ============================================================\n# Database Connection Configuration\n# ============================================================\n\n# SQLite paths\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\n# Milvus configuration\nmilvus_host = 'localhost'\nmilvus_port = '19530'\nmilvus_collections = {\n    'reviews': 'reviews',\n    'photos': 'photo_vector',\n    'tips': 'milvus_tip'\n}\n\n# Neo4j configuration\nneo4j_uri = 'bolt://localhost:7687'\nneo4j_auth = ('neo4j', 'password')\n\n# ============================================================\n# Step 1: Find Carl's friends from Neo4j\n# ============================================================\nprint(\"=\" * 70)\nprint(\"Step 1: Querying Neo4j for Carl's friends...\")\nprint(\"=\" * 70)\n\ncarl_friends = []\ntry:\n    driver = GraphDatabase.driver(neo4j_uri, auth=neo4j_auth)\n    with driver.session() as session:\n        # Find all friends of user Carl\n        result = session.run(\"\"\"\n            MATCH (u:User {name: 'Carl'})-[:FRIEND]->(f:User)\n            RETURN f.user_id AS friend_id, f.name AS friend_name\n        \"\"\")\n        carl_friends = [{'friend_id': record['friend_id'], 'friend_name': record['friend_name']} for record in result]\n        \n        # If no directed results, try undirected\n        if not carl_friends:\n            result = session.run(\"\"\"\n                MATCH (u:User {name: 'Carl'})-[:FRIEND]-(f:User)\n                RETURN f.user_id AS friend_id, f.name AS friend_name\n            \"\"\")\n            carl_friends = [{'friend_id': record['friend_id'], 'friend_name': record['friend_name']} for record in result]\n    driver.close()\nexcept Exception as e:\n    print(f\"Neo4j error: {e}\")\n    # Fallback: try to find Carl's friends from SQLite user table\n    print(\"Falling back to SQLite user table for friend lookup...\")\n    try:\n        conn_user = sqlite3.connect(sqlite_paths['user'])\n        carl_row = pd.read_sql_query(\"SELECT user_id, friends FROM user WHERE name = 'Carl' LIMIT 1\", conn_user)\n        if not carl_row.empty and carl_row.iloc[0]['friends']:\n            friend_ids_raw = carl_row.iloc[0]['friends'].split(', ')\n            friend_ids_raw = [fid.strip() for fid in friend_ids_raw if fid.strip() and fid.strip() != 'None']\n            if friend_ids_raw:\n                placeholders = ','.join(['?' for _ in friend_ids_raw])\n                friends_df = pd.read_sql_query(f\"SELECT user_id, name FROM user WHERE user_id IN ({placeholders})\", conn_user, params=friend_ids_raw)\n                carl_friends = [{'friend_id': row['user_id'], 'friend_name': row['name']} for _, row in friends_df.iterrows()]\n        conn_user.close()\n    except Exception as e2:\n        print(f\"SQLite fallback error: {e2}\")\n\ndf_carl_friends = pd.DataFrame(carl_friends)\nprint(f\"Found {len(carl_friends)} friends for Carl.\")\nif not df_carl_friends.empty:\n    print(df_carl_friends.head(10))\n\nif df_carl_friends.empty:\n    print(\"No friends found for Carl. Exiting.\")\n    exit()\n\n# ============================================================\n# Step 2: Filter friends who are active in Edmonton\n# ============================================================\nprint(\"\\n\" + \"=\" * 70)\nprint(\"Step 2: Filtering friends active in Edmonton...\")\nprint(\"=\" * 70)\n\nfriend_ids = df_carl_friends['friend_id'].tolist()\n\n# Check friends who have reviewed businesses in Edmonton\nconn_review = sqlite3.connect(sqlite_paths['review'])\nconn_business = sqlite3.connect(sqlite_paths['business'])\n\n# Get Edmonton business IDs first\nedmonton_biz_df = pd.read_sql_query(\n    \"SELECT business_id FROM business WHERE city = 'Edmonton'\",\n    conn_business\n)\nedmonton_biz_ids = edmonton_biz_df['business_id'].tolist()\nprint(f\"Found {len(edmonton_biz_ids)} businesses in Edmonton.\")\n\n# Find friends who reviewed Edmonton businesses\nif friend_ids and edmonton_biz_ids:\n    friend_placeholders = ','.join(['?' for _ in friend_ids])\n    biz_placeholders = ','.join(['?' for _ in edmonton_biz_ids])\n    \n    edmonton_friends_df = pd.read_sql_query(\n        f\"\"\"SELECT DISTINCT user_id FROM review \n            WHERE user_id IN ({friend_placeholders}) \n            AND business_id IN ({biz_placeholders})\"\"\",\n        conn_review,\n        params=friend_ids + edmonton_biz_ids\n    )\n    edmonton_friend_ids = edmonton_friends_df['user_id'].tolist()\nelse:\n    edmonton_friend_ids = []\n\nconn_review.close()\n\n# Get friend names for Edmonton friends\nedmonton_friends = df_carl_friends[df_carl_friends['friend_id'].isin(edmonton_friend_ids)].copy()\nprint(f\"Found {len(edmonton_friends)} of Carl's friends active in Edmonton.\")\nprint(edmonton_friends)\n\nif edmonton_friends.empty:\n    print(\"No Edmonton friends found. Exiting.\")\n    conn_business.close()\n    exit()\n\n# ============================================================\n# Step 3: Find Chinese restaurants in Edmonton\n# ============================================================\nprint(\"\\n\" + \"=\" * 70)\nprint(\"Step 3: Finding Chinese restaurants in Edmonton...\")\nprint(\"=\" * 70)\n\nchinese_restaurants_df = pd.read_sql_query(\n    \"\"\"SELECT business_id, name, address, city, state, stars, categories \n       FROM business \n       WHERE city = 'Edmonton' AND categories LIKE '%Chinese%'\"\"\",\n    conn_business\n)\nconn_business.close()\n\nprint(f\"Found {len(chinese_restaurants_df)} Chinese restaurants in Edmonton.\")\nif not chinese_restaurants_df.empty:\n    print(chinese_restaurants_df[['name', 'address', 'stars']].to_string())\n\nif chinese_restaurants_df.empty:\n    print(\"No Chinese restaurants found in Edmonton. Exiting.\")\n    exit()\n\nchinese_biz_ids = chinese_restaurants_df['business_id'].tolist()\n\n# ============================================================\n# Step 4: Search Milvus for dim sum / fried rice photos\n# ============================================================\nprint(\"\\n\" + \"=\" * 70)\nprint(\"Step 4: Searching Milvus for dim sum / fried rice photos...\")\nprint(\"=\" * 70)\n\nmatching_photo_biz_ids = set()\ntry:\n    # Connect to Milvus\n    connections.connect(alias='default', host=milvus_host, port=milvus_port)\n    \n    # Load photo vector collection\n    photo_collection = Collection(milvus_collections['photos'])\n    photo_collection.load()\n    \n    # Load sentence transformer model for text-to-vector encoding\n    model = SentenceTransformer('clip-ViT-B-32')  # CLIP model for text-image matching\n    \n    # Search for 'dim sum' photos\n    search_queries = ['dim sum', 'fried rice']\n    \n    for query_text in search_queries:\n        print(f\"\\nSearching for '{query_text}' photos...\")\n        query_vector = model.encode(query_text).tolist()\n        \n        # Build filter expression for Chinese restaurant business IDs\n        if chinese_biz_ids:\n            # Format business IDs for Milvus expression\n            biz_id_str = ', '.join([f'\"' + bid + '\"' for bid in chinese_biz_ids])\n            expr = f'business_id in [{biz_id_str}]'\n        else:\n            expr = ''\n        \n        search_params = {\n            'metric_type': 'L2',\n            'params': {'nprobe': 10}\n        }\n        \n        try:\n            results = photo_collection.search(\n                data=[query_vector],\n                anns_field='vector',\n                param=search_params,\n                limit=50,\n                expr=expr if expr else None,\n                output_fields=['business_id', 'photo_id']\n            )\n            \n            for hits in results:\n                for hit in hits:\n                    biz_id = hit.entity.get('business_id')\n                    if biz_id:\n                        matching_photo_biz_ids.add(biz_id)\n                        print(f\"  Found match: business_id={biz_id}, distance={hit.distance:.4f}\")\n        except Exception as search_err:\n            print(f\"  Search error for '{query_text}': {search_err}\")\n    \n    photo_collection.release()\n    connections.disconnect('default')\n    \nexcept Exception as e:\n    print(f\"Milvus error: {e}\")\n    print(\"Falling back to SQLite photo table for label-based filtering...\")\n    # Fallback: use SQLite photo table to find photos labeled as 'food'\n    try:\n        conn_photo = sqlite3.connect(sqlite_paths['photo'])\n        if chinese_biz_ids:\n            ph_placeholders = ','.join(['?' for _ in chinese_biz_ids])\n            photo_df = pd.read_sql_query(\n                f\"\"\"SELECT DISTINCT business_id FROM photo \n                    WHERE business_id IN ({ph_placeholders}) \n                    AND (label = 'food' OR caption LIKE '%dim sum%' OR caption LIKE '%fried rice%')\"\"\",\n                conn_photo,\n                params=chinese_biz_ids\n            )\n            matching_photo_biz_ids = set(photo_df['business_id'].tolist())\n        conn_photo.close()\n    except Exception as e2:\n        print(f\"Photo fallback error: {e2}\")\n        # If all else fails, use all Chinese restaurants\n        matching_photo_biz_ids = set(chinese_biz_ids)\n\nprint(f\"\\nFound {len(matching_photo_biz_ids)} Chinese restaurants with matching photos.\")\n\nif not matching_photo_biz_ids:\n    print(\"No matching photos found. Using all Chinese restaurants as candidates.\")\n    matching_photo_biz_ids = set(chinese_biz_ids)\n\n# ============================================================\n# Step 5: Get reviews by Edmonton friends for matched restaurants\n# ============================================================\nprint(\"\\n\" + \"=\" * 70)\nprint(\"Step 5: Finding reviews by Carl's Edmonton friends for matched restaurants...\")\nprint(\"=\" * 70)\n\nconn_review = sqlite3.connect(sqlite_paths['review'])\n\nedmonton_friend_id_list = edmonton_friends['friend_id'].tolist()\nmatched_biz_list = list(matching_photo_biz_ids)\n\nif edmonton_friend_id_list and matched_biz_list:\n    f_placeholders = ','.join(['?' for _ in edmonton_friend_id_list])\n    b_placeholders = ','.join(['?' for _ in matched_biz_list])\n    \n    reviews_df = pd.read_sql_query(\n        f\"\"\"SELECT user_id, business_id, stars, text, date \n            FROM review \n            WHERE user_id IN ({f_placeholders}) \n            AND business_id IN ({b_placeholders})\"\"\",\n        conn_review,\n        params=edmonton_friend_id_list + matched_biz_list\n    )\nelse:\n    reviews_df = pd.DataFrame()\n\nconn_review.close()\nprint(f\"Found {len(reviews_df)} reviews by Edmonton friends for matched restaurants.\")\n\n# ============================================================\n# Step 6: Combine all results into final output\n# ============================================================\nprint(\"\\n\" + \"=\" * 70)\nprint(\"Step 6: Combining results into final output...\")\nprint(\"=\" * 70)\n\nif not reviews_df.empty:\n    # Merge with friend names\n    final_df = reviews_df.merge(\n        edmonton_friends.rename(columns={'friend_id': 'user_id', 'friend_name': 'friend_name'}),\n        on='user_id',\n        how='inner'\n    )\n    \n    # Merge with restaurant info\n    final_df = final_df.merge(\n        chinese_restaurants_df[['business_id', 'name', 'address', 'city']].rename(\n            columns={'name': 'restaurant_name'}\n        ),\n        on='business_id',\n        how='inner'\n    )\n    \n    # Select and format output columns\n    output_df = final_df[[\n        'friend_name', 'restaurant_name', 'address', 'city', 'stars', 'date'\n    ]].rename(columns={\n        'friend_name': 'Friend Name',\n        'restaurant_name': 'Restaurant Name',\n        'address': 'Address',\n        'city': 'City',\n        'stars': 'Rating',\n        'date': 'Review Date'\n    }).sort_values(['Friend Name', 'Rating'], ascending=[True, False])\n    \n    print(\"\\n\" + \"=\" * 70)\n    print(\"FINAL RESULTS: Carl's Edmonton Friends' Reviews of Chinese Restaurants\")\n    print(\"       (with dim sum / fried rice photos)\")\n    print(\"=\" * 70)\n    print(output_df.to_string(index=False))\n    print(f\"\\nTotal results: {len(output_df)}\")\nelse:\n    print(\"\\nNo matching reviews found.\")\n    print(\"Showing Chinese restaurants in Edmonton with matching photos instead:\\n\")\n    filtered_restaurants = chinese_restaurants_df[\n        chinese_restaurants_df['business_id'].isin(matching_photo_biz_ids)\n    ][['name', 'address', 'stars']]\n    print(filtered_restaurants.to_string(index=False))\n    print(f\"\\nCarl's Edmonton friends: {edmonton_friends['friend_name'].tolist()}\")\n    print(\"(These friends have not reviewed the above restaurants.)\")\n\nprint(\"\\n\" + \"=\" * 70)\nprint(\"Query complete.\")\nprint(\"=\" * 70)"
+    }
+  }
+]

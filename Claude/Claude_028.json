@@ -1,0 +1,954 @@
+[
+  {
+    "index": 271,
+    "question": "Find St. Louis coffee shops rated >=4.5 with over 150 reviews and count check-ins since 2023-01-01.",
+    "success": true,
+    "result": {
+      "analysis": "该问题需要在SQLite的business库筛选符合条件的咖啡店（城市、评分、评论数、类别），再到SQLite的checkin库中按business_id提取打卡时间列表，并统计自2023-01-01以来的打卡次数。checkin表的date字段通常为逗号分隔的时间戳字符串，因此需要在Python侧解析并计数。整体为跨两个SQLite库的关系型查询+轻量文本日期解析。",
+      "natural_question": "找出圣路易斯（St. Louis）评分>=4.5且评论数>150的咖啡店，并统计它们从2023-01-01以来的打卡次数。",
+      "difficulty": "medium",
+      "query_types": [
+        "sql"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "sqlite:business.db (business表)"
+            ],
+            "filter_condition": {
+              "city": {
+                "=": "St. Louis"
+              },
+              "stars": {
+                ">=": 4.5
+              },
+              "review_count": {
+                ">": 150
+              },
+              "categories": {
+                "LIKE": "%Coffee%"
+              }
+            }
+          },
+          "result_var": "shops",
+          "description": {
+            "narrative": "在business库中筛选St. Louis的咖啡店（按categories包含Coffee做近似匹配），且stars>=4.5、review_count>150，取出business_id、name等字段。",
+            "example_query": "SELECT business_id, name, address, city, state, postal_code, stars, review_count, categories\nFROM business\nWHERE city = 'St. Louis'\n  AND stars >= 4.5\n  AND review_count > 150\n  AND categories LIKE '%Coffee%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "sqlite:checkin.db (checkin表)"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "IN": "步骤1 business_id 列表"
+              }
+            }
+          },
+          "result_var": "checkins_raw",
+          "description": {
+            "narrative": "在checkin库中按business_id批量拉取date字段（逗号分隔的时间戳列表）。",
+            "example_query": "SELECT business_id, date\nFROM checkin\nWHERE business_id IN ('id1','id2','id3');"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "python处理"
+            ],
+            "filter_condition": {
+              "date": {
+                ">=": "2023-01-01"
+              }
+            }
+          },
+          "result_var": "result",
+          "description": {
+            "narrative": "解析checkin.date中的时间戳并统计>=2023-01-01的数量，最后与商户信息合并输出（可按checkin_count排序）。",
+            "example_query": "Python: split(date_str, ',') -> parse '%Y-%m-%d %H:%M:%S' -> count(dt>=start)"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nfrom datetime import datetime\nfrom typing import Dict, List, Tuple\n\n# --------------------------\n# Fixed configuration (must match prompt)\n# --------------------------\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\n# (Not used in this task, but included per architecture context)\nconfig = {\n    'milvus_collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    },\n    'milvus_host': 'localhost',\n    'milvus_port': '19530',\n    'neo4j_uri': 'bolt://localhost:7687',\n    'neo4j_auth': ('neo4j', 'password')\n}\n\n\ndef chunked(lst: List[str], n: int) -> List[List[str]]:\n    for i in range(0, len(lst), n):\n        yield lst[i:i+n]\n\n\ndef parse_checkin_dates(date_str: str) -> List[datetime]:\n    \"\"\"Parse Yelp checkin.date string into list of datetimes.\n\n    Typical format: '2016-01-03 19:11:00, 2016-01-04 18:11:00, ...'\n    \"\"\"\n    if not date_str:\n        return []\n    parts = [p.strip() for p in date_str.split(',') if p.strip()]\n    out = []\n    for p in parts:\n        try:\n            out.append(datetime.strptime(p, \"%Y-%m-%d %H:%M:%S\"))\n        except ValueError:\n            # If unexpected format appears, skip that timestamp\n            continue\n    return out\n\n\ndef main():\n    city = \"St. Louis\"\n    min_stars = 4.5\n    min_review_count = 150  # user asked \"over 150\" => >150\n    start_date = datetime(2023, 1, 1)\n\n    # Step 1: query businesses\n    biz_sql = \"\"\"\n    SELECT business_id, name, address, city, state, postal_code, stars, review_count, categories\n    FROM business\n    WHERE city = ?\n      AND stars >= ?\n      AND review_count > ?\n      AND categories LIKE ?\n    \"\"\"\n\n    try:\n        with sqlite3.connect(sqlite_paths[\"business\"]) as biz_conn:\n            biz_conn.row_factory = sqlite3.Row\n            shops = biz_conn.execute(\n                biz_sql,\n                (city, min_stars, min_review_count, \"%Coffee%\")\n            ).fetchall()\n    except sqlite3.Error as e:\n        raise SystemExit(f\"SQLite error querying business.db: {e}\")\n\n    if not shops:\n        print(\"No matching coffee shops found for given criteria.\")\n        return\n\n    business_ids = [row[\"business_id\"] for row in shops]\n\n    # Step 2: query checkins (date strings) for those businesses\n    # Note: SQLite parameter limit exists; chunk IN queries.\n    checkin_map: Dict[str, str] = {}\n    checkin_sql_tmpl = \"SELECT business_id, date FROM checkin WHERE business_id IN ({placeholders})\"\n\n    try:\n        with sqlite3.connect(sqlite_paths[\"checkin\"]) as chk_conn:\n            chk_conn.row_factory = sqlite3.Row\n\n            for batch in chunked(business_ids, 800):\n                placeholders = \",\".join([\"?\"] * len(batch))\n                sql = checkin_sql_tmpl.format(placeholders=placeholders)\n                rows = chk_conn.execute(sql, batch).fetchall()\n                for r in rows:\n                    checkin_map[r[\"business_id\"]] = r[\"date\"]\n    except sqlite3.Error as e:\n        raise SystemExit(f\"SQLite error querying checkin.db: {e}\")\n\n    # Step 3: parse & count since start_date\n    results: List[Tuple] = []\n    for row in shops:\n        bid = row[\"business_id\"]\n        date_str = checkin_map.get(bid, \"\")\n        dts = parse_checkin_dates(date_str)\n        cnt_since = sum(1 for dt in dts if dt >= start_date)\n\n        results.append((\n            bid,\n            row[\"name\"],\n            row[\"address\"],\n            row[\"city\"],\n            row[\"state\"],\n            row[\"postal_code\"],\n            row[\"stars\"],\n            row[\"review_count\"],\n            cnt_since\n        ))\n\n    # Sort by check-ins since 2023 desc, then stars desc, then review_count desc\n    results.sort(key=lambda x: (x[-1], x[6], x[7]), reverse=True)\n\n    # Print output\n    print(f\"Coffee shops in {city} with stars>={min_stars} and review_count>{min_review_count} (check-ins since {start_date.date()}):\")\n    print(\"-\" * 110)\n    header = f\"{'name':40}  {'stars':5}  {'reviews':7}  {'checkins>=2023':13}  {'address':40}\"\n    print(header)\n    print(\"-\" * 110)\n\n    for (_, name, address, city, state, postal, stars, rc, cnt) in results:\n        addr = f\"{address}, {city}, {state} {postal}\".strip()\n        print(f\"{name[:40]:40}  {stars:5.1f}  {rc:7d}  {cnt:13d}  {addr[:40]:40}\")\n\n\nif __name__ == \"__main__\":\n    main()\n"
+    }
+  },
+  {
+    "index": 272,
+    "question": "Find Wilmington coffee shops with over 100 reviews and average stars >=4.0 and count their 2023 check-ins.",
+    "success": true,
+    "result": {
+      "analysis": "该问题是典型的跨库（同为SQLite但分库）聚合分析：先在business库筛选Wilmington的咖啡店（类别包含Coffee相关），并满足review_count>100且stars>=4.0；再到checkin库按business_id取出checkin.date（通常为逗号分隔的时间戳字符串），解析并统计发生在2023年的check-in次数。难点在于：check-in是字符串列表，需要在Python侧做年份过滤与计数，以及要处理IN查询的参数数量限制（分批查询）。",
+      "natural_question": "查找位于Wilmington的咖啡店，评论数超过100且平均星级>=4.0，并统计这些店在2023年的check-in次数。",
+      "difficulty": "medium",
+      "query_types": [
+        "sql"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "SQLite: business.db / business表"
+            ],
+            "filter_condition": {
+              "city": {
+                "=": "Wilmington"
+              },
+              "review_count": {
+                ">": 100
+              },
+              "stars": {
+                ">=": 4.0
+              },
+              "categories": {
+                "LIKE": "%Coffee%"
+              }
+            }
+          },
+          "result_var": "biz_rows",
+          "description": {
+            "narrative": "在business库中过滤出Wilmington且为咖啡相关类别的商家，并满足评论数与评分阈值，拿到business_id列表及基础属性（name, stars, review_count等）。",
+            "example_query": "SELECT business_id, name, stars, review_count, city, state, categories\nFROM business\nWHERE city = 'Wilmington'\n  AND review_count > 100\n  AND stars >= 4.0\n  AND (categories LIKE '%Coffee%' OR categories LIKE '%Coffee & Tea%');"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "SQLite: checkin.db / checkin表"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "IN": "step1返回的business_id列表"
+              }
+            }
+          },
+          "result_var": "checkin_rows",
+          "description": {
+            "narrative": "在checkin库中按business_id批量取出checkin记录（business_id, date）。date字段通常是多个时间戳用逗号分隔的字符串。",
+            "example_query": "SELECT business_id, date\nFROM checkin\nWHERE business_id IN ('id1','id2','id3');"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "Python解析与聚合"
+            ],
+            "filter_condition": {
+              "date": {
+                "YEAR=": 2023
+              }
+            }
+          },
+          "result_var": "result_df",
+          "description": {
+            "narrative": "将每个商家的date字符串按逗号拆分成时间戳列表，统计以'2023-'开头的条目数量作为2023 check-in次数，并与商家基础信息合并输出排序结果。",
+            "example_query": "（Python）count_2023 = sum(1 for ts in date_str.split(',') if ts.strip().startswith('2023-'))"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nfrom typing import List, Dict, Any, Tuple\n\n# -----------------------------\n# Fixed configuration (as required)\n# -----------------------------\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nmilvus_config = {\n    'milvus_collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    },\n    'milvus_host': 'localhost',\n    'milvus_port': '19530',\n}\n\nneo4j_config = {\n    'neo4j_uri': 'bolt://localhost:7687',\n    'neo4j_auth': ('neo4j', 'password')\n}\n\n\ndef chunk_list(xs: List[Any], size: int) -> List[List[Any]]:\n    return [xs[i:i + size] for i in range(0, len(xs), size)]\n\n\ndef fetch_all(conn: sqlite3.Connection, query: str, params: Tuple = ()) -> List[Dict[str, Any]]:\n    conn.row_factory = sqlite3.Row\n    cur = conn.cursor()\n    cur.execute(query, params)\n    rows = cur.fetchall()\n    return [dict(r) for r in rows]\n\n\ndef count_checkins_2023(date_str: str) -> int:\n    \"\"\"checkin.date is typically like: '2019-01-01 10:00:00, 2023-05-02 12:30:00, ...'\"\"\"\n    if not date_str:\n        return 0\n    parts = [p.strip() for p in date_str.split(',') if p.strip()]\n    return sum(1 for p in parts if p.startswith('2023-'))\n\n\ndef main():\n    city = \"Wilmington\"\n    min_reviews = 100\n    min_stars = 4.0\n\n    # -----------------------------\n    # Step 1: Filter businesses from business.db\n    # -----------------------------\n    try:\n        biz_conn = sqlite3.connect(sqlite_paths[\"business\"])\n    except Exception as e:\n        raise RuntimeError(f\"Failed to connect business.db: {e}\")\n\n    biz_query = \"\"\"\n    SELECT business_id, name, stars, review_count, city, state, categories\n    FROM business\n    WHERE city = ?\n      AND review_count > ?\n      AND stars >= ?\n      AND (categories LIKE '%Coffee%' OR categories LIKE '%Coffee & Tea%')\n    \"\"\"\n\n    biz_rows = fetch_all(biz_conn, biz_query, (city, min_reviews, min_stars))\n    biz_conn.close()\n\n    if not biz_rows:\n        print(\"No businesses matched the criteria.\")\n        return\n\n    business_ids = [r[\"business_id\"] for r in biz_rows]\n\n    # -----------------------------\n    # Step 2: Fetch check-ins from checkin.db (chunked IN queries)\n    # -----------------------------\n    try:\n        chk_conn = sqlite3.connect(sqlite_paths[\"checkin\"])\n    except Exception as e:\n        raise RuntimeError(f\"Failed to connect checkin.db: {e}\")\n\n    checkin_map_2023: Dict[str, int] = {bid: 0 for bid in business_ids}\n\n    # SQLite has a limit on bound parameters; chunk to be safe.\n    for batch in chunk_list(business_ids, 800):\n        placeholders = \",\".join([\"?\"] * len(batch))\n        chk_query = f\"SELECT business_id, date FROM checkin WHERE business_id IN ({placeholders})\"\n        rows = fetch_all(chk_conn, chk_query, tuple(batch))\n        for r in rows:\n            bid = r[\"business_id\"]\n            checkin_map_2023[bid] = count_checkins_2023(r.get(\"date\"))\n\n    chk_conn.close()\n\n    # -----------------------------\n    # Step 3: Merge + output\n    # -----------------------------\n    results = []\n    for r in biz_rows:\n        bid = r[\"business_id\"]\n        results.append({\n            \"business_id\": bid,\n            \"name\": r.get(\"name\"),\n            \"city\": r.get(\"city\"),\n            \"state\": r.get(\"state\"),\n            \"stars\": r.get(\"stars\"),\n            \"review_count\": r.get(\"review_count\"),\n            \"checkins_2023\": checkin_map_2023.get(bid, 0),\n            \"categories\": r.get(\"categories\"),\n        })\n\n    # Sort by 2023 check-ins desc, then rating desc, then review_count desc\n    results.sort(key=lambda x: (x[\"checkins_2023\"], x[\"stars\"], x[\"review_count\"]), reverse=True)\n\n    # Pretty print (top 50)\n    top_n = min(50, len(results))\n    print(f\"Matched businesses: {len(results)}; showing top {top_n} by 2023 check-ins\\n\")\n    for i, row in enumerate(results[:top_n], 1):\n        print(\n            f\"{i:>2}. {row['name']} | stars={row['stars']} | reviews={row['review_count']} | \"\n            f\"checkins_2023={row['checkins_2023']} | {row['city']}, {row['state']}\\n\"\n            f\"    business_id={row['business_id']}\\n\"\n        )\n\n\nif __name__ == \"__main__\":\n    main()\n"
+    }
+  },
+  {
+    "index": 273,
+    "question": "What is open right now for a quick bite?",
+    "success": true,
+    "result": {
+      "analysis": "用户想要“现在就开门、适合快速吃一口”的商家推荐。要回答需要两个关键上下文：1) 你所在位置（城市或经纬度+搜索半径）；2) “现在”的本地时间/时区。Yelp business数据通常包含经纬度、类别、是否营业(is_open)与每周营业时间(hours)。可用SQLite先筛候选（附近+快餐/简餐类别），再用Python解析hours判断当前是否营业；如需更贴合“quick bite”，可用Milvus对reviews/tips做向量检索加权排序（可选）。",
+      "natural_question": "现在（此刻）我附近有什么适合快速吃一口且正在营业的店？",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "SQLite: business.db / business表"
+            ],
+            "filter_condition": {
+              "is_open": {
+                "=": 1
+              },
+              "latitude": {
+                "between": "[lat±delta]"
+              },
+              "longitude": {
+                "between": "[lon±delta]"
+              },
+              "categories": {
+                "like_any": [
+                  "Fast Food",
+                  "Sandwiches",
+                  "Cafes",
+                  "Pizza",
+                  "Burgers",
+                  "Delis",
+                  "Bakeries",
+                  "Breakfast & Brunch",
+                  "Coffee & Tea",
+                  "Food Trucks",
+                  "Tacos"
+                ]
+              }
+            }
+          },
+          "result_var": "candidates",
+          "description": {
+            "narrative": "用SQLite从business表取“附近 + 快速简餐相关类别 + is_open=1”的候选店，先用经纬度bounding box粗筛，减少后续计算量。",
+            "example_query": "SELECT business_id, name, address, city, state, postal_code, latitude, longitude, stars, review_count, categories, hours, attributes\nFROM business\nWHERE is_open=1\n  AND latitude BETWEEN ? AND ?\n  AND longitude BETWEEN ? AND ?\n  AND (\n    categories LIKE '%Fast Food%' OR categories LIKE '%Sandwiches%' OR categories LIKE '%Cafes%' OR categories LIKE '%Pizza%'\n    OR categories LIKE '%Burgers%' OR categories LIKE '%Delis%' OR categories LIKE '%Bakeries%' OR categories LIKE '%Breakfast & Brunch%'\n    OR categories LIKE '%Coffee & Tea%' OR categories LIKE '%Food Trucks%' OR categories LIKE '%Tacos%'\n  )\nLIMIT 500;"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "Python解析hours字段"
+            ],
+            "filter_condition": {
+              "hours": {
+                "open_now": "基于本地当前时间判断"
+              }
+            }
+          },
+          "result_var": "open_now",
+          "description": {
+            "narrative": "解析hours（通常是JSON或类似字典文本），按今天星期几取营业时间段，判断“当前时间是否落在营业区间”。并计算候选到用户位置的距离，按距离/评分做初排。",
+            "example_query": "（无SQL；Python中：hours_dict[today_name] -> '11:00-21:00'，比较now_time是否在区间内）"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "Milvus: milvus_tip 或 reviews（可选）"
+            ],
+            "filter_condition": {
+              "query_text": {
+                "=": "quick bite, fast, grab-and-go"
+              },
+              "topk": {
+                "=": 50
+              }
+            }
+          },
+          "result_var": "semantic_scores",
+          "description": {
+            "narrative": "可选：对“quick bite”做向量检索，找与“快速、出餐快、简餐、外带”语义相关的tips/reviews，再把命中到的business_id汇总为加分项，用于更贴合需求的排序。",
+            "example_query": "Milvus向量检索：search(collection='milvus_tip', data=[embed('quick bite fast grab and go')], limit=50, output_fields=['business_id'])"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "结果融合与输出"
+            ],
+            "filter_condition": {
+              "limit": {
+                "=": 10
+              }
+            }
+          },
+          "result_var": "final_recommendations",
+          "description": {
+            "narrative": "融合距离（更近优先）、当前营业状态、星级/评论数、（可选）语义匹配加分，输出Top N：店名、距离、营业时间、类别、评分、地址。",
+            "example_query": "（无SQL；Python排序：score = w1*(1/dist) + w2*stars + w3*log(review_count) + w4*semantic_bonus）"
+          }
+        }
+      ],
+      "complete_code": "import json\nimport math\nimport sqlite3\nfrom datetime import datetime\n\n# Optional imports (Milvus + embedding)\ntry:\n    from pymilvus import connections, Collection\n    MILVUS_AVAILABLE = True\nexcept Exception:\n    MILVUS_AVAILABLE = False\n\ntry:\n    from sentence_transformers import SentenceTransformer\n    EMB_AVAILABLE = True\nexcept Exception:\n    EMB_AVAILABLE = False\n\n\n# ---------------------------\n# Fixed configuration (as required)\n# ---------------------------\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nmilvus_cfg = {\n    'milvus_collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    },\n    'milvus_host': 'localhost',\n    'milvus_port': '19530',\n}\n\nneo4j_cfg = {\n    'neo4j_uri': 'bolt://localhost:7687',\n    'neo4j_auth': ('neo4j', 'password')\n}\n\n\n# ---------------------------\n# Helpers\n# ---------------------------\nQUICK_BITE_KEYWORDS = [\n    'Fast Food', 'Sandwiches', 'Cafes', 'Pizza', 'Burgers', 'Delis',\n    'Bakeries', 'Breakfast & Brunch', 'Coffee & Tea', 'Food Trucks', 'Tacos'\n]\n\n\ndef haversine_km(lat1, lon1, lat2, lon2):\n    \"\"\"Great-circle distance between two points.\"\"\"\n    r = 6371.0\n    phi1, phi2 = math.radians(lat1), math.radians(lat2)\n    dphi = math.radians(lat2 - lat1)\n    dlambda = math.radians(lon2 - lon1)\n    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2\n    return 2 * r * math.asin(math.sqrt(a))\n\n\ndef bbox_delta(lat, radius_km):\n    \"\"\"Rough conversion radius->lat/lon deltas for bounding box prefilter.\"\"\"\n    dlat = radius_km / 111.0\n    dlon = radius_km / (111.0 * max(0.2, math.cos(math.radians(lat))))\n    return dlat, dlon\n\n\ndef safe_parse_json_maybe(text):\n    if text is None:\n        return None\n    if isinstance(text, dict):\n        return text\n    if not isinstance(text, str):\n        return None\n    s = text.strip()\n    if not s:\n        return None\n    # Try JSON\n    try:\n        return json.loads(s)\n    except Exception:\n        # Sometimes stored as Python dict string with single quotes; try a light fix\n        try:\n            s2 = s.replace(\"'\", '\"')\n            return json.loads(s2)\n        except Exception:\n            return None\n\n\ndef is_open_now(hours_value, now_dt):\n    \"\"\"Return True/False/None (None means unknown hours).\"\"\"\n    hours = safe_parse_json_maybe(hours_value)\n    if not hours or not isinstance(hours, dict):\n        return None\n\n    day_name = now_dt.strftime('%A')  # e.g., 'Monday'\n    spec = hours.get(day_name)\n    if not spec or not isinstance(spec, str):\n        return None\n\n    # Yelp often uses '11:00-21:00'. Some data could have multiple ranges separated by ',' or ';'\n    ranges = [r.strip() for r in spec.replace(';', ',').split(',') if r.strip()]\n    now_minutes = now_dt.hour * 60 + now_dt.minute\n\n    def parse_hhmm(t):\n        hh, mm = t.split(':')\n        return int(hh) * 60 + int(mm)\n\n    for r in ranges:\n        if '-' not in r:\n            continue\n        start_s, end_s = [x.strip() for x in r.split('-', 1)]\n        try:\n            start_m = parse_hhmm(start_s)\n            end_m = parse_hhmm(end_s)\n        except Exception:\n            continue\n\n        # Handle overnight (e.g., 18:00-02:00)\n        if end_m < start_m:\n            if now_minutes >= start_m or now_minutes <= end_m:\n                return True\n        else:\n            if start_m <= now_minutes <= end_m:\n                return True\n\n    return False\n\n\ndef fetch_candidates_sqlite(user_lat, user_lon, radius_km=3.0, limit=500):\n    dlat, dlon = bbox_delta(user_lat, radius_km)\n    lat_min, lat_max = user_lat - dlat, user_lat + dlat\n    lon_min, lon_max = user_lon - dlon, user_lon + dlon\n\n    like_parts = \" OR \".join([\"categories LIKE ?\" for _ in QUICK_BITE_KEYWORDS])\n    sql = f\"\"\"\n    SELECT business_id, name, address, city, state, postal_code,\n           latitude, longitude, stars, review_count, categories, hours, attributes\n    FROM business\n    WHERE is_open = 1\n      AND latitude BETWEEN ? AND ?\n      AND longitude BETWEEN ? AND ?\n      AND ({like_parts})\n    LIMIT ?\n    \"\"\"\n\n    params = [lat_min, lat_max, lon_min, lon_max] + [f\"%{k}%\" for k in QUICK_BITE_KEYWORDS] + [limit]\n\n    conn = sqlite3.connect(sqlite_paths[\"business\"])\n    conn.row_factory = sqlite3.Row\n    try:\n        rows = conn.execute(sql, params).fetchall()\n        return [dict(r) for r in rows]\n    finally:\n        conn.close()\n\n\ndef milvus_semantic_bonus(business_ids, query_text=\"quick bite fast grab and go\", topk=80):\n    \"\"\"Return dict: business_id -> bonus score (0..1). Safe fallback if Milvus/embedding not available.\"\"\"\n    if not (MILVUS_AVAILABLE and EMB_AVAILABLE):\n        return {}\n\n    # Connect\n    connections.connect(host=milvus_cfg['milvus_host'], port=milvus_cfg['milvus_port'])\n\n    # Load embedding model (can be slow first time)\n    model = SentenceTransformer('all-MiniLM-L6-v2')\n    qvec = model.encode([query_text], normalize_embeddings=True).tolist()\n\n    col_name = milvus_cfg['milvus_collections']['tips']\n    col = Collection(col_name)\n    col.load()\n\n    # NOTE: field names depend on your Milvus schema.\n    # We assume a vector field named 'embedding' and a scalar field 'business_id'.\n    # If your schema differs, update `anns_field` and `output_fields`.\n    try:\n        res = col.search(\n            data=qvec,\n            anns_field='embedding',\n            param={\"metric_type\": \"IP\", \"params\": {\"nprobe\": 16}},\n            limit=topk,\n            output_fields=['business_id']\n        )\n    except Exception:\n        # Try common alternative vector field name\n        res = col.search(\n            data=qvec,\n            anns_field='vector',\n            param={\"metric_type\": \"IP\", \"params\": {\"nprobe\": 16}},\n            limit=topk,\n            output_fields=['business_id']\n        )\n\n    bonus = {}\n    # res[0] is hits list\n    for rank, hit in enumerate(res[0]):\n        bid = None\n        try:\n            bid = hit.entity.get('business_id')\n        except Exception:\n            try:\n                bid = hit.get('business_id')\n            except Exception:\n                bid = None\n        if bid is None:\n            continue\n        if business_ids and bid not in business_ids:\n            continue\n        # Higher rank => higher bonus; keep within (0,1]\n        score = 1.0 / (1.0 + rank)\n        bonus[bid] = max(bonus.get(bid, 0.0), score)\n\n    # Normalize to 0..1\n    if bonus:\n        m = max(bonus.values())\n        if m > 0:\n            for k in list(bonus.keys()):\n                bonus[k] = bonus[k] / m\n    return bonus\n\n\ndef recommend_open_quick_bite(user_lat, user_lon, radius_km=3.0, topn=10, now_dt=None, use_milvus=False):\n    if now_dt is None:\n        now_dt = datetime.now()\n\n    candidates = fetch_candidates_sqlite(user_lat, user_lon, radius_km=radius_km, limit=800)\n\n    enriched = []\n    for b in candidates:\n        dist = haversine_km(user_lat, user_lon, b['latitude'], b['longitude'])\n        if dist > radius_km:\n            continue\n        open_flag = is_open_now(b.get('hours'), now_dt)\n        # If hours unknown, we keep it but down-rank later\n        b2 = dict(b)\n        b2['distance_km'] = dist\n        b2['open_now'] = open_flag\n        enriched.append(b2)\n\n    # Prefer definitively open_now==True\n    open_now_list = [x for x in enriched if x['open_now'] is True]\n    unknown_hours_list = [x for x in enriched if x['open_now'] is None]\n    # If nothing has hours, fall back to unknown list\n    pool = open_now_list if open_now_list else unknown_hours_list\n\n    # Optional semantic bonus from Milvus\n    bonus = {}\n    if use_milvus and pool:\n        pool_ids = set([x['business_id'] for x in pool])\n        try:\n            bonus = milvus_semantic_bonus(pool_ids)\n        except Exception:\n            bonus = {}\n\n    def final_score(x):\n        # Distance score (closer is better)\n        dist_score = 1.0 / (0.2 + x['distance_km'])\n        stars = float(x.get('stars') or 0.0)\n        rc = float(x.get('review_count') or 0.0)\n        pop = math.log1p(rc)\n        sem = float(bonus.get(x['business_id'], 0.0))\n        # weights\n        return 2.2 * dist_score + 0.8 * stars + 0.25 * pop + 0.9 * sem\n\n    pool.sort(key=final_score, reverse=True)\n    out = []\n    for x in pool[:topn]:\n        out.append({\n            'business_id': x['business_id'],\n            'name': x.get('name'),\n            'distance_km': round(x['distance_km'], 2),\n            'stars': x.get('stars'),\n            'review_count': x.get('review_count'),\n            'address': \", \".join([p for p in [x.get('address'), x.get('city'), x.get('state'), x.get('postal_code')] if p]),\n            'categories': x.get('categories'),\n            'open_now': x.get('open_now'),\n            'today_hours_raw': (safe_parse_json_maybe(x.get('hours')) or {}).get(now_dt.strftime('%A')) if x.get('hours') else None,\n            'semantic_bonus': round(float(bonus.get(x['business_id'], 0.0)), 3) if use_milvus else None\n        })\n    return out\n\n\nif __name__ == \"__main__\":\n    # ---------------------------\n    # User inputs (edit these)\n    # ---------------------------\n    # Provide your location for \"near me\". Example coordinates shown below.\n    user_lat = 37.7749\n    user_lon = -122.4194\n    radius_km = 3.0\n\n    # \"right now\" uses your machine local time by default\n    now_dt = datetime.now()\n\n    # Turn on if you have Milvus + a compatible schema + sentence-transformers installed\n    use_milvus = False\n\n    try:\n        recs = recommend_open_quick_bite(\n            user_lat=user_lat,\n            user_lon=user_lon,\n            radius_km=radius_km,\n            topn=10,\n            now_dt=now_dt,\n            use_milvus=use_milvus\n        )\n        print(f\"Now: {now_dt} | radius={radius_km}km | results={len(recs)}\")\n        for i, r in enumerate(recs, 1):\n            print(f\"\\n#{i} {r['name']}  ({r['distance_km']} km)\")\n            print(f\"  Open now: {r['open_now']} | Hours today: {r['today_hours_raw']}\")\n            print(f\"  Stars: {r['stars']} ({r['review_count']} reviews)\")\n            print(f\"  Address: {r['address']}\")\n            print(f\"  Categories: {r['categories']}\")\n            if use_milvus:\n                print(f\"  Semantic bonus: {r['semantic_bonus']}\")\n\n        if not recs:\n            print(\"\\nNo matches found with the current filters. Try increasing radius_km or relaxing category keywords.\")\n\n    except sqlite3.OperationalError as e:\n        print(\"SQLite error:\", e)\n        print(\"Hint: check the business table/column names in business.db (schema may differ).\")\n    except Exception as e:\n        print(\"Unexpected error:\", e)\n"
+    }
+  },
+  {
+    "index": 274,
+    "question": "What places are open after 10pm for late-night food?",
+    "success": true,
+    "result": {
+      "analysis": "用户想找“10pm之后还营业、适合宵夜/晚餐”的地点。这主要依赖 Yelp business 数据中的营业时间(hours)、是否营业(is_open)以及类别(categories 是否包含 Restaurants/Food)。没有指定城市/位置，因此结果可能非常多；更合理的是允许可选的 city/state 过滤，然后在 Python 中解析 hours 字段(通常是JSON或类似字典字符串)，筛选出任意一天在22:00之后仍在营业(含跨夜到凌晨)的商家，并按评分/评论数排序输出。",
+      "natural_question": "What places are open after 10pm for late-night food?",
+      "difficulty": "medium",
+      "query_types": [
+        "sql"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "SQLite: business.db / business table"
+            ],
+            "filter_condition": {
+              "is_open": {
+                "=": 1
+              },
+              "categories": {
+                "LIKE_ANY": [
+                  "%Restaurants%",
+                  "%Food%"
+                ]
+              },
+              "hours": {
+                "IS_NOT": "NULL"
+              }
+            }
+          },
+          "result_var": "biz_rows",
+          "description": {
+            "narrative": "从SQLite的business库取出仍在营业、类别与餐饮相关、且包含营业时间信息的商家基本信息（后续用Python解析hours以判断是否10pm后营业）。可选 city/state 过滤缩小范围。",
+            "example_query": "SELECT business_id, name, address, city, state, postal_code, stars, review_count, categories, hours\nFROM business\nWHERE is_open = 1\n  AND hours IS NOT NULL\n  AND (categories LIKE '%Restaurants%' OR categories LIKE '%Food%')\n  AND (? IS NULL OR city = ?)\n  AND (? IS NULL OR state = ?);"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "Python in-memory filtering"
+            ],
+            "filter_condition": {
+              "open_after": {
+                ">=": "22:00"
+              }
+            }
+          },
+          "result_var": "late_night_places",
+          "description": {
+            "narrative": "解析每条记录的hours（可能是JSON字符串或Python字典字符串），判断是否存在任意一天的营业区间覆盖22:00之后（包括跨夜，如 18:00-02:00 或 22:00-04:00）。",
+            "example_query": "Pseudo:\nfor biz in biz_rows:\n  h = parse_hours(biz['hours'])\n  if any(day_interval_open_after_22(h[day])): keep"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "Python ranking/output"
+            ],
+            "filter_condition": {
+              "order_by": [
+                "stars DESC",
+                "review_count DESC"
+              ],
+              "limit": 25
+            }
+          },
+          "result_var": "top_results",
+          "description": {
+            "narrative": "按 stars 与 review_count 排序，输出Top N 宵夜商家列表，并展示其可能的营业时间片段与类别。",
+            "example_query": "late_night_places.sort(key=lambda x: (x['stars'], x['review_count']), reverse=True)\nprint(top 25)"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport json\nimport ast\nfrom typing import Any, Dict, Optional, List, Tuple\n\n# --- Required exact configuration (even if some are not used in this task) ---\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nconfig = {\n    'milvus_collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    },\n    'milvus_host': 'localhost',\n    'milvus_port': '19530',\n    'neo4j_uri': 'bolt://localhost:7687',\n    'neo4j_auth': ('neo4j', 'password')\n}\n\n\ndef parse_hours(hours_val: Any) -> Optional[Dict[str, str]]:\n    \"\"\"Parse Yelp hours field.\n\n    Expected common formats:\n      1) JSON string: {\"Monday\": \"11:00-02:00\", ...}\n      2) Python-literal dict string: {'Monday': '11:00-02:00', ...}\n      3) Already a dict\n\n    Returns dict(day -> \"HH:MM-HH:MM\") or None.\n    \"\"\"\n    if hours_val is None:\n        return None\n\n    if isinstance(hours_val, dict):\n        return hours_val\n\n    if isinstance(hours_val, (bytes, bytearray)):\n        hours_val = hours_val.decode('utf-8', errors='ignore')\n\n    if isinstance(hours_val, str):\n        s = hours_val.strip()\n        if not s:\n            return None\n        # Try JSON\n        try:\n            obj = json.loads(s)\n            if isinstance(obj, dict):\n                return obj\n        except Exception:\n            pass\n        # Try Python literal\n        try:\n            obj = ast.literal_eval(s)\n            if isinstance(obj, dict):\n                return obj\n        except Exception:\n            pass\n\n    return None\n\n\ndef to_minutes(hhmm: str) -> int:\n    hh, mm = hhmm.split(':')\n    return int(hh) * 60 + int(mm)\n\n\ndef interval_open_after_22(interval: str) -> bool:\n    \"\"\"Return True if a single interval (e.g., '17:00-02:00') implies open after 22:00.\n\n    We consider late-night if:\n      - opens at/after 22:00, OR\n      - closes after 22:00 same-day, OR\n      - crosses midnight (close < open), which necessarily includes time after 22:00.\n\n    Note: Some businesses may have multiple intervals; Yelp hours is typically one interval/day.\n    \"\"\"\n    if not interval or '-' not in interval:\n        return False\n\n    start_s, end_s = [x.strip() for x in interval.split('-', 1)]\n    # Defensive checks\n    if len(start_s) != 5 or len(end_s) != 5:\n        return False\n\n    start = to_minutes(start_s)\n    end = to_minutes(end_s)\n    ten_pm = 22 * 60\n\n    # opens late\n    if start >= ten_pm:\n        return True\n\n    # same-day close after 10pm\n    if end > start and end > ten_pm:\n        return True\n\n    # crosses midnight (e.g., 18:00-02:00)\n    if end < start:\n        return True\n\n    return False\n\n\ndef is_open_after_10pm(hours_dict: Dict[str, str]) -> bool:\n    for _, interval in hours_dict.items():\n        if interval_open_after_22(str(interval)):\n            return True\n    return False\n\n\ndef fetch_candidate_businesses(city: Optional[str] = None, state: Optional[str] = None) -> List[Dict[str, Any]]:\n    db_path = sqlite_paths[\"business\"]\n    conn = sqlite3.connect(db_path)\n    conn.row_factory = sqlite3.Row\n    try:\n        # Table name is assumed to be 'business'. If your schema differs, change it here.\n        sql = \"\"\"\n        SELECT business_id, name, address, city, state, postal_code,\n               stars, review_count, categories, hours\n        FROM business\n        WHERE is_open = 1\n          AND hours IS NOT NULL\n          AND (categories LIKE '%Restaurants%' OR categories LIKE '%Food%')\n          AND (? IS NULL OR city = ?)\n          AND (? IS NULL OR state = ?)\n        \"\"\"\n        rows = conn.execute(sql, (city, city, state, state)).fetchall()\n        return [dict(r) for r in rows]\n    finally:\n        conn.close()\n\n\ndef find_late_night_food(city: Optional[str] = None, state: Optional[str] = None, limit: int = 25) -> List[Dict[str, Any]]:\n    candidates = fetch_candidate_businesses(city=city, state=state)\n\n    late = []\n    for b in candidates:\n        h = parse_hours(b.get('hours'))\n        if not h:\n            continue\n        if is_open_after_10pm(h):\n            b['hours_parsed'] = h\n            late.append(b)\n\n    late.sort(key=lambda x: (x.get('stars', 0) or 0, x.get('review_count', 0) or 0), reverse=True)\n    return late[:max(1, int(limit))]\n\n\ndef main():\n    # Optional: narrow results by location for practical output.\n    # If you leave these as None, you'll get global results across the dataset.\n    city = None   # e.g., 'Las Vegas'\n    state = None  # e.g., 'NV'\n    limit = 25\n\n    try:\n        results = find_late_night_food(city=city, state=state, limit=limit)\n    except sqlite3.OperationalError as e:\n        print(\"SQLite OperationalError:\", e)\n        print(\"Tip: Verify the table/column names in your business.db schema (e.g., table might not be named 'business').\")\n        return\n\n    if not results:\n        print(\"No late-night food places found with the current filters.\")\n        return\n\n    print(f\"Late-night food places open after 10pm (top {len(results)}):\")\n    print(\"-\" * 100)\n    for i, b in enumerate(results, 1):\n        name = b.get('name')\n        stars = b.get('stars')\n        rc = b.get('review_count')\n        addr = \", \".join([x for x in [b.get('address'), b.get('city'), b.get('state'), b.get('postal_code')] if x])\n        cats = b.get('categories')\n\n        # Show only the day-intervals that indicate late-night\n        hours_dict = b.get('hours_parsed') or {}\n        late_days = {day: interval for day, interval in hours_dict.items() if interval_open_after_22(str(interval))}\n\n        print(f\"{i:02d}. {name} | {stars}⭐ ({rc} reviews)\")\n        print(f\"    Address: {addr}\")\n        print(f\"    Late-night hours: {late_days}\")\n        print(f\"    Categories: {cats}\")\n        print(\"-\" * 100)\n\n\nif __name__ == \"__main__\":\n    main()\n"
+    }
+  },
+  {
+    "index": 275,
+    "question": "What places are open between 3–5pm for a late lunch or early dinner?",
+    "success": true,
+    "result": {
+      "analysis": "用户想找“下午3点到5点之间营业”的用餐地点。该问题本质是对Yelp business表中hours字段的时间窗口过滤，并可叠加城市/州、是否仍在营业(is_open)、评分(stars)等排序条件。由于用户未提供城市/日期，这里将查询做成可参数化：city/state/day/time_window。实现上：先用SQL粗筛(城市、is_open、hours非空)，再在Python里解析hours(JSON/字典字符串)并做时间区间判断（支持跨午夜与部分重叠/完全覆盖）。",
+      "natural_question": "What places are open between 3–5pm for a late lunch or early dinner?",
+      "difficulty": "easy",
+      "query_types": [
+        "sql"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "SQLite.business (business.db)"
+            ],
+            "filter_condition": {
+              "is_open": {
+                "=": 1
+              },
+              "city": {
+                "=": "<CITY>"
+              },
+              "state": {
+                "=": "<STATE>"
+              },
+              "hours": {
+                "is_not_null": true
+              }
+            }
+          },
+          "result_var": "candidate_businesses",
+          "description": {
+            "narrative": "从SQLite的business表中拉取候选商家：仍在营业(is_open=1)、指定城市/州、且hours字段不为空。该步只做粗过滤，避免全表解析hours。",
+            "example_query": "SELECT business_id, name, address, city, state, stars, review_count, categories, hours\nFROM business\nWHERE is_open = 1\n  AND city = ?\n  AND state = ?\n  AND hours IS NOT NULL;"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "Python post-filter"
+            ],
+            "filter_condition": {
+              "day_of_week": {
+                "=": "<DAY>"
+              },
+              "time_window": {
+                "between": [
+                  "15:00",
+                  "17:00"
+                ]
+              },
+              "match_mode": {
+                "in": [
+                  "overlap",
+                  "full_cover"
+                ]
+              }
+            }
+          },
+          "result_var": "open_3_to_5",
+          "description": {
+            "narrative": "解析每条记录的hours为字典，并判断在指定星期几是否在15:00–17:00窗口营业。支持两种口径：overlap=窗口内任意时刻营业即可；full_cover=整个15:00–17:00都在营业（更符合“3–5pm之间都开着”的直觉）。",
+            "example_query": "Python逻辑：hours_dict[day] -> '11:00-22:00'；将区间转成分钟并判断与[15:00,17:00]的重叠或覆盖关系。"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "Python ranking/output"
+            ],
+            "filter_condition": {
+              "order_by": {
+                "desc": [
+                  "stars",
+                  "review_count"
+                ]
+              },
+              "limit": {
+                "=": 20
+              }
+            }
+          },
+          "result_var": "top_results",
+          "description": {
+            "narrative": "将结果按stars、review_count排序并输出前N条，便于做“晚午餐/早晚餐”的选择。",
+            "example_query": "排序键：(-stars, -review_count)，limit=20"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport json\nimport ast\nfrom datetime import datetime\n\n# -----------------------------\n# Fixed configuration (must use exactly these)\n# -----------------------------\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n\n}\n\nmilvus_config = {\n    'milvus_collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    },\n    'milvus_host': 'localhost',\n    'milvus_port': '19530',\n}\n\nneo4j_config = {\n    'neo4j_uri': 'bolt://localhost:7687',\n    'neo4j_auth': ('neo4j', 'password')\n}\n\n# -----------------------------\n# User parameters (edit these)\n# -----------------------------\nCITY = \"Las Vegas\"     # TODO: change to your city\nSTATE = \"NV\"          # TODO: change to your state\nDAY = \"Monday\"        # e.g., Monday/Tuesday/.../Sunday\nSTART_TIME = \"15:00\"  # 3pm\nEND_TIME = \"17:00\"    # 5pm\nMATCH_MODE = \"full_cover\"  # \"full_cover\" or \"overlap\"\nLIMIT = 20\n\n# -----------------------------\n# Helpers\n# -----------------------------\n\ndef parse_hours(hours_value):\n    \"\"\"Parse the 'hours' field into a dict.\n\n    Yelp hours is usually a JSON-like dict string, e.g.:\n      {\"Monday\": \"11:00-22:00\", \"Tuesday\": \"11:00-22:00\"}\n    Some SQLite loads may store it with single quotes; we handle both.\n    \"\"\"\n    if hours_value is None:\n        return None\n    if isinstance(hours_value, dict):\n        return hours_value\n    s = str(hours_value).strip()\n    if not s:\n        return None\n\n    # Try JSON first\n    try:\n        return json.loads(s)\n    except Exception:\n        pass\n\n    # Fallback: Python literal (handles single quotes)\n    try:\n        obj = ast.literal_eval(s)\n        return obj if isinstance(obj, dict) else None\n    except Exception:\n        return None\n\n\ndef to_minutes(hhmm):\n    \"\"\"Convert 'HH:MM' to minutes since 00:00.\"\"\"\n    h, m = hhmm.split(\":\")\n    return int(h) * 60 + int(m)\n\n\ndef parse_intervals(interval_str):\n    \"\"\"Parse a day hours string like '11:00-22:00' into list of (start_min, end_min).\n\n    Notes:\n    - Some businesses can have multiple intervals separated by ', ' (rare, but handle it).\n    - If end < start, treat as crossing midnight.\n    \"\"\"\n    if not interval_str:\n        return []\n\n    parts = [p.strip() for p in str(interval_str).split(\",\") if p.strip()]\n    intervals = []\n    for p in parts:\n        if \"-\" not in p:\n            continue\n        a, b = [x.strip() for x in p.split(\"-\", 1)]\n        try:\n            start = to_minutes(a)\n            end = to_minutes(b)\n        except Exception:\n            continue\n\n        if end >= start:\n            intervals.append((start, end))\n        else:\n            # Cross-midnight, e.g., 18:00-02:00 => [18:00-24:00] and [00:00-02:00]\n            intervals.append((start, 24 * 60))\n            intervals.append((0, end))\n    return intervals\n\n\ndef matches_window(day_intervals, window_start, window_end, mode=\"full_cover\"):\n    \"\"\"Check if any interval matches the time window.\n\n    mode:\n      - 'overlap': any overlap with [window_start, window_end]\n      - 'full_cover': interval fully covers [window_start, window_end]\n    \"\"\"\n    for a, b in day_intervals:\n        if mode == \"overlap\":\n            # overlap if max(starts) < min(ends)\n            if max(a, window_start) < min(b, window_end):\n                return True\n        else:\n            # full cover\n            if a <= window_start and b >= window_end:\n                return True\n    return False\n\n\ndef main():\n    window_start = to_minutes(START_TIME)\n    window_end = to_minutes(END_TIME)\n\n    if window_end <= window_start:\n        raise ValueError(\"END_TIME must be after START_TIME within the same day window.\")\n\n    sql = \"\"\"\n    SELECT business_id, name, address, city, state, stars, review_count, categories, hours\n    FROM business\n    WHERE is_open = 1\n      AND city = ?\n      AND state = ?\n      AND hours IS NOT NULL\n    \"\"\"\n\n    conn = None\n    try:\n        conn = sqlite3.connect(sqlite_paths[\"business\"])\n        conn.row_factory = sqlite3.Row\n        rows = conn.execute(sql, (CITY, STATE)).fetchall()\n\n        results = []\n        for r in rows:\n            hours_dict = parse_hours(r[\"hours\"])\n            if not hours_dict or DAY not in hours_dict:\n                continue\n\n            day_str = hours_dict.get(DAY)\n            intervals = parse_intervals(day_str)\n            if not intervals:\n                continue\n\n            if matches_window(intervals, window_start, window_end, mode=MATCH_MODE):\n                results.append({\n                    \"business_id\": r[\"business_id\"],\n                    \"name\": r[\"name\"],\n                    \"address\": r[\"address\"],\n                    \"city\": r[\"city\"],\n                    \"state\": r[\"state\"],\n                    \"stars\": r[\"stars\"],\n                    \"review_count\": r[\"review_count\"],\n                    \"categories\": r[\"categories\"],\n                    \"hours_on_day\": day_str\n                })\n\n        # Rank\n        results.sort(key=lambda x: (-(x[\"stars\"] or 0), -(x[\"review_count\"] or 0)))\n        top = results[:LIMIT]\n\n        print(f\"Query: {CITY}, {STATE} | {DAY} | {START_TIME}-{END_TIME} | mode={MATCH_MODE}\")\n        print(f\"Found {len(results)} places; showing top {len(top)}\\n\")\n\n        for i, item in enumerate(top, 1):\n            print(f\"{i}. {item['name']}  | {item['stars']}⭐ ({item['review_count']} reviews)\")\n            print(f\"   {item['address']}, {item['city']}, {item['state']}\")\n            print(f\"   Categories: {item['categories']}\")\n            print(f\"   Hours({DAY}): {item['hours_on_day']}\\n\")\n\n    except sqlite3.Error as e:\n        raise RuntimeError(f\"SQLite error: {e}\")\n    finally:\n        if conn is not None:\n            conn.close()\n\n\nif __name__ == \"__main__\":\n    main()\n"
+    }
+  },
+  {
+    "index": 276,
+    "question": "What restaurants are good for dinner between 9–11pm?",
+    "success": true,
+    "result": {
+      "analysis": "你的问题是在Yelp数据集中找“适合晚餐、且在晚上9点到11点之间营业”的餐厅，并给出“好”的排序依据。这里的关键是：1) 必须是Restaurants类目；2) 必须在指定星期几（默认Friday）21:00–23:00之间处于营业状态（需解析business的hours字段/列）；3) “好”的定义可用结构化指标（stars、review_count）+ 可选的热度（checkin在该时段的次数）+ 可选的语义证据（从Milvus检索与‘late dinner’相关的review向量并聚合到business）。由于用户未指定城市/位置，本方案提供可选位置过滤参数：city/state 或 经纬度半径。",
+      "natural_question": "What restaurants are good for dinner between 9–11pm?",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "SQLite: business.db (business table)"
+            ],
+            "filter_condition": {
+              "categories": {
+                "contains": "Restaurants"
+              },
+              "is_open": {
+                "=": 1
+              },
+              "location(optional)": {
+                "city": {
+                  "=": "Las Vegas"
+                },
+                "state": {
+                  "=": "NV"
+                }
+              }
+            }
+          },
+          "result_var": "candidate_businesses",
+          "description": {
+            "narrative": "从business库中过滤出餐厅类目（categories包含Restaurants）、仍在营业（is_open=1），并按可选的城市/州（或后续用经纬度）缩小范围。读取其hours信息（可能是单列JSON，也可能是按星期拆分列），留给下一步做“21:00–23:00是否覆盖”的判断。",
+            "example_query": "SELECT business_id, name, city, state, latitude, longitude, stars, review_count, categories, hours, is_open FROM business WHERE is_open=1 AND categories LIKE '%Restaurants%' AND city='Las Vegas' AND state='NV';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "Python hours parser"
+            ],
+            "filter_condition": {
+              "day_of_week": {
+                "=": "Friday"
+              },
+              "time_window": {
+                "between": "21:00-23:00"
+              }
+            }
+          },
+          "result_var": "open_in_window",
+          "description": {
+            "narrative": "解析每个餐厅在指定星期几的营业时间，判断其是否覆盖21:00–23:00（支持跨天如 '17:00-02:00' 的情况）。仅保留窗口内营业的餐厅。",
+            "example_query": "（此步为Python逻辑）hours_str='17:00-02:00' -> 21:00-23:00 为True"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "SQLite: checkin.db (checkin table)"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "open_in_window.business_id"
+              },
+              "timestamp_hour": {
+                "between": "21-22"
+              }
+            }
+          },
+          "result_var": "late_checkin_counts",
+          "description": {
+            "narrative": "对候选餐厅读取checkin.date字段（通常是逗号分隔的时间戳字符串），统计指定星期几在21:00–23:00的check-in次数作为“晚间热度”。",
+            "example_query": "SELECT business_id, date FROM checkin WHERE business_id IN ('id1','id2',...);"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "Milvus: reviews collection"
+            ],
+            "filter_condition": {
+              "query_text": {
+                "=": "great dinner late night 9pm 10pm"
+              },
+              "business_id(optional)": {
+                "in": "open_in_window.business_id"
+              }
+            }
+          },
+          "result_var": "milvus_dinner_signals",
+          "description": {
+            "narrative": "（可选）对“晚间晚餐体验”做语义检索：将query_text嵌入后到Milvus reviews collection中做向量搜索，再按business_id聚合相似度/命中数，作为补充证据。",
+            "example_query": "Milvus search: collection='reviews', vector=query_embedding, limit=200 (然后Python按business_id聚合)"
+          }
+        },
+        {
+          "step": 5,
+          "parameters": {
+            "ms_names": [
+              "Python ranking"
+            ],
+            "filter_condition": {
+              "ranking_formula": {
+                "stars": "high",
+                "review_count": "high",
+                "late_checkins": "high",
+                "milvus_signal(optional)": "high"
+              }
+            }
+          },
+          "result_var": "ranked_results",
+          "description": {
+            "narrative": "将结构化评分(stars、review_count)与晚间checkin热度、（可选）Milvus语义信号组合成综合得分并排序，输出Top N，并给出每家店的解释字段（星级、评论数、晚间checkin数、营业时间）。",
+            "example_query": "（此步为Python逻辑）final_score = 0.55*stars_norm + 0.25*log1p(review_count)_norm + 0.20*log1p(late_checkins)_norm (+ milvus_weight)"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport json\nimport math\nfrom datetime import datetime\nfrom typing import Dict, Any, List, Optional, Tuple\n\n# Optional (Milvus + embeddings)\nUSE_MILVUS = True\ntry:\n    from pymilvus import connections, Collection\n    from sentence_transformers import SentenceTransformer\nexcept Exception:\n    USE_MILVUS = False\n\n\n# ----------------------\n# Fixed configuration (as required)\n# ----------------------\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nmilvus_config = {\n    'milvus_collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    },\n    'milvus_host': 'localhost',\n    'milvus_port': '19530',\n}\n\nneo4j_config = {\n    'neo4j_uri': 'bolt://localhost:7687',\n    'neo4j_auth': ('neo4j', 'password')\n}\n\n\n# ----------------------\n# Helpers\n# ----------------------\ndef connect_sqlite(path: str) -> sqlite3.Connection:\n    conn = sqlite3.connect(path)\n    conn.row_factory = sqlite3.Row\n    return conn\n\n\ndef get_table_columns(conn: sqlite3.Connection, table: str) -> List[str]:\n    rows = conn.execute(f\"PRAGMA table_info({table})\").fetchall()\n    return [r[1] for r in rows]\n\n\ndef normalize_day_name(day: str) -> str:\n    day = day.strip().lower()\n    mapping = {\n        'mon': 'Monday', 'monday': 'Monday',\n        'tue': 'Tuesday', 'tues': 'Tuesday', 'tuesday': 'Tuesday',\n        'wed': 'Wednesday', 'wednesday': 'Wednesday',\n        'thu': 'Thursday', 'thurs': 'Thursday', 'thursday': 'Thursday',\n        'fri': 'Friday', 'friday': 'Friday',\n        'sat': 'Saturday', 'saturday': 'Saturday',\n        'sun': 'Sunday', 'sunday': 'Sunday'\n    }\n    if day not in mapping:\n        raise ValueError(f\"Unsupported day_of_week: {day}\")\n    return mapping[day]\n\n\ndef time_to_minutes(t: str) -> int:\n    # expects 'HH:MM'\n    hh, mm = t.split(':')\n    return int(hh) * 60 + int(mm)\n\n\ndef parse_hours_value(hours_value: Any) -> Dict[str, str]:\n    \"\"\"Return dict like {'Friday': '17:00-02:00', ...}\n\n    Supports:\n      1) JSON string in a single 'hours' column\n      2) Already-parsed dict\n    \"\"\"\n    if hours_value is None:\n        return {}\n    if isinstance(hours_value, dict):\n        return hours_value\n    if isinstance(hours_value, str):\n        s = hours_value.strip()\n        if not s:\n            return {}\n        # common: JSON dict\n        if s.startswith('{') and s.endswith('}'):\n            try:\n                return json.loads(s)\n            except Exception:\n                return {}\n        # otherwise unknown format\n        return {}\n    return {}\n\n\ndef interval_covers_window(open_interval: str, window_start: str, window_end: str) -> bool:\n    \"\"\"open_interval like '17:00-02:00'; window_end is exclusive-ish but we treat as coverage.\n\n    We consider the restaurant suitable if it is open for the entire window [start, end].\n    Handles overnight intervals where close < open.\n    \"\"\"\n    if not open_interval or '-' not in open_interval:\n        return False\n    a, b = [x.strip() for x in open_interval.split('-', 1)]\n    try:\n        open_m = time_to_minutes(a)\n        close_m = time_to_minutes(b)\n        ws = time_to_minutes(window_start)\n        we = time_to_minutes(window_end)\n    except Exception:\n        return False\n\n    # window is assumed within same day (21:00-23:00). If you want overnight windows, extend logic.\n\n    if close_m > open_m:\n        # same-day closing\n        return open_m <= ws and we <= close_m\n    else:\n        # overnight closing (e.g., 17:00-02:00)\n        # Open from open_m..1440 and 0..close_m\n        return (open_m <= ws) and (we <= 1440)\n\n\ndef parse_checkin_dates(date_str: str) -> List[datetime]:\n    \"\"\"Yelp checkin 'date' is often like '2019-10-12 00:15:12, 2019-10-12 01:15:12, ...'\"\"\"\n    if not date_str:\n        return []\n    parts = [p.strip() for p in date_str.split(',') if p.strip()]\n    out = []\n    for p in parts:\n        # Some datasets include seconds; use robust parse\n        for fmt in (\"%Y-%m-%d %H:%M:%S\", \"%Y-%m-%d %H:%M\"):\n            try:\n                out.append(datetime.strptime(p, fmt))\n                break\n            except Exception:\n                continue\n    return out\n\n\ndef minmax_norm(values: List[float]) -> List[float]:\n    if not values:\n        return []\n    lo, hi = min(values), max(values)\n    if hi - lo < 1e-12:\n        return [0.0 for _ in values]\n    return [(v - lo) / (hi - lo) for v in values]\n\n\n# ----------------------\n# Main query function\n# ----------------------\ndef find_late_dinner_restaurants(\n    day_of_week: str = 'Friday',\n    window_start: str = '21:00',\n    window_end: str = '23:00',\n    city: Optional[str] = None,\n    state: Optional[str] = None,\n    top_n: int = 20,\n    enable_milvus: bool = True\n) -> List[Dict[str, Any]]:\n\n    day = normalize_day_name(day_of_week)\n\n    # --- Step 1: candidate restaurants from business.db\n    bconn = connect_sqlite(sqlite_paths['business'])\n    try:\n        bcols = set(get_table_columns(bconn, 'business'))\n    except Exception as e:\n        bconn.close()\n        raise RuntimeError(\"Could not read business table schema\") from e\n\n    # Build SELECT with best-effort hours access\n    select_cols = [\n        'business_id', 'name', 'city', 'state', 'latitude', 'longitude',\n        'stars', 'review_count', 'categories', 'is_open'\n    ]\n    hours_mode = None\n    if 'hours' in bcols:\n        select_cols.append('hours')\n        hours_mode = 'json'\n    else:\n        # try weekday columns, common patterns\n        # e.g. 'hours_Monday' ... or 'Monday'\n        weekday_col = None\n        candidates = [f\"hours_{day}\", day, day.lower(), f\"{day.lower()}_hours\"]\n        for c in candidates:\n            if c in bcols:\n                weekday_col = c\n                break\n        if weekday_col:\n            select_cols.append(f\"{weekday_col} as hours_day\")\n            hours_mode = 'weekday_col'\n        else:\n            # We can still fetch rows but cannot filter by hours reliably\n            hours_mode = 'none'\n\n    where = [\"is_open=1\", \"categories LIKE '%Restaurants%'\"]\n    params: List[Any] = []\n    if city:\n        where.append(\"city = ?\")\n        params.append(city)\n    if state:\n        where.append(\"state = ?\")\n        params.append(state)\n\n    sql = f\"SELECT {', '.join(select_cols)} FROM business WHERE {' AND '.join(where)}\"\n    rows = bconn.execute(sql, params).fetchall()\n\n    # --- Step 2: filter by open hours in window\n    open_rows = []\n    if hours_mode == 'none':\n        # If no hours available, we cannot guarantee open 9-11pm; return empty with a clear error\n        # Alternatively, keep them but flag unknown. Here: keep but mark unknown.\n        for r in rows:\n            d = dict(r)\n            d['_hours_status'] = 'unknown'\n            open_rows.append(d)\n    else:\n        for r in rows:\n            d = dict(r)\n            hours_for_day = None\n            if hours_mode == 'json':\n                hours_dict = parse_hours_value(d.get('hours'))\n                hours_for_day = hours_dict.get(day)\n            elif hours_mode == 'weekday_col':\n                hours_for_day = d.get('hours_day')\n\n            if hours_for_day and interval_covers_window(hours_for_day, window_start, window_end):\n                d['_hours_status'] = 'covered'\n                d['_hours_for_day'] = hours_for_day\n                open_rows.append(d)\n\n    # Early stop\n    if not open_rows:\n        bconn.close()\n        return []\n\n    # --- Step 3: late checkin counts\n    cconn = connect_sqlite(sqlite_paths['checkin'])\n    open_ids = [r['business_id'] for r in open_rows]\n    late_checkins: Dict[str, int] = {bid: 0 for bid in open_ids}\n\n    # Chunk to avoid SQLite parameter limits\n    chunk_size = 900\n    for i in range(0, len(open_ids), chunk_size):\n        chunk = open_ids[i:i+chunk_size]\n        placeholders = ','.join(['?'] * len(chunk))\n        q = f\"SELECT business_id, date FROM checkin WHERE business_id IN ({placeholders})\"\n        for row in cconn.execute(q, chunk).fetchall():\n            bid = row['business_id']\n            dates = parse_checkin_dates(row['date'])\n            cnt = 0\n            for dt in dates:\n                # Filter by day-of-week and hour window\n                if dt.strftime('%A') != day:\n                    continue\n                if window_start <= dt.strftime('%H:%M') < window_end:\n                    cnt += 1\n            late_checkins[bid] = late_checkins.get(bid, 0) + cnt\n\n    cconn.close()\n    bconn.close()\n\n    # --- Step 4: optional Milvus dinner-related review signals\n    milvus_signal: Dict[str, float] = {bid: 0.0 for bid in open_ids}\n    if enable_milvus and USE_MILVUS:\n        try:\n            connections.connect(host=milvus_config['milvus_host'], port=milvus_config['milvus_port'])\n            col = Collection(milvus_config['milvus_collections']['reviews'])\n\n            # Try to load collection (needed in some Milvus deployments)\n            try:\n                col.load()\n            except Exception:\n                pass\n\n            model = SentenceTransformer('sentence-transformers/all-MiniLM-L6-v2')\n            query_text = f\"great dinner late night between {window_start} and {window_end}\"\n            qvec = model.encode([query_text], normalize_embeddings=True).tolist()\n\n            # Heuristic: attempt to infer vector field name\n            schema_fields = [f.name for f in col.schema.fields]\n            vector_field = None\n            for cand in ['embedding', 'vector', 'review_vector', 'text_vector']:\n                if cand in schema_fields:\n                    vector_field = cand\n                    break\n            if vector_field is None:\n                # fallback to first FLOAT_VECTOR field\n                for f in col.schema.fields:\n                    if str(f.dtype).endswith('FLOAT_VECTOR'):\n                        vector_field = f.name\n                        break\n\n            # We also need business_id field name\n            business_id_field = None\n            for cand in ['business_id', 'biz_id']:\n                if cand in schema_fields:\n                    business_id_field = cand\n                    break\n\n            if vector_field and business_id_field:\n                # Milvus filtering expr might be limited by IN size; so we skip filter and aggregate globally.\n                # If your collection supports expr with in, add it here.\n                res = col.search(\n                    data=qvec,\n                    anns_field=vector_field,\n                    param={\"metric_type\": \"IP\", \"params\": {\"nprobe\": 16}},\n                    limit=300,\n                    output_fields=[business_id_field]\n                )\n\n                # Aggregate: higher score means more dinner-related reviews\n                # Using sum of similarities for businesses in our open set\n                open_set = set(open_ids)\n                for hits in res:\n                    for h in hits:\n                        bid = h.entity.get(business_id_field)\n                        if bid in open_set:\n                            milvus_signal[bid] += float(h.score)\n        except Exception:\n            # If Milvus is unavailable or schema mismatch, silently degrade\n            pass\n\n    # --- Step 5: rank\n    stars_vals = [float(r.get('stars') or 0.0) for r in open_rows]\n    rc_vals = [math.log1p(float(r.get('review_count') or 0.0)) for r in open_rows]\n    lc_vals = [math.log1p(float(late_checkins.get(r['business_id'], 0))) for r in open_rows]\n    mv_vals = [math.log1p(float(milvus_signal.get(r['business_id'], 0.0))) for r in open_rows]\n\n    stars_n = minmax_norm(stars_vals)\n    rc_n = minmax_norm(rc_vals)\n    lc_n = minmax_norm(lc_vals)\n    mv_n = minmax_norm(mv_vals)\n\n    # Weights: prioritize stars + review_count; use checkins + milvus as tie-breakers\n    w_stars, w_rc, w_lc, w_mv = 0.55, 0.25, 0.20, (0.10 if (enable_milvus and USE_MILVUS) else 0.0)\n    # If milvus enabled, renormalize by reducing others slightly\n    if w_mv > 0:\n        scale = (1.0 - w_mv) / (w_stars + w_rc + w_lc)\n        w_stars *= scale\n        w_rc *= scale\n        w_lc *= scale\n\n    results = []\n    for i, r in enumerate(open_rows):\n        bid = r['business_id']\n        score = w_stars * stars_n[i] + w_rc * rc_n[i] + w_lc * lc_n[i] + w_mv * mv_n[i]\n        results.append({\n            \"business_id\": bid,\n            \"name\": r.get('name'),\n            \"city\": r.get('city'),\n            \"state\": r.get('state'),\n            \"stars\": r.get('stars'),\n            \"review_count\": r.get('review_count'),\n            \"late_checkins_in_window\": int(late_checkins.get(bid, 0)),\n            \"hours_for_day\": r.get('_hours_for_day', None),\n            \"score\": float(score),\n            \"milvus_dinner_signal\": float(milvus_signal.get(bid, 0.0)) if (enable_milvus and USE_MILVUS) else None\n        })\n\n    results.sort(key=lambda x: x['score'], reverse=True)\n    return results[:top_n]\n\n\nif __name__ == '__main__':\n    # ---- Adjust these parameters as needed ----\n    # If you don't specify city/state, it will search across the whole dataset (can be slow).\n    params = {\n        \"day_of_week\": \"Friday\",\n        \"window_start\": \"21:00\",\n        \"window_end\": \"23:00\",\n        \"city\": None,     # e.g. 'Las Vegas'\n        \"state\": None,    # e.g. 'NV'\n        \"top_n\": 20,\n        \"enable_milvus\": True\n    }\n\n    try:\n        out = find_late_dinner_restaurants(**params)\n        if not out:\n            print(\"No matching restaurants found (or hours not available).\")\n        else:\n            for idx, r in enumerate(out, 1):\n                print(f\"{idx:02d}. {r['name']} | {r['city']}, {r['state']} | stars={r['stars']} (n={r['review_count']}) | late_checkins={r['late_checkins_in_window']} | hours={r['hours_for_day']} | score={r['score']:.4f}\")\n    except Exception as e:\n        print(f\"Error: {e}\")\n"
+    }
+  },
+  {
+    "index": 277,
+    "question": "Where can I get breakfast at 6:30am?",
+    "success": true,
+    "result": {
+      "analysis": "问题意图：找“早上6:30还在营业、且提供早餐/早午餐”的商家。核心数据通常在SQLite的business表：categories（类别）+ hours（营业时间）+ is_open（是否营业）+ city/state（位置）。由于你未指定城市/位置，默认在全量数据里找符合条件的商家并按评分/评论数排序返回；你也可以在参数里加城市/州来缩小范围。",
+      "natural_question": "Where can I get breakfast at 6:30am?",
+      "difficulty": "medium",
+      "query_types": [
+        "sql"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "SQLite: business.db"
+            ],
+            "filter_condition": {
+              "is_open": {
+                "=": 1
+              },
+              "categories": {
+                "LIKE_ANY": [
+                  "%Breakfast%",
+                  "%Brunch%",
+                  "%Coffee%",
+                  "%Bakeries%"
+                ]
+              },
+              "location_optional": {
+                "city": {
+                  "=": "<CITY or null>"
+                },
+                "state": {
+                  "=": "<STATE or null>"
+                }
+              }
+            }
+          },
+          "result_var": "candidates",
+          "description": {
+            "narrative": "从business库中先粗筛：仍在营业(is_open=1)且类别包含早餐/早午餐/咖啡/烘焙等关键词的商家；可选按city/state进一步过滤。为了兼容不同hours字段形态，先把hours相关字段一并取出，后续在Python里精确判断6:30是否营业。",
+            "example_query": "SELECT business_id, name, address, city, state, stars, review_count, categories, hours FROM business WHERE is_open=1 AND (categories LIKE '%Breakfast%' OR categories LIKE '%Brunch%' OR categories LIKE '%Coffee%' OR categories LIKE '%Bakeries%') LIMIT 5000;"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "Python post-filter"
+            ],
+            "filter_condition": {
+              "day_of_week": {
+                "=": "<today or specified>"
+              },
+              "time": {
+                "=": "06:30"
+              }
+            }
+          },
+          "result_var": "open_at_0630",
+          "description": {
+            "narrative": "解析每条记录的营业时间（例如\"06:00-14:00\"），判断目标日期的营业区间是否覆盖06:30。考虑跨午夜（如\"18:00-02:00\"）的情况。",
+            "example_query": "N/A (Python parsing of hours strings such as '06:00-14:00')"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "Python ranking"
+            ],
+            "filter_condition": {
+              "sort": {
+                "stars": "DESC",
+                "review_count": "DESC"
+              },
+              "limit": {
+                "=": 20
+              }
+            }
+          },
+          "result_var": "top_results",
+          "description": {
+            "narrative": "将满足6:30营业的商家按stars和review_count排序，输出前20个，包含名称、地址、城市、评分、评论数与当天营业时间。",
+            "example_query": "N/A (Python sort)"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\\nimport json\\nfrom datetime import datetime\\n\\n# -------------------------------\\n# Fixed configuration (required)\\n# -------------------------------\\nsqlite_paths = {\\n    \\\"business\\\": \\\"D:/Yelp-JSON/db/sqlite3/business.db\\\",\\n    \\\"checkin\\\": \\\"D:/Yelp-JSON/db/sqlite3/checkin.db\\\",\\n    \\\"photo\\\": \\\"D:/Yelp-JSON/db/sqlite3/photo.db\\\",\\n    \\\"review\\\": \\\"D:/Yelp-JSON/db/sqlite3/review.db\\\",\\n    \\\"tip\\\": \\\"D:/Yelp-JSON/db/sqlite3/tip.db\\\",\\n    \\\"user\\\": \\\"D:/Yelp-JSON/db/sqlite3/user.db\\\"\\n}\\n\\nCONFIG = {\\n    'milvus_collections': {\\n        'reviews': 'reviews',\\n        'photos': 'photo_vector',\\n        'tips': 'milvus_tip'\\n    },\\n    'milvus_host': 'localhost',\\n    'milvus_port': '19530',\\n    'neo4j_uri': 'bolt://localhost:7687',\\n    'neo4j_auth': ('neo4j', 'password')\\n}\\n\\n# -------------------------------\\n# User-adjustable parameters\\n# -------------------------------\\nTARGET_TIME = \\\"06:30\\\"  # 6:30am\\n# If you want to narrow down results, set these (recommended).\\nCITY = None   # e.g., \\\"Las Vegas\\\"\\nSTATE = None  # e.g., \\\"NV\\\"\\n# Use today's weekday by default; override if needed: Monday/Tuesday/...\\nDAY_OF_WEEK = datetime.now().strftime('%A')\\n\\nBREAKFAST_KEYWORDS = [\\n    \\\"%Breakfast%\\\", \\\"%Brunch%\\\", \\\"%Coffee%\\\", \\\"%Bakeries%\\\"\\n]\\n\\n# -------------------------------\\n# Helpers\\n# -------------------------------\\n\\ndef parse_hhmm(s: str) -> int:\\n    \\\"\\\"\\\"Convert 'HH:MM' to minutes since 00:00.\\\"\\\"\\\"\\n    hh, mm = s.split(':')\\n    return int(hh) * 60 + int(mm)\\n\\n\\ndef is_time_in_range(target_min: int, start_min: int, end_min: int) -> bool:\\n    \\\"\\\"\\\"\\n    Check if target_min is within [start_min, end_min) considering overnight ranges.\\n    Example: 18:00-02:00 crosses midnight.\\n    \\\"\\\"\\\"\\n    if start_min == end_min:\\n        return False\\n    if start_min < end_min:\\n        return start_min <= target_min < end_min\\n    # Overnight\\n    return target_min >= start_min or target_min < end_min\\n\\n\\ndef extract_hours_for_day(row: dict, day: str, hour_cols: list) -> str | None:\\n    \\\"\\\"\\\"\\n    Try to get hours string for a given day. Supports two common shapes:\\n    1) column 'hours' contains JSON like {\"Monday\":\"06:00-14:00\", ...}\\n    2) separate columns like 'Monday'/'hours_Monday' etc.\\n    Returns a string like '06:00-14:00' or None.\\n    \\\"\\\"\\\"\\n    # Case 1: JSON column\\n    if 'hours' in row and row['hours']:\\n        try:\\n            obj = json.loads(row['hours']) if isinstance(row['hours'], str) else row['hours']\\n            if isinstance(obj, dict):\\n                return obj.get(day)\\n        except Exception:\\n            pass\\n\\n    # Case 2: day column variants\\n    candidates = [day, f'hours_{day}', f'hours{day}', day.lower(), f'hours_{day.lower()}']\\n    for c in candidates:\\n        if c in row and row[c]:\\n            return row[c]\\n\\n    # Some datasets store hours as a single text blob; can't reliably parse without schema\\n    return None\\n\\n\\ndef open_at_time(hours_str: str, target_time_hhmm: str) -> bool:\\n    \\\"\\\"\\\"hours_str example: '06:00-14:00'.\\\"\\\"\\\"\\n    if not hours_str or '-' not in hours_str:\\n        return False\\n    try:\\n        start, end = [x.strip() for x in hours_str.split('-', 1)]\\n        t = parse_hhmm(target_time_hhmm)\\n        s = parse_hhmm(start)\\n        e = parse_hhmm(end)\\n        return is_time_in_range(t, s, e)\\n    except Exception:\\n        return False\\n\\n\\n# -------------------------------\\n# Main\\n# -------------------------------\\n\\ndef main():\\n    conn = sqlite3.connect(sqlite_paths['business'])\\n    conn.row_factory = sqlite3.Row\\n    try:\\n        cur = conn.cursor()\\n\\n        # Introspect columns to adapt to schema\\n        cur.execute(\\\"PRAGMA table_info(business);\\\")\\n        cols = [r[1] for r in cur.fetchall()]\\n\\n        base_select = [\\n            'business_id', 'name', 'address', 'city', 'state',\\n            'stars', 'review_count', 'categories'\\n        ]\\n        # Add any hours-related columns if present\\n        hour_cols = []\\n        for c in cols:\\n            if c == 'hours' or c.lower().startswith('hours_') or c in [\\n                'Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'\\n            ] or c.lower() in [\\n                'monday','tuesday','wednesday','thursday','friday','saturday','sunday'\\n            ]:\\n                hour_cols.append(c)\\n\\n        select_cols = []\\n        for c in base_select + hour_cols:\\n            if c in cols and c not in select_cols:\\n                select_cols.append(c)\\n\\n        # Build WHERE clause\\n        where = [\\\"is_open = 1\\\"] if 'is_open' in cols else []\\n\\n        # categories filter\\n        if 'categories' in cols:\\n            like_parts = [\\\"categories LIKE ?\\\" for _ in BREAKFAST_KEYWORDS]\\n            where.append('(' + ' OR '.join(like_parts) + ')')\\n        else:\\n            raise RuntimeError(\\\"No 'categories' column found in business table; cannot filter for breakfast.\\\")\\n\\n        params = list(BREAKFAST_KEYWORDS)\\n\\n        # Optional location filters\\n        if CITY and 'city' in cols:\\n            where.append('city = ?')\\n            params.append(CITY)\\n        if STATE and 'state' in cols:\\n            where.append('state = ?')\\n            params.append(STATE)\\n\\n        where_sql = (' WHERE ' + ' AND '.join(where)) if where else ''\\n\\n        # Pull a reasonable number of candidates, then exact-filter in Python\\n        sql = f\\\"SELECT {', '.join(select_cols)} FROM business{where_sql} LIMIT 5000\\\"\\n        cur.execute(sql, params)\\n        rows = [dict(r) for r in cur.fetchall()]\\n\\n        # Exact filter for open at 06:30 on the chosen day\\n        results = []\\n        for r in rows:\\n            hours_str = extract_hours_for_day(r, DAY_OF_WEEK, hour_cols)\\n            if open_at_time(hours_str, TARGET_TIME):\\n                r['hours_that_day'] = hours_str\\n                results.append(r)\\n\\n        # Rank\\n        results.sort(key=lambda x: (x.get('stars') or 0, x.get('review_count') or 0), reverse=True)\\n        top = results[:20]\\n\\n        # Output\\n        print(f\\\"Breakfast options open at {TARGET_TIME} on {DAY_OF_WEEK}\\\")\\n        if CITY or STATE:\\n            print(f\\\"Location filter: city={CITY}, state={STATE}\\\")\\n        print('-' * 80)\\n\\n        if not top:\\n            print(\\\"No matches found with the current filters. Try setting CITY/STATE or increasing the LIMIT.\\\")\\n            return\\n\\n        for i, r in enumerate(top, 1):\\n            name = r.get('name')\\n            addr = r.get('address')\\n            city = r.get('city')\\n            state = r.get('state')\\n            stars = r.get('stars')\\n            rc = r.get('review_count')\\n            hrs = r.get('hours_that_day')\\n            print(f\\\"{i:02d}. {name} | {addr}, {city}, {state} | stars={stars}, reviews={rc} | hours({DAY_OF_WEEK})={hrs}\\\")\\n\\n    finally:\\n        conn.close()\\n\\n\\nif __name__ == '__main__':\\n    main()\\n"
+    }
+  },
+  {
+    "index": 278,
+    "question": "Where can I get breakfast at 7am on Saturday?",
+    "success": true,
+    "result": {
+      "analysis": "用户想找“周六早上7点能吃早餐的地方”。在Yelp结构化数据中，核心条件通常来自business表：类别(categories)包含早餐/早午餐/咖啡等，以及营业时间(hours)在Saturday覆盖07:00；再按评分(stars)和评论数(review_count)排序。该问题的关键不确定项是地理范围（城市/州或经纬度+半径），因此代码中将其作为参数输入。主要使用SQLite即可完成。",
+      "natural_question": "Where can I get breakfast at 7am on Saturday?",
+      "difficulty": "easy",
+      "query_types": [
+        "sql"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "SQLite: business.db / table: business"
+            ],
+            "filter_condition": {
+              "is_open": {
+                "=": 1
+              },
+              "location": {
+                "city/state OR lat/lon+radius_km": "user_provided"
+              },
+              "categories": {
+                "LIKE_ANY": [
+                  "%Breakfast%",
+                  "%Brunch%",
+                  "%Coffee%",
+                  "%Cafe%",
+                  "%Baker%"
+                ]
+              }
+            }
+          },
+          "result_var": "candidates_df",
+          "description": {
+            "narrative": "从SQLite的business表筛选仍在营业(is_open=1)、位于指定范围内、且类别包含早餐相关的商家，取出其hours字段（通常为JSON文本或类似结构）以便后续判断周六07:00是否营业。",
+            "example_query": "SELECT business_id, name, address, city, state, postal_code, latitude, longitude, stars, review_count, categories, hours\nFROM business\nWHERE is_open = 1\n  AND city = :city AND state = :state\n  AND (categories LIKE '%Breakfast%' OR categories LIKE '%Brunch%' OR categories LIKE '%Coffee%' OR categories LIKE '%Cafe%' OR categories LIKE '%Baker%');"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "Python post-filter"
+            ],
+            "filter_condition": {
+              "day": {
+                "=": "Saturday"
+              },
+              "time": {
+                "=": "07:00"
+              },
+              "hours": {
+                "covers_time": "Saturday open-close range includes 07:00"
+              }
+            }
+          },
+          "result_var": "open_at_time_df",
+          "description": {
+            "narrative": "解析hours字段，筛选出周六营业时间覆盖07:00的商家（例如 'Saturday': '06:00-14:00' 则满足）。兼容hours为空或格式异常的记录（直接跳过）。",
+            "example_query": "N/A (parse hours in Python; check Saturday time window includes 07:00)"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "Python ranking"
+            ],
+            "filter_condition": {
+              "sort": {
+                "by": [
+                  "stars DESC",
+                  "review_count DESC"
+                ]
+              },
+              "limit": {
+                "=": 20
+              }
+            }
+          },
+          "result_var": "top_results_df",
+          "description": {
+            "narrative": "对满足条件的商家按stars与review_count排序，输出Top N作为“周六早上7点可以吃早餐”的推荐列表。",
+            "example_query": "N/A (sorting/limit in Python or append ORDER BY stars DESC, review_count DESC in SQL after time-filtering)"
+          }
+        }
+      ],
+      "complete_code": "import json\nimport sqlite3\nfrom datetime import datetime\nfrom typing import Optional, Tuple\n\nimport pandas as pd\n\n# ----------------------\n# Fixed configuration (as required)\n# ----------------------\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nmilvus_cfg = {\n    'milvus_collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    },\n    'milvus_host': 'localhost',\n    'milvus_port': '19530',\n}\n\nneo4j_cfg = {\n    'neo4j_uri': 'bolt://localhost:7687',\n    'neo4j_auth': ('neo4j', 'password')\n}\n\n# ----------------------\n# Helpers\n# ----------------------\n\ndef parse_time_hhmm(t: str) -> int:\n    \"\"\"Return minutes from 00:00.\"\"\"\n    dt = datetime.strptime(t, \"%H:%M\")\n    return dt.hour * 60 + dt.minute\n\n\ndef hours_open_at(hours_value, day: str, at_time: str) -> bool:\n    \"\"\"\n    hours_value can be:\n      - None\n      - dict like {\"Saturday\": \"06:00-14:00\", ...}\n      - JSON string representing such dict\n      - already a python object in some ETL variants\n\n    Returns True if day exists and at_time within [open, close].\n    Note: If close < open (overnight), treat as spanning midnight.\n    \"\"\"\n    if hours_value is None or (isinstance(hours_value, float) and pd.isna(hours_value)):\n        return False\n\n    obj = hours_value\n    try:\n        if isinstance(hours_value, str):\n            s = hours_value.strip()\n            # Some datasets store as JSON; others store as python-like string.\n            # First try JSON.\n            try:\n                obj = json.loads(s)\n            except Exception:\n                # Fallback: sometimes it's like \"{'Saturday': '06:00-14:00'}\"\n                # Replace single quotes with double quotes conservatively.\n                s2 = s.replace(\"'\", '\"')\n                obj = json.loads(s2)\n        if not isinstance(obj, dict):\n            return False\n    except Exception:\n        return False\n\n    if day not in obj or not obj[day]:\n        return False\n\n    try:\n        span = obj[day]\n        # expected \"HH:MM-HH:MM\"\n        open_s, close_s = span.split(\"-\")\n        open_m = parse_time_hhmm(open_s)\n        close_m = parse_time_hhmm(close_s)\n        at_m = parse_time_hhmm(at_time)\n\n        if close_m >= open_m:\n            return open_m <= at_m <= close_m\n        else:\n            # Overnight schedule, e.g., 20:00-02:00\n            return at_m >= open_m or at_m <= close_m\n    except Exception:\n        return False\n\n\ndef connect_sqlite(db_path: str) -> sqlite3.Connection:\n    con = sqlite3.connect(db_path)\n    con.row_factory = sqlite3.Row\n    return con\n\n\ndef get_breakfast_open_at_7am(\n    city: Optional[str] = None,\n    state: Optional[str] = None,\n    day: str = \"Saturday\",\n    time_str: str = \"07:00\",\n    limit: int = 20\n) -> pd.DataFrame:\n    \"\"\"\n    Query businesses in (city,state) whose categories look like breakfast and are open at given day/time.\n    Location is required; provide city and state.\n    \"\"\"\n    if not city or not state:\n        raise ValueError(\"Please provide both city and state (e.g., city='Las Vegas', state='NV').\")\n\n    category_terms = [\"Breakfast\", \"Brunch\", \"Coffee\", \"Cafe\", \"Baker\"]\n    like_clause = \" OR \".join([\"categories LIKE ?\" for _ in category_terms])\n    params = [city, state] + [f\"%{t}%\" for t in category_terms]\n\n    sql = f\"\"\"\n    SELECT business_id, name, address, city, state, postal_code,\n           latitude, longitude, stars, review_count, categories, hours\n    FROM business\n    WHERE is_open = 1\n      AND city = ? AND state = ?\n      AND ({like_clause})\n    \"\"\"\n\n    con = connect_sqlite(sqlite_paths[\"business\"])\n    try:\n        candidates = pd.read_sql_query(sql, con, params=params)\n    finally:\n        con.close()\n\n    if candidates.empty:\n        return candidates\n\n    # Filter by hours\n    mask = candidates[\"hours\"].apply(lambda h: hours_open_at(h, day=day, at_time=time_str))\n    open_df = candidates[mask].copy()\n\n    # Rank\n    if not open_df.empty:\n        open_df.sort_values([\"stars\", \"review_count\"], ascending=[False, False], inplace=True)\n        open_df = open_df.head(limit)\n\n    return open_df\n\n\nif __name__ == \"__main__\":\n    # ---- User inputs ----\n    # Provide your location here:\n    city = input(\"City (e.g., Las Vegas): \").strip()\n    state = input(\"State (e.g., NV): \").strip()\n\n    # Fixed for the question; you can change if needed\n    day = \"Saturday\"\n    time_str = \"07:00\"\n\n    try:\n        df = get_breakfast_open_at_7am(city=city, state=state, day=day, time_str=time_str, limit=20)\n        if df.empty:\n            print(\"No matching breakfast places found (or hours/categories missing) for the given location/time.\")\n        else:\n            cols = [\"name\", \"address\", \"city\", \"state\", \"postal_code\", \"stars\", \"review_count\", \"categories\", \"hours\"]\n            print(df[cols].to_string(index=False))\n    except Exception as e:\n        print(f\"Error: {e}\")\n"
+    }
+  },
+  {
+    "index": 279,
+    "question": "Where can I get brunch on Sunday morning?",
+    "success": true,
+    "result": {
+      "analysis": "问题意图是“在周日早上哪里能吃早午餐(Brunch)”，本质是基于Yelp数据集做本地化POI检索+营业时间过滤+语义相关性排序。该问题缺少关键参数（城市/州或经纬度范围），因此方案需要把地点作为必填输入。实现上可用SQLite筛出：地点匹配 + 类别包含Brunch/Breakfast等 + 周日营业且覆盖早晨时段；再用Milvus对review/tip文本做向量检索提升‘确实提供brunch/早午餐体验’的相关性，最后综合Yelp星级、评论数与向量相似度排序输出。",
+      "natural_question": "Where can I get brunch on Sunday morning (in a specified city/state)?",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "SQLite: business.db"
+            ],
+            "filter_condition": {
+              "city": {
+                "=": "<CITY>"
+              },
+              "state": {
+                "=": "<STATE>"
+              },
+              "categories": {
+                "LIKE_ANY": [
+                  "%Brunch%",
+                  "%Breakfast%",
+                  "%Breakfast & Brunch%",
+                  "%Cafe%",
+                  "%American (New)%"
+                ]
+              }
+            }
+          },
+          "result_var": "candidate_businesses",
+          "description": {
+            "narrative": "先在SQLite的business表中按城市/州筛选出潜在餐厅，并用categories做粗过滤（Brunch/Breakfast等）。同时取出hours字段/列以便后续在Python侧做“周日早上”营业时间判断（因为hours在不同落库方式下可能是JSON或拆分列）。",
+            "example_query": "SELECT business_id, name, address, city, state, postal_code, stars, review_count, categories, hours FROM business WHERE city=? AND state=? AND (categories LIKE '%Brunch%' OR categories LIKE '%Breakfast%' OR categories LIKE '%Breakfast & Brunch%' OR categories LIKE '%Cafe%');"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "SQLite: business.db"
+            ],
+            "filter_condition": {
+              "sunday_morning_window": {
+                "between": [
+                  "09:00",
+                  "11:30"
+                ]
+              }
+            }
+          },
+          "result_var": "open_on_sunday_morning",
+          "description": {
+            "narrative": "对候选商家做“周日早上营业”过滤：解析hours（如Sunday: '08:00-14:00'），判断是否覆盖用户设定的周日早晨时间窗（默认09:00-11:30）。",
+            "example_query": "（若hours为拆分列）SELECT ... FROM business WHERE hours_Sunday IS NOT NULL;"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "Milvus: reviews",
+              "Milvus: milvus_tip",
+              "SQLite: review.db",
+              "SQLite: tip.db"
+            ],
+            "filter_condition": {
+              "semantic_query": {
+                "=": "brunch sunday morning eggs benedict mimosas breakfast & brunch"
+              },
+              "top_k": {
+                "=": 200
+              }
+            }
+          },
+          "result_var": "semantic_business_scores",
+          "description": {
+            "narrative": "用Milvus对review与tip做语义检索，找到最像“周日早上吃brunch”的文本片段；再通过SQLite把命中的review_id/tip_id映射回business_id，聚合得到每个business的语义相关性得分。",
+            "example_query": "Milvus: search(collection='reviews', data=[query_vector], limit=200, output_fields=['review_id']); 然后SQLite: SELECT review_id, business_id FROM review WHERE review_id IN (...);"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "SQLite: business.db"
+            ],
+            "filter_condition": {
+              "ranking": {
+                "hybrid_score": "0.55*semantic + 0.30*stars + 0.15*log(review_count+1)"
+              }
+            }
+          },
+          "result_var": "final_ranked_list",
+          "description": {
+            "narrative": "把‘周日早上营业’的商家与语义得分做join，计算混合排序分数并输出Top N（含地址、星级、评论数、营业时间）。",
+            "example_query": "（Python侧计算）final_score = 0.55*semantic_norm + 0.30*(stars/5) + 0.15*log1p(review_count)/log1p(max_review_count)"
+          }
+        }
+      ],
+      "complete_code": "import json\\nimport math\\nimport sqlite3\\nfrom dataclasses import dataclass\\nfrom datetime import datetime\\nfrom typing import Dict, List, Optional, Tuple\\n\\n# Milvus\\nfrom pymilvus import connections, Collection, utility\\n\\n# Embeddings\\ntry:\\n    from sentence_transformers import SentenceTransformer\\nexcept Exception as e:\\n    raise RuntimeError(\\n        \"Missing dependency: sentence-transformers. Install with: pip install sentence-transformers\"\\n    ) from e\\n\\n\\n# -----------------------------\\n# Fixed configuration (as required)\\n# -----------------------------\\nsqlite_paths = {\\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\\n}\\n\\nmilvus_cfg = {\\n    'milvus_collections': {\\n        'reviews': 'reviews',\\n        'photos': 'photo_vector',\\n        'tips': 'milvus_tip'\\n    },\\n    'milvus_host': 'localhost',\\n    'milvus_port': '19530',\\n}\\n\\nneo4j_cfg = {\\n    'neo4j_uri': 'bolt://localhost:7687',\\n    'neo4j_auth': ('neo4j', 'password')\\n}\\n\\n\\n# -----------------------------\\n# Helpers\\n# -----------------------------\\n@dataclass\\nclass BusinessRow:\\n    business_id: str\\n    name: str\\n    address: str\\n    city: str\\n    state: str\\n    postal_code: Optional[str]\\n    stars: float\\n    review_count: int\\n    categories: Optional[str]\\n    hours_raw: Optional[str]\\n    hours_sunday: Optional[str] = None  # if schema has hours_Sunday etc\\n\\n\\ndef connect_sqlite(path: str) -> sqlite3.Connection:\\n    conn = sqlite3.connect(path)\\n    conn.row_factory = sqlite3.Row\\n    return conn\\n\\n\\ndef table_columns(conn: sqlite3.Connection, table: str) -> List[str]:\\n    rows = conn.execute(f\"PRAGMA table_info({table})\").fetchall()\\n    return [r[1] for r in rows]\\n\\n\\ndef parse_hours_sunday(biz: BusinessRow) -> Optional[str]:\\n    \"\"\"Return something like '08:00-14:00' if available.\"\"\"\\n    # 1) If there is an explicit hours_Sunday column\\n    if biz.hours_sunday:\\n        return biz.hours_sunday\\n\\n    # 2) If hours is a JSON string like {\"Sunday\": \"08:00-14:00\", ...}\\n    if not biz.hours_raw:\\n        return None\\n\\n    raw = biz.hours_raw\\n    # Try JSON\\n    try:\\n        obj = json.loads(raw)\\n        if isinstance(obj, dict):\\n            return obj.get(\"Sunday\")\\n    except Exception:\\n        pass\\n\\n    # 3) If hours is a non-JSON string (fallback heuristic)\\n    # e.g., \"Sunday: 08:00-14:00; Monday: ...\"\\n    lower = raw.lower()\\n    if \"sunday\" in lower:\\n        # very naive extraction\\n        parts = raw.split(\";\")\\n        for p in parts:\\n            if \"sunday\" in p.lower():\\n                # strip 'Sunday:'\\n                if \":\" in p:\\n                    return p.split(\":\", 1)[1].strip()\\n                return p.strip()\\n    return None\\n\\n\\ndef time_to_minutes(t: str) -> int:\\n    hh, mm = t.split(\":\")\\n    return int(hh) * 60 + int(mm)\\n\\n\\ndef hours_cover_window(hours_range: str, window_start: str, window_end: str) -> bool:\\n    \"\"\"\\n    hours_range examples: '08:00-14:00' or '08:00-02:00' (cross-midnight).\\n    window_start/end are within the same morning period (e.g., 09:00-11:30).\\n    \"\"\"\\n    if not hours_range or \"-\" not in hours_range:\\n        return False\\n    start_s, end_s = [x.strip() for x in hours_range.split(\"-\", 1)]\\n\\n    open_m = time_to_minutes(start_s)\\n    close_m = time_to_minutes(end_s)\\n    w_start = time_to_minutes(window_start)\\n    w_end = time_to_minutes(window_end)\\n\\n    # handle cross-midnight: treat close as next day\\n    if close_m < open_m:\\n        close_m += 24 * 60\\n\\n    # window is assumed same day morning; if window is before open and business crosses midnight from previous day,\\n    # this won't be captured; acceptable for brunch use-case.\\n    return open_m <= w_start and close_m >= w_end\\n\\n\\ndef normalize_scores(d: Dict[str, float]) -> Dict[str, float]:\\n    if not d:\\n        return {}\\n    vals = list(d.values())\\n    mn, mx = min(vals), max(vals)\\n    if mx - mn < 1e-9:\\n        return {k: 1.0 for k in d}\\n    return {k: (v - mn) / (mx - mn) for k, v in d.items()}\\n\\n\\n# -----------------------------\\n# Core pipeline\\n# -----------------------------\\n\\ndef fetch_candidate_businesses(city: str, state: str) -> List[BusinessRow]:\\n    conn = connect_sqlite(sqlite_paths[\"business\"])\\n    cols = table_columns(conn, \"business\")\\n\\n    # Determine hours storage\\n    has_hours_json = \"hours\" in cols\\n    has_hours_sunday = \"hours_Sunday\" in cols\\n\\n    select_cols = [\\n        \"business_id\", \"name\", \"address\", \"city\", \"state\", \"postal_code\",\\n        \"stars\", \"review_count\", \"categories\"\\n    ]\\n    if has_hours_json:\\n        select_cols.append(\"hours\")\\n    else:\\n        select_cols.append(\"NULL as hours\")\\n    if has_hours_sunday:\\n        select_cols.append(\"hours_Sunday\")\\n    else:\\n        select_cols.append(\"NULL as hours_Sunday\")\\n\\n    # Category keywords for brunch\\n    # (you can tune this list)\\n    like_terms = [\"%Brunch%\", \"%Breakfast%\", \"%Breakfast & Brunch%\", \"%Cafe%\", \"%Diners%\"]\\n    like_clause = \" OR \".join([\"categories LIKE ?\" for _ in like_terms])\\n\\n    sql = f\"\"\"\\n        SELECT {', '.join(select_cols)}\\n        FROM business\\n        WHERE city = ? AND state = ?\\n          AND ({like_clause})\\n    \"\"\"\\n    params = [city, state] + like_terms\\n\\n    rows = conn.execute(sql, params).fetchall()\\n    conn.close()\\n\\n    out: List[BusinessRow] = []\\n    for r in rows:\\n        out.append(BusinessRow(\\n            business_id=r[\"business_id\"],\\n            name=r[\"name\"],\\n            address=r[\"address\"],\\n            city=r[\"city\"],\\n            state=r[\"state\"],\\n            postal_code=r[\"postal_code\"] if \"postal_code\" in r.keys() else None,\\n            stars=float(r[\"stars\"]) if r[\"stars\"] is not None else 0.0,\\n            review_count=int(r[\"review_count\"]) if r[\"review_count\"] is not None else 0,\\n            categories=r[\"categories\"] if \"categories\" in r.keys() else None,\\n            hours_raw=r[\"hours\"],\\n            hours_sunday=r[\"hours_Sunday\"],\\n        ))\\n    return out\\n\\n\\ndef filter_open_sunday_morning(businesses: List[BusinessRow], window_start: str = \"09:00\", window_end: str = \"11:30\") -> List[Tuple[BusinessRow, Optional[str]]]:\\n    filtered = []\\n    for b in businesses:\\n        sunday = parse_hours_sunday(b)\\n        if sunday and hours_cover_window(sunday, window_start, window_end):\\n            filtered.append((b, sunday))\\n    return filtered\\n\\n\\ndef milvus_connect():\\n    connections.connect(alias=\"default\", host=milvus_cfg[\"milvus_host\"], port=milvus_cfg[\"milvus_port\"])\\n\\n\\ndef get_collection(name: str) -> Collection:\\n    if not utility.has_collection(name):\\n        raise RuntimeError(f\"Milvus collection not found: {name}\")\\n    col = Collection(name)\\n    col.load()\\n    return col\\n\\n\\ndef infer_vector_field(col: Collection) -> str:\\n    # pick the first FLOAT_VECTOR field\\n    for f in col.schema.fields:\\n        if str(f.dtype) == \"DataType.FLOAT_VECTOR\":\\n            return f.name\\n    raise RuntimeError(f\"No FLOAT_VECTOR field found in collection {col.name}\")\\n\\n\\ndef infer_id_field(col: Collection) -> str:\\n    # Heuristic: look for common id fields\\n    candidates = [\"review_id\", \"tip_id\", \"id\"]\\n    schema_fields = {f.name for f in col.schema.fields}\\n    for c in candidates:\\n        if c in schema_fields:\\n            return c\\n    # fallback: choose first non-vector field\\n    for f in col.schema.fields:\\n        if str(f.dtype) != \"DataType.FLOAT_VECTOR\":\\n            return f.name\\n    raise RuntimeError(f\"No suitable id field found in collection {col.name}\")\\n\\n\\ndef embed_query(text: str, dim: int) -> List[float]:\\n    model = SentenceTransformer(\"all-MiniLM-L6-v2\")\\n    vec = model.encode([text], normalize_embeddings=True)[0]\\n    vec = vec.tolist()\\n    if len(vec) != dim:\\n        raise RuntimeError(\\n            f\"Embedding dim mismatch: model produced {len(vec)} but Milvus expects {dim}. \"\\n            \"Use the same embedding model as used when building the Milvus collection.\"\\n        )\\n    return vec\\n\\n\\ndef search_text_collection(collection_name: str, query_text: str, top_k: int = 200) -> List[Tuple[str, float]]:\\n    col = get_collection(collection_name)\\n    vec_field = infer_vector_field(col)\\n    id_field = infer_id_field(col)\\n\\n    # infer dim\\n    dim = None\\n    for f in col.schema.fields:\\n        if f.name == vec_field:\\n            dim = f.params.get(\"dim\")\\n            break\\n    if dim is None:\\n        raise RuntimeError(f\"Cannot infer vector dim for {collection_name}.{vec_field}\")\\n\\n    qvec = embed_query(query_text, int(dim))\\n\\n    search_params = {\"metric_type\": \"IP\", \"params\": {\"nprobe\": 16}}\\n    res = col.search(\\n        data=[qvec],\\n        anns_field=vec_field,\\n        param=search_params,\\n        limit=top_k,\\n        output_fields=[id_field]\\n    )\\n\\n    hits = []\\n    for hit in res[0]:\\n        # hit.entity.get(id_field) works in newer pymilvus; fallback to hit.get\\n        try:\\n            rid = hit.entity.get(id_field)\\n        except Exception:\\n            rid = hit.get(id_field)\\n        score = float(hit.score)\\n        hits.append((str(rid), score))\\n    return hits\\n\\n\\ndef map_review_ids_to_business(review_ids: List[str]) -> Dict[str, str]:\\n    if not review_ids:\\n        return {}\\n    conn = connect_sqlite(sqlite_paths[\"review\"])\\n\\n    # chunk IN queries to avoid SQLite limits\\n    out = {}\\n    chunk_size = 900\\n    for i in range(0, len(review_ids), chunk_size):\\n        chunk = review_ids[i:i+chunk_size]\\n        placeholders = \",\".join([\"?\"] * len(chunk))\\n        sql = f\"SELECT review_id, business_id FROM review WHERE review_id IN ({placeholders})\"\\n        for r in conn.execute(sql, chunk).fetchall():\\n            out[str(r[\"review_id\"])] = str(r[\"business_id\"])\\n    conn.close()\\n    return out\\n\\n\\ndef map_tip_ids_to_business(tip_ids: List[str]) -> Dict[str, str]:\\n    if not tip_ids:\\n        return {}\\n    conn = connect_sqlite(sqlite_paths[\"tip\"])\\n\\n    out = {}\\n    chunk_size = 900\\n    for i in range(0, len(tip_ids), chunk_size):\\n        chunk = tip_ids[i:i+chunk_size]\\n        placeholders = \",\".join([\"?\"] * len(chunk))\\n        sql = f\"SELECT tip_id, business_id FROM tip WHERE tip_id IN ({placeholders})\"\\n        for r in conn.execute(sql, chunk).fetchall():\\n            out[str(r[\"tip_id\"])] = str(r[\"business_id\"])\\n    conn.close()\\n    return out\\n\\n\\ndef aggregate_semantic_scores(query_text: str, top_k: int = 200) -> Dict[str, float]:\\n    milvus_connect()\\n\\n    # Search reviews\\n    review_hits = search_text_collection(milvus_cfg['milvus_collections']['reviews'], query_text, top_k=top_k)\\n    review_id_to_biz = map_review_ids_to_business([rid for rid, _ in review_hits])\\n\\n    # Search tips\\n    tip_hits = search_text_collection(milvus_cfg['milvus_collections']['tips'], query_text, top_k=top_k)\\n    tip_id_to_biz = map_tip_ids_to_business([tid for tid, _ in tip_hits])\\n\\n    # Aggregate: max score per business from each source, then sum\\n    biz_scores: Dict[str, float] = {}\\n\\n    def upd(bid: str, s: float):\\n        if not bid:\\n            return\\n        # keep max per business per source by using max update pattern\\n        if bid not in biz_scores:\\n            biz_scores[bid] = s\\n        else:\\n            biz_scores[bid] = max(biz_scores[bid], s)\\n\\n    for rid, score in review_hits:\\n        bid = review_id_to_biz.get(rid)\\n        if bid:\\n            upd(bid, score)\\n\\n    for tid, score in tip_hits:\\n        bid = tip_id_to_biz.get(tid)\\n        if bid:\\n            upd(bid, score)\\n\\n    return biz_scores\\n\\n\\ndef recommend_brunch(city: str, state: str, window_start: str = \"09:00\", window_end: str = \"11:30\", top_n: int = 10):\\n    # 1) SQL candidates\\n    candidates = fetch_candidate_businesses(city, state)\\n\\n    # 2) Hours filter\\n    open_list = filter_open_sunday_morning(candidates, window_start, window_end)\\n    open_by_id = {b.business_id: (b, sun_hours) for b, sun_hours in open_list}\\n\\n    # 3) Vector semantic boost\\n    query_text = \"brunch sunday morning eggs benedict mimosas breakfast and brunch\"\\n    try:\\n        semantic_scores = aggregate_semantic_scores(query_text, top_k=200)\\n    except Exception as e:\\n        # If Milvus/embedding mismatches, fallback to no semantic ranking\\n        semantic_scores = {}\\n        print(f\"[WARN] Semantic search unavailable, fallback to SQL-only ranking. Reason: {e}\")\\n\\n    semantic_norm = normalize_scores(semantic_scores)\\n\\n    # 4) Hybrid rank\\n    if open_by_id:\\n        max_rc = max(b.review_count for b, _ in open_list)\\n    else:\\n        max_rc = 1\\n\\n    results = []\\n    for bid, (b, sun_hours) in open_by_id.items():\\n        sem = semantic_norm.get(bid, 0.0)\\n        stars = (b.stars or 0.0) / 5.0\\n        rc = b.review_count or 0\\n        rc_norm = math.log1p(rc) / math.log1p(max_rc) if max_rc > 0 else 0.0\\n\\n        final = 0.55 * sem + 0.30 * stars + 0.15 * rc_norm\\n\\n        results.append({\\n            \"business_id\": b.business_id,\\n            \"name\": b.name,\\n            \"address\": b.address,\\n            \"city\": b.city,\\n            \"state\": b.state,\\n            \"postal_code\": b.postal_code,\\n            \"stars\": b.stars,\\n            \"review_count\": b.review_count,\\n            \"categories\": b.categories,\\n            \"sunday_hours\": sun_hours,\\n            \"semantic_score_norm\": round(sem, 4),\\n            \"final_score\": round(final, 6),\\n        })\\n\\n    results.sort(key=lambda x: x[\"final_score\"], reverse=True)\\n    return results[:top_n]\\n\\n\\nif __name__ == \"__main__\":\\n    # ---- User inputs (required) ----\\n    # Please set your target location here\\n    CITY = \"Las Vegas\"\\n    STATE = \"NV\"\\n\\n    # Sunday morning window (tunable)\\n    WINDOW_START = \"09:00\"\\n    WINDOW_END = \"11:30\"\\n\\n    TOP_N = 10\\n\\n    recs = recommend_brunch(CITY, STATE, WINDOW_START, WINDOW_END, TOP_N)\\n    print(json.dumps({\\n        \"city\": CITY,\\n        \"state\": STATE,\\n        \"window\": {\"start\": WINDOW_START, \"end\": WINDOW_END},\\n        \"results\": recs\\n    }, ensure_ascii=False, indent=2))\\n"
+    }
+  },
+  {
+    "index": 280,
+    "question": "Show Franklin coffee shops with outdoor seating and free WiFi; return name, address, and rating.",
+    "success": true,
+    "result": {
+      "analysis": "用户要在Franklin城市中筛选“咖啡店/coffee shops”，并要求同时满足两个属性条件：outdoor seating + free WiFi；返回字段为名称、地址、评分。该问题主要依赖SQLite中的business结构化数据（categories、city、stars、address等），但属性字段在Yelp数据里常以JSON/字典字符串存储在attributes列或拆分成多列，需做兼容处理（SQL粗筛 + Python精筛）。",
+      "natural_question": "查询Franklin的咖啡店，要求有户外座位且提供免费WiFi，返回店名、地址和评分。",
+      "difficulty": "medium",
+      "query_types": [
+        "sql"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "SQLite: business.db / business表"
+            ],
+            "filter_condition": {
+              "city": {
+                "=": "Franklin"
+              },
+              "categories": {
+                "LIKE": "%Coffee%"
+              }
+            }
+          },
+          "result_var": "candidates",
+          "description": {
+            "narrative": "先在SQLite里按城市(Franklin)与类别包含Coffee做候选集粗筛，取出地址、评分、categories和attributes（若存在）等字段。",
+            "example_query": "SELECT business_id, name, address, city, state, postal_code, stars, categories, attributes FROM business WHERE city = 'Franklin' AND categories LIKE '%Coffee%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "Python后处理"
+            ],
+            "filter_condition": {
+              "attributes.OutdoorSeating": {
+                "=": true
+              },
+              "attributes.WiFi": {
+                "=": "free"
+              }
+            }
+          },
+          "result_var": "filtered",
+          "description": {
+            "narrative": "对候选集解析attributes（兼容JSON/字典字符串/拆分列），过滤出OutdoorSeating为真且WiFi为free（处理Yelp常见格式如 \"u'free'\" 或 'free'）。",
+            "example_query": "（Python）if outdoor_seating is True and wifi == 'free': keep"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "结果输出"
+            ],
+            "filter_condition": {
+              "order_by": {
+                "stars": "DESC"
+              }
+            }
+          },
+          "result_var": "result_rows",
+          "description": {
+            "narrative": "将结果整理为 name、完整地址、stars，并按评分降序输出。",
+            "example_query": "ORDER BY stars DESC"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport json\nimport ast\nfrom typing import Any, Dict, List, Tuple\n\n# ---- Fixed configuration (as required) ----\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\n# Milvus/Neo4j config included for completeness of the multi-DB project (not used in this query)\nconfig = {\n    'milvus_collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    },\n    'milvus_host': 'localhost',\n    'milvus_port': '19530',\n    'neo4j_uri': 'bolt://localhost:7687',\n    'neo4j_auth': ('neo4j', 'password')\n}\n\n\ndef get_table_columns(conn: sqlite3.Connection, table: str) -> List[str]:\n    cur = conn.cursor()\n    cur.execute(f\"PRAGMA table_info({table});\")\n    return [r[1] for r in cur.fetchall()]\n\n\ndef safe_parse_attributes(val: Any) -> Dict[str, Any]:\n    \"\"\"Parse Yelp 'attributes' field if stored as JSON or python-dict-like string.\"\"\"\n    if val is None:\n        return {}\n    if isinstance(val, dict):\n        return val\n    if not isinstance(val, str):\n        return {}\n\n    s = val.strip()\n    if not s:\n        return {}\n\n    # Try JSON first\n    try:\n        obj = json.loads(s)\n        return obj if isinstance(obj, dict) else {}\n    except Exception:\n        pass\n\n    # Try python literal (some dumps look like \"{'WiFi': \"u'free'\", ...}\")\n    try:\n        obj = ast.literal_eval(s)\n        return obj if isinstance(obj, dict) else {}\n    except Exception:\n        return {}\n\n\ndef normalize_wifi(v: Any) -> str:\n    if v is None:\n        return \"\"\n    if isinstance(v, bool):\n        return \"\"\n    s = str(v).strip()\n    # Normalize common Yelp legacy representations\n    # e.g., \"u'free'\" or \"'free'\" -> \"free\"\n    if s.startswith(\"u'\") and s.endswith(\"'\"):\n        s = s[2:-1]\n    if s.startswith(\"'\") and s.endswith(\"'\"):\n        s = s[1:-1]\n    if s.startswith('\"') and s.endswith('\"'):\n        s = s[1:-1]\n    return s.lower()\n\n\ndef truthy(v: Any) -> bool:\n    if v is None:\n        return False\n    if isinstance(v, bool):\n        return v\n    s = str(v).strip().lower()\n    return s in {\"true\", \"1\", \"yes\", \"y\", \"t\"}\n\n\ndef build_full_address(row: Dict[str, Any]) -> str:\n    parts = []\n    for k in (\"address\", \"city\", \"state\", \"postal_code\"):\n        v = row.get(k)\n        if v:\n            parts.append(str(v).strip())\n    return \", \".join([p for p in parts if p])\n\n\ndef main():\n    city = \"Franklin\"\n    category_like = \"%Coffee%\"\n\n    db_path = sqlite_paths[\"business\"]\n\n    try:\n        conn = sqlite3.connect(db_path)\n        conn.row_factory = sqlite3.Row\n    except Exception as e:\n        raise SystemExit(f\"Failed to connect to SQLite business DB: {e}\")\n\n    try:\n        # Detect available columns to be robust across different SQLite schemas\n        cols = set(get_table_columns(conn, \"business\"))\n\n        base_select_cols = [\n            \"business_id\", \"name\", \"address\", \"city\", \"state\", \"postal_code\", \"stars\", \"categories\"\n        ]\n        select_cols = [c for c in base_select_cols if c in cols]\n\n        # Prefer attributes column if exists\n        has_attributes = \"attributes\" in cols\n        if has_attributes:\n            select_cols.append(\"attributes\")\n\n        # Some schemas may have exploded attribute columns\n        outdoor_col_candidates = [\n            \"OutdoorSeating\",\n            \"attributes_OutdoorSeating\",\n            \"attribute_OutdoorSeating\",\n            \"outdoor_seating\"\n        ]\n        wifi_col_candidates = [\n            \"WiFi\",\n            \"attributes_WiFi\",\n            \"attribute_WiFi\",\n            \"wifi\"\n        ]\n        outdoor_col = next((c for c in outdoor_col_candidates if c in cols), None)\n        wifi_col = next((c for c in wifi_col_candidates if c in cols), None)\n        if outdoor_col and outdoor_col not in select_cols:\n            select_cols.append(outdoor_col)\n        if wifi_col and wifi_col not in select_cols:\n            select_cols.append(wifi_col)\n\n        if \"city\" not in cols or \"categories\" not in cols:\n            raise RuntimeError(\"business table must contain at least 'city' and 'categories' columns for this query.\")\n\n        sql = f\"\"\"\n        SELECT {\", \".join(select_cols)}\n        FROM business\n        WHERE city = ?\n          AND categories LIKE ?\n        \"\"\"\n\n        cur = conn.cursor()\n        cur.execute(sql, (city, category_like))\n        candidates = [dict(r) for r in cur.fetchall()]\n\n        filtered = []\n        for r in candidates:\n            attrs = safe_parse_attributes(r.get(\"attributes\")) if has_attributes else {}\n\n            # OutdoorSeating: read from exploded column if present, else attributes\n            if outdoor_col is not None:\n                outdoor_val = r.get(outdoor_col)\n            else:\n                outdoor_val = attrs.get(\"OutdoorSeating\")\n\n            # WiFi: exploded column if present, else attributes\n            if wifi_col is not None:\n                wifi_val = r.get(wifi_col)\n            else:\n                wifi_val = attrs.get(\"WiFi\")\n\n            if not truthy(outdoor_val):\n                continue\n\n            wifi_norm = normalize_wifi(wifi_val)\n            if wifi_norm != \"free\":\n                continue\n\n            filtered.append({\n                \"name\": r.get(\"name\"),\n                \"address\": build_full_address(r),\n                \"rating\": r.get(\"stars\")\n            })\n\n        # Sort by rating desc, then name\n        filtered.sort(key=lambda x: (x[\"rating\"] is None, -(x[\"rating\"] or 0), x[\"name\"] or \"\"))\n\n        # Print results\n        print(f\"Franklin coffee shops with OutdoorSeating=True and WiFi=free: {len(filtered)}\")\n        for item in filtered:\n            print(f\"- {item['name']} | {item['address']} | rating={item['rating']}\")\n\n    except Exception as e:\n        raise SystemExit(f\"Query failed: {e}\")\n    finally:\n        try:\n            conn.close()\n        except Exception:\n            pass\n\n\nif __name__ == \"__main__\":\n    main()\n"
+    }
+  }
+]
