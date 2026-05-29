@@ -1,0 +1,693 @@
+[
+{
+    "index": 51,
+    "question": "Which hotels in Tampa are family-friendly and have good facilities for kids?",
+    "success": true,
+    "result": {
+      "analysis": "该问题需要结合结构化地理/类别过滤和非结构化语义搜索。首先，需要从SQLite的关系型数据库中筛选出位于'Tampa'且类别包含'Hotels'的商家。然后，利用Milvus向量数据库对这些特定商家的评论进行语义搜索，寻找与'family-friendly and have good facilities for kids'（适合家庭且有良好儿童设施）最匹配的评论。最后将两者的结果进行关联，得出最符合条件的酒店。",
+      "natural_question": "Which hotels in Tampa are family-friendly and have good facilities for kids?",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business.db"
+            ],
+            "filter_condition": {
+              "city": {
+                "=": "Tampa"
+              },
+              "categories": {
+                "LIKE": "%Hotels%"
+              }
+            }
+          },
+          "result_var": "tampa_hotels_df",
+          "description": {
+            "narrative": "连接SQLite的business数据库，筛选出位于Tampa且类别属于Hotels的商家，提取它们的business_id和name。",
+            "example_query": "SELECT business_id, name, stars FROM business WHERE city = 'Tampa' AND categories LIKE '%Hotels%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "Milvus: reviews"
+            ],
+            "filter_condition": {
+              "text": {
+                "semantic_match": "family-friendly and have good facilities for kids"
+              },
+              "business_id": {
+                "IN": "tampa_hotels_df['business_id']"
+              }
+            }
+          },
+          "result_var": "search_results",
+          "description": {
+            "narrative": "使用SentenceTransformer将查询文本转换为向量。连接Milvus数据库的reviews集合，利用上一步获取的Tampa酒店的business_id作为过滤条件（expr），进行向量相似度搜索，找出最匹配的评论。",
+            "example_query": "collection.search(data=[query_vector], expr='business_id in [...]', limit=10)"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [],
+            "filter_condition": {}
+          },
+          "result_var": "final_output",
+          "description": {
+            "narrative": "解析Milvus返回的搜索结果，将匹配到的business_id映射回SQLite中查询到的酒店名称，并打印输出推荐的酒店及相关评论片段。",
+            "example_query": "Merge vector search results with SQLite business names."
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport pandas as pd\nfrom pymilvus import connections, Collection\nfrom sentence_transformers import SentenceTransformer\n\ndef find_family_friendly_hotels_in_tampa():\n    # ==========================================\n    # Step 1: Query SQLite for Hotels in Tampa\n    # ==========================================\n    sqlite_business_path = \"D:/Yelp-JSON/db/sqlite3/business.db\"\n    \n    try:\n        conn = sqlite3.connect(sqlite_business_path)\n        sql_query = \"\"\"\n            SELECT business_id, name, stars, review_count \n            FROM business \n            WHERE city = 'Tampa' \n              AND categories LIKE '%Hotels%'\n        \"\"\"\n        tampa_hotels_df = pd.read_sql_query(sql_query, conn)\n        conn.close()\n        \n        if tampa_hotels_df.empty:\n            print(\"No hotels found in Tampa in the SQLite database.\")\n            return\n            \n        # Create a dictionary for quick name lookup\n        hotel_dict = tampa_hotels_df.set_index('business_id')['name'].to_dict()\n        valid_bids = list(hotel_dict.keys())\n        print(f\"Found {len(valid_bids)} hotels in Tampa. Proceeding to semantic search...\\n\")\n        \n    except Exception as e:\n        print(f\"Error querying SQLite: {e}\")\n        return\n\n    # ==========================================\n    # Step 2: Semantic Search in Milvus\n    # ==========================================\n    try:\n        # Connect to Milvus\n        connections.connect(host='localhost', port='19530')\n        collection = Collection('reviews')\n        collection.load()\n        \n        # Generate embedding for the query\n        print(\"Loading embedding model...\")\n        model = SentenceTransformer('all-MiniLM-L6-v2')\n        query_text = \"family-friendly and have good facilities for kids\"\n        query_vector = model.encode([query_text])[0].tolist()\n        \n        # Prepare search parameters\n        search_params = {\n            \"metric_type\": \"L2\",  # Or IP depending on your index\n            \"params\": {\"nprobe\": 10}\n        }\n        \n        # Filter expression to only include reviews from Tampa hotels\n        # Note: If valid_bids is extremely large (> thousands), this expr might need chunking.\n        # For a single city's hotels, it is usually well within limits.\n        expr = f\"business_id in {valid_bids}\"\n        \n        print(\"Searching Milvus for family-friendly reviews...\")\n        results = collection.search(\n            data=[query_vector],\n            anns_field=\"embedding\",  # Ensure this matches your vector field name in Milvus\n            param=search_params,\n            limit=10,\n            expr=expr,\n            output_fields=[\"business_id\", \"text\"]\n        )\n        \n    except Exception as e:\n        print(f\"Error querying Milvus: {e}\")\n        return\n\n    # ==========================================\n    # Step 3: Process and Display Results\n    # ==========================================\n    print(\"\\n=== Top Family-Friendly Hotels in Tampa ===\\n\")\n    \n    # Use a set to avoid recommending the exact same hotel multiple times if it has multiple matching reviews\n    seen_hotels = set()\n    \n    for hits in results:\n        for hit in hits:\n            b_id = hit.entity.get('business_id')\n            text = hit.entity.get('text')\n            distance = hit.distance\n            \n            if b_id not in seen_hotels:\n                hotel_name = hotel_dict.get(b_id, \"Unknown Hotel\")\n                print(f\"Hotel Name: {hotel_name}\")\n                print(f\"Business ID: {b_id}\")\n                print(f\"Match Distance: {distance:.4f}\")\n                print(f\"Review Snippet: {text[:250]}...\")\n                print(\"-\" * 60)\n                seen_hotels.add(b_id)\n\nif __name__ == \"__main__\":\n    find_family_friendly_hotels_in_tampa()\n"
+    }
+  },
+{
+    "index": 52,
+    "question": "Which gyms in Clearwater have good personal trainers and modern equipment?",
+    "success": true,
+    "result": {
+      "analysis": "该问题需要结合结构化属性过滤和非结构化语义搜索。首先，需要在关系型数据库中筛选出位于'Clearwater'且类别包含'Gyms'或'Fitness'的商户。其次，由于'优秀的私人教练'和'现代化的设备'是主观的定性描述，需要通过向量数据库对评论文本进行语义搜索。最后，将语义搜索检索到的评论映射回对应的商户，并与第一步筛选出的Clearwater健身房进行交集匹配。",
+      "natural_question": "Which gyms in Clearwater have good personal trainers and modern equipment?",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "=": "Clearwater"
+              },
+              "categories": {
+                "LIKE": "%Gyms%"
+              }
+            }
+          },
+          "result_var": "clearwater_gyms_df",
+          "description": {
+            "narrative": "在SQLite的business数据库中查询位于Clearwater且类别包含Gyms或Fitness的商户，获取它们的business_id和基本信息。",
+            "example_query": "SELECT business_id, name, address, stars FROM business WHERE city = 'Clearwater' AND (categories LIKE '%Gyms%' OR categories LIKE '%Fitness & Instruction%');"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "Milvus: reviews"
+            ],
+            "filter_condition": {
+              "text_embedding": {
+                "SIMILARITY_SEARCH": "good personal trainers and modern equipment"
+              }
+            }
+          },
+          "result_var": "review_ids",
+          "description": {
+            "narrative": "使用SentenceTransformer将查询文本向量化，并在Milvus的reviews集合中进行相似度搜索，提取最相关的review_id。",
+            "example_query": "collection.search(data=[query_vector], anns_field='vector', param={'metric_type': 'L2', 'params': {'nprobe': 10}}, limit=1000, output_fields=['review_id'])"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "review"
+            ],
+            "filter_condition": {
+              "review_id": {
+                "IN": "review_ids"
+              }
+            }
+          },
+          "result_var": "review_business_df",
+          "description": {
+            "narrative": "在SQLite的review数据库中，根据上一步获取的review_id查询对应的business_id。",
+            "example_query": "SELECT review_id, business_id FROM review WHERE review_id IN (...);"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "Python Dataframe"
+            ],
+            "filter_condition": {}
+          },
+          "result_var": "final_gyms",
+          "description": {
+            "narrative": "将步骤1中的Clearwater健身房ID与步骤3中包含相关评论的商户ID进行交集匹配，输出最终符合条件的健身房列表。",
+            "example_query": "pd.merge(clearwater_gyms_df, review_business_df, on='business_id')"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport pandas as pd\nfrom pymilvus import connections, Collection\nfrom sentence_transformers import SentenceTransformer\n\n# 数据库路径配置\nSQLITE_PATHS = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\"\n}\n\ndef find_good_gyms_in_clearwater():\n    conn_biz = None\n    conn_rev = None\n    try:\n        # ==========================================\n        # 步骤 1: 从 business.db 获取 Clearwater 的健身房\n        # ==========================================\n        print(\"Step 1: Fetching gyms in Clearwater from SQLite...\")\n        conn_biz = sqlite3.connect(SQLITE_PATHS['business'])\n        query_biz = \"\"\"\n            SELECT business_id, name, address, stars, review_count\n            FROM business \n            WHERE city = 'Clearwater' \n              AND (categories LIKE '%Gyms%' OR categories LIKE '%Fitness & Instruction%')\n        \"\"\"\n        clearwater_gyms_df = pd.read_sql_query(query_biz, conn_biz)\n        \n        if clearwater_gyms_df.empty:\n            print(\"No gyms found in Clearwater.\")\n            return\n            \n        clearwater_gym_ids = clearwater_gyms_df['business_id'].tolist()\n        print(f\"Found {len(clearwater_gym_ids)} gyms in Clearwater.\")\n\n        # ==========================================\n        # 步骤 2: 在 Milvus 中搜索相关评论\n        # ==========================================\n        print(\"Step 2: Searching for relevant reviews in Milvus...\")\n        connections.connect(host='localhost', port='19530')\n        collection = Collection('reviews')\n        collection.load()\n\n        # 初始化向量化模型并生成查询向量\n        model = SentenceTransformer('all-MiniLM-L6-v2')\n        query_text = \"good personal trainers and modern equipment\"\n        query_vector = model.encode(query_text).tolist()\n\n        # 执行向量搜索 (假设向量字段名为 'vector' 或 'embedding')\n        search_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\n        # 注意：根据实际Milvus schema，anns_field可能为'vector'或'embedding'\n        results = collection.search(\n            data=[query_vector], \n            anns_field=\"embedding\", \n            param=search_params, \n            limit=1000,  # 获取前1000条最相关的评论以确保有足够的交集\n            output_fields=[\"review_id\"]\n        )\n\n        review_ids = [hit.entity.get('review_id') for hit in results[0]]\n        print(f\"Retrieved {len(review_ids)} semantically similar reviews.\")\n\n        # ==========================================\n        # 步骤 3: 从 review.db 映射 review_id 到 business_id\n        # ==========================================\n        print(\"Step 3: Mapping reviews to businesses...\")\n        conn_rev = sqlite3.connect(SQLITE_PATHS['review'])\n        \n        # 使用参数化查询防止SQL注入及语法错误\n        placeholders = ','.join(['?'] * len(review_ids))\n        query_rev = f\"\"\"\n            SELECT review_id, business_id \n            FROM review \n            WHERE review_id IN ({placeholders})\n        \"\"\"\n        review_business_df = pd.read_sql_query(query_rev, conn_rev, params=review_ids)\n\n        # ==========================================\n        # 步骤 4: 交集匹配并输出结果\n        # ==========================================\n        print(\"Step 4: Intersecting results...\")\n        # 找出既在Clearwater又是健身房，且拥有相关好评的business_id\n        matched_business_ids = review_business_df[review_business_df['business_id'].isin(clearwater_gym_ids)]['business_id'].unique()\n        \n        final_gyms = clearwater_gyms_df[clearwater_gyms_df['business_id'].isin(matched_business_ids)]\n        \n        print(\"\\n=== Recommended Gyms in Clearwater ===\")\n        if final_gyms.empty:\n            print(\"No gyms matched the specific criteria for trainers and equipment.\")\n        else:\n            # 按星级降序排列输出\n            final_gyms = final_gyms.sort_values(by='stars', ascending=False)\n            for index, row in final_gyms.iterrows():\n                print(f\"Name: {row['name']}\")\n                print(f\"Address: {row['address']}\")\n                print(f\"Rating: {row['stars']} Stars ({row['review_count']} reviews)\")\n                print(\"-\" * 40)\n                \n    except Exception as e:\n        print(f\"An error occurred: {e}\")\n    finally:\n        # 确保数据库连接被正确关闭\n        if conn_biz:\n            conn_biz.close()\n        if conn_rev:\n            conn_rev.close()\n        try:\n            connections.disconnect('default')\n        except:\n            pass\n\nif __name__ == '__main__':\n    find_good_gyms_in_clearwater()\n"
+    }
+  },
+{
+    "index": 53,
+    "question": "Which dental clinics in Metairie have patient, caring dentists and good patient care?",
+    "success": true,
+    "result": {
+      "analysis": "该问题需要结合地理位置、业务类别过滤以及基于语义的评论搜索。首先，需要在关系型数据库（SQLite）中筛选出位于'Metairie'且类别包含'Dentists'的诊所。然后，利用这些诊所的business_id作为过滤条件，在向量数据库（Milvus）中对评论进行语义搜索，寻找与'patient, caring dentists and good patient care'最匹配的评论，从而找出符合条件的牙科诊所。",
+      "natural_question": "Which dental clinics in Metairie have patient, caring dentists and good patient care?",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "=": "Metairie"
+              },
+              "categories": {
+                "LIKE": "%Dentists%"
+              }
+            }
+          },
+          "result_var": "metairie_dentists",
+          "description": {
+            "narrative": "在SQLite的business数据库中查询位于Metairie的牙科诊所，获取它们的business_id和name。",
+            "example_query": "SELECT business_id, name FROM business WHERE city = 'Metairie' AND categories LIKE '%Dentists%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "reviews"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "IN": "metairie_dentists.business_id"
+              },
+              "text": {
+                "semantic_match": "patient, caring dentists and good patient care"
+              }
+            }
+          },
+          "result_var": "matching_reviews",
+          "description": {
+            "narrative": "将用户的查询文本转换为向量，并在Milvus的reviews集合中进行相似度搜索，同时使用步骤1中获取的business_id列表进行过滤，以找到评价最好的牙科诊所。",
+            "example_query": "collection.search(data=[query_vector], anns_field='embedding', param=search_params, limit=10, expr='business_id in [...]', output_fields=['business_id', 'text'])"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nfrom pymilvus import connections, Collection\nfrom sentence_transformers import SentenceTransformer\n\ndef find_caring_dentists_in_metairie():\n    # ==========================================\n    # Step 1: SQL Query to find dentists in Metairie\n    # ==========================================\n    sqlite_db_path = 'D:/Yelp-JSON/db/sqlite3/business.db'\n    \n    try:\n        conn = sqlite3.connect(sqlite_db_path)\n        cursor = conn.cursor()\n        \n        query = \"\"\"\n            SELECT business_id, name \n            FROM business \n            WHERE city = 'Metairie' \n              AND categories LIKE '%Dentists%';\n        \"\"\"\n        cursor.execute(query)\n        dentists = cursor.fetchall()\n        \n        if not dentists:\n            print(\"No dental clinics found in Metairie.\")\n            return\n            \n        # Create a mapping of business_id to name for later use\n        dentist_dict = {row[0]: row[1] for row in dentists}\n        business_ids = list(dentist_dict.keys())\n        \n    except sqlite3.Error as e:\n        print(f\"SQLite error: {e}\")\n        return\n    finally:\n        if conn:\n            conn.close()\n            \n    # ==========================================\n    # Step 2: Vector Search in Milvus for reviews\n    # ==========================================\n    try:\n        # Connect to Milvus\n        connections.connect(host='localhost', port='19530')\n        collection = Collection('reviews')\n        collection.load()\n        \n        # Initialize embedding model\n        model = SentenceTransformer('all-MiniLM-L6-v2')\n        search_text = \"patient, caring dentists and good patient care\"\n        query_vector = model.encode([search_text])[0].tolist()\n        \n        # Format business_ids for Milvus expression\n        formatted_ids = [f\"'{bid}'\" for bid in business_ids]\n        expr = f\"business_id in [{','.join(formatted_ids)}]\"\n        \n        search_params = {\n            \"metric_type\": \"L2\", \n            \"params\": {\"nprobe\": 10}\n        }\n        \n        # Perform vector search\n        results = collection.search(\n            data=[query_vector],\n            anns_field=\"embedding\",  # Assuming the vector field is named 'embedding'\n            param=search_params,\n            limit=10,\n            expr=expr,\n            output_fields=[\"business_id\", \"text\"]\n        )\n        \n        # ==========================================\n        # Step 3: Process and output results\n        # ==========================================\n        print(f\"\\nTop matching dental clinics in Metairie for '{search_text}':\\n\")\n        \n        seen_businesses = set()\n        for hits in results:\n            for hit in hits:\n                bid = hit.entity.get(\"business_id\")\n                text = hit.entity.get(\"text\")\n                \n                # Only print each business once (highest matching review)\n                if bid not in seen_businesses:\n                    clinic_name = dentist_dict.get(bid, \"Unknown Clinic\")\n                    print(f\"Clinic Name: {clinic_name}\")\n                    print(f\"Distance Score: {hit.distance:.4f}\")\n                    print(f\"Relevant Review Snippet: {text[:250]}...\\n\")\n                    print(\"-\" * 60 + \"\\n\")\n                    seen_businesses.add(bid)\n                    \n        if not seen_businesses:\n            print(\"No relevant reviews found for the specified criteria.\")\n            \n    except Exception as e:\n        print(f\"Milvus/Vector search error: {e}\")\n    finally:\n        # Disconnect from Milvus\n        connections.disconnect('default')\n\nif __name__ == '__main__':\n    find_caring_dentists_in_metairie()\n"
+    }
+  },
+{
+    "index": 54,
+    "question": "Which pet groomers in Boise are gentle with pets and have experienced groomers?",
+    "success": true,
+    "result": {
+      "analysis": "该问题需要结合结构化数据和非结构化数据进行混合查询。首先，需要从关系型数据库中筛选出位于'Boise'且类别包含'Pet Groomers'的商家。然后，利用这些商家的ID作为过滤条件，在向量数据库中对评论进行语义搜索，寻找提及'gentle with pets'（对宠物温柔）和'experienced groomers'（经验丰富的美容师）的评论，从而找到最符合用户需求的宠物美容店。",
+      "natural_question": "Which pet groomers in Boise are gentle with pets and have experienced groomers?",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "=": "Boise"
+              },
+              "categories": {
+                "LIKE": "%Pet Groomers%"
+              }
+            }
+          },
+          "result_var": "boise_groomers",
+          "description": {
+            "narrative": "在SQLite的business数据库中查询位于Boise且类别包含'Pet Groomers'的商家，获取它们的business_id和name。",
+            "example_query": "SELECT business_id, name FROM business WHERE city = 'Boise' AND categories LIKE '%Pet Groomers%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "reviews"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "IN": "boise_groomers.business_id"
+              },
+              "text": {
+                "semantic_match": "gentle with pets and experienced groomers"
+              }
+            }
+          },
+          "result_var": "top_reviews",
+          "description": {
+            "narrative": "将查询文本'gentle with pets and experienced groomers'转换为向量，在Milvus的reviews集合中进行相似度搜索，同时使用第一步获取的business_id列表进行标量过滤。",
+            "example_query": "collection.search(data=[query_vector], expr=f\"business_id in {business_ids}\", limit=5, output_fields=['business_id', 'text'])"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nfrom pymilvus import connections, Collection\nfrom sentence_transformers import SentenceTransformer\n\n# 步骤 1: 从SQLite获取Boise的宠物美容店\nsqlite_db_path = 'D:/Yelp-JSON/db/sqlite3/business.db'\nconn = sqlite3.connect(sqlite_db_path)\ncursor = conn.cursor()\n\nsql_query = \"\"\"\nSELECT business_id, name \nFROM business \nWHERE city = 'Boise' AND categories LIKE '%Pet Groomers%';\n\"\"\"\ncursor.execute(sql_query)\nboise_groomers = cursor.fetchall()\nconn.close()\n\n# 构建business_id到name的映射字典\nbusiness_dict = {row[0]: row[1] for row in boise_groomers}\nbusiness_ids = list(business_dict.keys())\n\nif not business_ids:\n    print(\"No pet groomers found in Boise.\")\nelse:\n    # 步骤 2: 在Milvus中进行语义搜索\n    # 连接到Milvus\n    connections.connect(host='localhost', port='19530')\n    collection = Collection('reviews')\n    collection.load()\n    \n    # 加载向量化模型并对查询进行编码\n    model = SentenceTransformer('all-MiniLM-L6-v2')\n    query_text = \"gentle with pets and experienced groomers\"\n    query_vector = model.encode([query_text])[0].tolist()\n    \n    # 格式化business_ids用于Milvus的expr过滤\n    # 注意：Milvus中字符串列表的格式要求\n    formatted_ids = \"[\" + \",\".join([f\"'{bid}'\" for bid in business_ids]) + \"]\"\n    expr = f\"business_id in {formatted_ids}\"\n    \n    search_params = {\n        \"metric_type\": \"L2\",\n        \"params\": {\"nprobe\": 10}\n    }\n    \n    print(f\"Searching for '{query_text}' among {len(business_ids)} pet groomers in Boise...\\n\")\n    \n    # 执行向量搜索\n    results = collection.search(\n        data=[query_vector],\n        anns_field=\"embedding\",\n        param=search_params,\n        limit=5,\n        expr=expr,\n        output_fields=[\"business_id\", \"text\"]\n    )\n    \n    # 步骤 3: 处理并输出结果\n    seen_businesses = set()\n    for hits in results:\n        for hit in hits:\n            b_id = hit.entity.get(\"business_id\")\n            text = hit.entity.get(\"text\")\n            distance = hit.distance\n            name = business_dict.get(b_id, \"Unknown Business\")\n            \n            # 为了结果多样性，每个商家最好只展示最相关的一条评论\n            if b_id not in seen_businesses:\n                print(f\"Business Name: {name}\")\n                print(f\"Relevance Score (L2 Distance): {distance:.4f}\")\n                print(f\"Review Snippet: {text[:250]}...\\n\")\n                print(\"-\" * 50)\n                seen_businesses.add(b_id)"
+    }
+  },
+{
+    "index": 55,
+    "question": "Which auto repair shops in Philadelphia are honest and reasonably priced?",
+    "success": true,
+    "result": {
+      "analysis": "为了找到费城（Philadelphia）既诚实又价格合理的汽车修理店，我们需要结合结构化数据过滤和非结构化文本的语义搜索。首先，利用SQLite数据库筛选出位于费城且类别包含'Auto Repair'的商铺，获取它们的ID。然后，利用Milvus向量数据库对评论文本进行语义搜索，寻找与'honest and reasonably priced'（诚实且价格合理）语义最接近的评论，并通过商铺ID列表进行过滤。最后将结果聚合，推荐匹配度最高的商铺。",
+      "natural_question": "Which auto repair shops in Philadelphia are honest and reasonably priced?",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "=": "Philadelphia"
+              },
+              "categories": {
+                "LIKE": "%Auto Repair%"
+              }
+            }
+          },
+          "result_var": "philly_auto_shops",
+          "description": {
+            "narrative": "在SQLite的business数据库中查询位于费城且类别包含'Auto Repair'的商铺，提取它们的business_id和基本信息。",
+            "example_query": "SELECT business_id, name, stars, review_count FROM business WHERE city = 'Philadelphia' AND categories LIKE '%Auto Repair%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "reviews"
+            ],
+            "filter_condition": {
+              "text": {
+                "semantic_match": "honest and reasonably priced"
+              },
+              "business_id": {
+                "IN": "philly_auto_shops.business_id"
+              }
+            }
+          },
+          "result_var": "matching_reviews",
+          "description": {
+            "narrative": "将查询文本'honest and reasonably priced'转化为向量，在Milvus的reviews集合中进行相似度搜索，并使用第一步获取的business_id列表作为过滤条件（expr），以确保只搜索这些特定车行的评论。",
+            "example_query": "collection.search(data=[query_vector], anns_field='embedding', param=search_params, limit=10, expr='business_id in [\"id1\", \"id2\", ...]', output_fields=['business_id', 'text'])"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [],
+            "filter_condition": {}
+          },
+          "result_var": "final_recommendations",
+          "description": {
+            "narrative": "解析Milvus的搜索结果，将匹配到的评论与SQLite中获取的商铺名称和星级信息进行关联，输出最终的推荐列表。",
+            "example_query": "Python data manipulation to map business_id from Milvus results to business details from SQLite."
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nfrom pymilvus import connections, Collection\nfrom sentence_transformers import SentenceTransformer\n\n# 数据库配置\nSQLITE_BUSINESS_PATH = \"D:/Yelp-JSON/db/sqlite3/business.db\"\nMILVUS_HOST = \"localhost\"\nMILVUS_PORT = \"19530\"\nMILVUS_COLLECTION = \"reviews\"\n\ndef find_honest_auto_shops():\n    # 1. 连接SQLite并获取费城的汽车修理店\n    print(\"Step 1: Fetching Auto Repair shops in Philadelphia from SQLite...\")\n    philly_auto_shops = {}\n    try:\n        conn = sqlite3.connect(SQLITE_BUSINESS_PATH)\n        cursor = conn.cursor()\n        \n        query = \"\"\"\n            SELECT business_id, name, stars, review_count, address \n            FROM business \n            WHERE city = 'Philadelphia' \n            AND categories LIKE '%Auto Repair%';\n        \"\"\"\n        cursor.execute(query)\n        rows = cursor.fetchall()\n        \n        for row in rows:\n            b_id, name, stars, review_count, address = row\n            philly_auto_shops[b_id] = {\n                \"name\": name,\n                \"stars\": stars,\n                \"review_count\": review_count,\n                \"address\": address\n            }\n            \n        print(f\"Found {len(philly_auto_shops)} auto repair shops in Philadelphia.\")\n    except Exception as e:\n        print(f\"SQLite Error: {e}\")\n        return\n    finally:\n        if 'conn' in locals():\n            conn.close()\n\n    if not philly_auto_shops:\n        print(\"No auto repair shops found in Philadelphia.\")\n        return\n\n    # 2. 连接Milvus并进行语义搜索\n    print(\"\\nStep 2: Searching for 'honest and reasonably priced' reviews in Milvus...\")\n    try:\n        # 加载向量化模型 (需与存入Milvus时使用的模型一致，此处以all-MiniLM-L6-v2为例)\n        model = SentenceTransformer('all-MiniLM-L6-v2')\n        search_text = \"honest and reasonably priced\"\n        query_vector = model.encode(search_text).tolist()\n\n        # 连接Milvus\n        connections.connect(host=MILVUS_HOST, port=MILVUS_PORT)\n        collection = Collection(MILVUS_COLLECTION)\n        collection.load()\n\n        # 准备过滤条件: business_id IN [...]\n        # 注意：如果列表过长，可能需要分批查询。这里假设几百个ID在Milvus的表达式长度限制内。\n        business_ids_list = list(philly_auto_shops.keys())\n        # 格式化为Milvus表达式所需的字符串格式\n        formatted_ids = \", \".join([f\"'{b_id}'\" for b_id in business_ids_list])\n        expr = f\"business_id in [{formatted_ids}]\"\n\n        search_params = {\n            \"metric_type\": \"L2\",  # 或 COSINE, 需与集合定义一致\n            \"params\": {\"nprobe\": 10}\n        }\n\n        results = collection.search(\n            data=[query_vector],\n            anns_field=\"embedding\", # 假设向量字段名为embedding\n            param=search_params,\n            limit=10, # 获取最匹配的10条评论\n            expr=expr,\n            output_fields=[\"business_id\", \"text\"] # 假设标量字段包含business_id和text\n        )\n\n        # 3. 整合结果并输出\n        print(\"\\nStep 3: Aggregating and displaying recommendations...\")\n        recommended_shops = []\n        seen_businesses = set()\n\n        for hits in results:\n            for hit in hits:\n                b_id = hit.entity.get(\"business_id\")\n                review_text = hit.entity.get(\"text\")\n                distance = hit.distance\n                \n                if b_id not in seen_businesses:\n                    seen_businesses.add(b_id)\n                    shop_info = philly_auto_shops[b_id]\n                    recommended_shops.append({\n                        \"name\": shop_info[\"name\"],\n                        \"address\": shop_info[\"address\"],\n                        \"stars\": shop_info[\"stars\"],\n                        \"distance\": distance,\n                        \"review_snippet\": review_text[:150] + \"...\"\n                    })\n\n        print(\"\\n--- Top Recommended Honest & Reasonably Priced Auto Shops in Philadelphia ---\")\n        for idx, shop in enumerate(recommended_shops, 1):\n            print(f\"{idx}. {shop['name']} (Stars: {shop['stars']})\")\n            print(f\"   Address: {shop['address']}\")\n            print(f\"   Relevant Review: \\\"{shop['review_snippet']}\\\"\")\n            print(f\"   Match Score (Distance): {shop['distance']:.4f}\\n\")\n\n    except Exception as e:\n        print(f\"Milvus/Vector Search Error: {e}\")\n    finally:\n        connections.disconnect(\"default\")\n\nif __name__ == \"__main__\":\n    find_honest_auto_shops()\n"
+    }
+  },
+{
+    "index": 56,
+    "question": "I'm a yoga beginner in Saint Petersburg. Which studios are beginner-friendly?",
+    "success": true,
+    "result": {
+      "analysis": "用户希望寻找位于Saint Petersburg（圣彼得堡）且对初学者友好的瑜伽馆。这是一个典型的跨数据库查询需求：首先需要从关系型数据库（SQLite）中筛选出特定城市和类别的商家，然后通过关联的评论ID，在向量数据库（Milvus）中进行语义搜索，寻找包含“初学者友好（beginner-friendly）”语义的评论，最后将结果聚合推荐给用户。",
+      "natural_question": "I'm a yoga beginner in Saint Petersburg. Which studios are beginner-friendly?",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business.db"
+            ],
+            "filter_condition": {
+              "city": {
+                "=": "Saint Petersburg"
+              },
+              "categories": {
+                "LIKE": "%Yoga%"
+              }
+            }
+          },
+          "result_var": "df_biz",
+          "description": {
+            "narrative": "在SQLite的business.db中查询位于Saint Petersburg且类别包含Yoga的营业中商家，获取business_id和基本信息。",
+            "example_query": "SELECT business_id, name, stars, address FROM business WHERE city = 'Saint Petersburg' AND categories LIKE '%Yoga%' AND is_open = 1"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "review.db"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "IN": "step_1_business_ids"
+              }
+            }
+          },
+          "result_var": "df_rev",
+          "description": {
+            "narrative": "在SQLite的review.db中，根据第一步获取的business_id，查询这些瑜伽馆的所有评论ID (review_id)，建立跨库映射基础。",
+            "example_query": "SELECT review_id, business_id, text FROM review WHERE business_id IN (...)"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "Milvus: reviews"
+            ],
+            "filter_condition": {
+              "review_id": {
+                "IN": "step_2_review_ids"
+              },
+              "semantic": {
+                "SIMILARITY": "beginner-friendly yoga studio"
+              }
+            }
+          },
+          "result_var": "recommended_studios",
+          "description": {
+            "narrative": "将用户的自然语言需求转化为向量，在Milvus的reviews集合中进行向量相似度搜索。为了精准匹配，使用表达式(expr)将搜索范围限定在第二步获取的review_id中。最后按商家聚合推荐。",
+            "example_query": "collection.search(data=query_vector, expr='review_id in [...]', limit=20)"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport pandas as pd\nfrom pymilvus import connections, Collection\nfrom sentence_transformers import SentenceTransformer\n\n# ==========================================\n# Step 1: 获取Saint Petersburg的瑜伽馆 (SQLite)\n# ==========================================\nprint(\"Step 1: Filtering Yoga studios in Saint Petersburg...\")\nconn_biz = sqlite3.connect(\"D:/Yelp-JSON/db/sqlite3/business.db\")\nquery_biz = \"\"\"\nSELECT business_id, name, stars, review_count, address\nFROM business\nWHERE city = 'Saint Petersburg'\n  AND categories LIKE '%Yoga%'\n  AND is_open = 1\n\"\"\"\ndf_biz = pd.read_sql_query(query_biz, conn_biz)\nconn_biz.close()\n\nbusiness_ids = df_biz['business_id'].tolist()\n\nif not business_ids:\n    print(\"No Yoga studios found in Saint Petersburg.\")\nelse:\n    # ==========================================\n    # Step 2: 获取这些瑜伽馆的评论ID (SQLite)\n    # ==========================================\n    print(f\"Found {len(business_ids)} Yoga studios. Fetching their reviews...\")\n    conn_rev = sqlite3.connect(\"D:/Yelp-JSON/db/sqlite3/review.db\")\n    placeholders = ','.join(['?'] * len(business_ids))\n    query_rev = f\"\"\"\n    SELECT review_id, business_id, text\n    FROM review\n    WHERE business_id IN ({placeholders})\n    \"\"\"\n    df_rev = pd.read_sql_query(query_rev, conn_rev, params=business_ids)\n    conn_rev.close()\n    \n    review_ids = df_rev['review_id'].tolist()\n    \n    if not review_ids:\n        print(\"No reviews found for these studios.\")\n    else:\n        # ==========================================\n        # Step 3: 语义搜索初学者友好的评论 (Milvus)\n        # ==========================================\n        print(f\"Found {len(review_ids)} reviews. Searching for beginner-friendly mentions in Milvus...\")\n        \n        # 连接Milvus\n        connections.connect(host='localhost', port='19530')\n        collection = Collection('reviews')\n        collection.load()\n        \n        # 编码查询向量\n        model = SentenceTransformer('all-MiniLM-L6-v2')\n        search_text = \"beginner-friendly yoga studio, great for beginners, welcoming to new students\"\n        query_vector = model.encode([search_text]).tolist()\n        \n        # 构建Milvus过滤表达式 (限制在目标城市的瑜伽馆评论中搜索)\n        # 注意: 如果review_ids非常多，可以分批查询或截断以防止超出表达式长度限制\n        valid_review_ids = review_ids[:2000] \n        formatted_rids = \"[\" + \",\".join([f\"'{rid}'\" for rid in valid_review_ids]) + \"]\"\n        expr = f\"review_id in {formatted_rids}\"\n        \n        search_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\n        \n        try:\n            # 假设向量字段名为 'embedding' (根据实际Schema可能为 'vector')\n            results = collection.search(\n                data=query_vector,\n                anns_field=\"embedding\", \n                param=search_params,\n                limit=30,  # 获取最相关的30条评论\n                expr=expr,\n                output_fields=[\"review_id\"]\n            )\n            \n            # 提取匹配的review_id和距离分数\n            matched_reviews = []\n            for hits in results:\n                for hit in hits:\n                    matched_reviews.append({\n                        \"review_id\": hit.entity.get(\"review_id\") if hit.entity.get(\"review_id\") else hit.id,\n                        \"semantic_distance\": hit.distance\n                    })\n            \n            df_matches = pd.DataFrame(matched_reviews)\n            \n            # ==========================================\n            # Step 4: 跨库数据合并与结果聚合 (Pandas)\n            # ==========================================\n            if not df_matches.empty:\n                # 关联 review.db 获取 business_id 和 评论文本\n                df_merged = pd.merge(df_matches, df_rev, on=\"review_id\")\n                # 关联 business.db 获取 商家名称和地址\n                df_final = pd.merge(df_merged, df_biz, on=\"business_id\")\n                \n                # 按商家聚合，计算每个商家有多少条“初学者友好”的评论，并取最佳语义分数\n                recommendations = df_final.groupby(['business_id', 'name', 'stars', 'address']).agg(\n                    beginner_mentions=('review_id', 'count'),\n                    best_match_score=('semantic_distance', 'min')\n                ).reset_index()\n                \n                # 排序：提及次数越多越好，语义距离越小越好\n                recommendations = recommendations.sort_values(by=['beginner_mentions', 'best_match_score'], ascending=[False, True])\n                \n                print(\"\\n=== Top Beginner-Friendly Yoga Studios in Saint Petersburg ===\")\n                for idx, row in recommendations.head(5).iterrows():\n                    print(f\"{idx+1}. {row['name']} ({row['stars']} Stars)\")\n                    print(f\"   Address: {row['address']}\")\n                    print(f\"   Beginner-friendly mentions found: {row['beginner_mentions']}\")\n                    print(\"   ---\")\n            else:\n                print(\"No specifically beginner-friendly reviews found among these studios.\")\n                \n        except Exception as e:\n            print(f\"Milvus search encountered an error (Please verify vector field name in schema): {e}\")\n"
+    }
+  },
+{
+    "index": 57,
+    "question": "Which dry cleaners in Sparks offer high-quality service and fast turnaround?",
+    "success": true,
+    "result": {
+      "analysis": "该问题需要结合地理位置、业务分类（结构化数据）以及服务质量的主观评价（非结构化文本数据）进行综合查询。首先需要在关系型数据库中筛选出位于'Sparks'且类别包含'Dry Cleaning'的商户，然后利用向量数据库在这些特定商户的评论中进行语义搜索，寻找与'high-quality service and fast turnaround'（高质量服务和快速周转）语义最相近的评论，从而推荐最佳的干洗店。",
+      "natural_question": "Which dry cleaners in Sparks offer high-quality service and fast turnaround?",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business.db"
+            ],
+            "filter_condition": {
+              "city": {
+                "=": "Sparks"
+              },
+              "categories": {
+                "LIKE": "%Dry Cleaning%"
+              }
+            }
+          },
+          "result_var": "sparks_dry_cleaners",
+          "description": {
+            "narrative": "在SQLite的business数据库中查询位于Sparks市且类别包含干洗（Dry Cleaning）的商户，提取它们的business_id、名称和地址等基本信息。",
+            "example_query": "SELECT business_id, name, address, stars FROM business WHERE city = 'Sparks' AND categories LIKE '%Dry Cleaning%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "Milvus: reviews"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "IN": "sparks_dry_cleaners.business_id"
+              },
+              "text_semantic": {
+                "SIMILAR_TO": "high-quality service and fast turnaround"
+              }
+            }
+          },
+          "result_var": "top_reviews",
+          "description": {
+            "narrative": "将'high-quality service and fast turnaround'转化为向量，在Milvus的reviews集合中进行相似度检索，同时使用步骤1获取的business_id列表作为过滤条件（expr），找出最符合要求的评论及对应的商户。",
+            "example_query": "collection.search(data=[query_vector], expr=\"business_id in ['id1', 'id2', ...]\", limit=5)"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nfrom pymilvus import connections, Collection\nfrom sentence_transformers import SentenceTransformer\n\ndef find_best_dry_cleaners():\n    # ==========================================\n    # Step 1: Query SQLite for Dry Cleaners in Sparks\n    # ==========================================\n    sqlite_path = \"D:/Yelp-JSON/db/sqlite3/business.db\"\n    print(f\"Connecting to SQLite at {sqlite_path}...\")\n    conn = sqlite3.connect(sqlite_path)\n    cursor = conn.cursor()\n    \n    sql_query = \"\"\"\n        SELECT business_id, name, address, stars \n        FROM business \n        WHERE city = 'Sparks' \n          AND categories LIKE '%Dry Cleaning%'\n    \"\"\"\n    cursor.execute(sql_query)\n    businesses = cursor.fetchall()\n    conn.close()\n    \n    if not businesses:\n        print(\"No dry cleaners found in Sparks in the database.\")\n        return\n        \n    # Create a dictionary for quick lookup and extract business_ids\n    business_dict = {b[0]: {'name': b[1], 'address': b[2], 'stars': b[3]} for b in businesses}\n    business_ids = list(business_dict.keys())\n    print(f\"Found {len(business_ids)} dry cleaners in Sparks.\")\n\n    # ==========================================\n    # Step 2: Vector Search in Milvus for Reviews\n    # ==========================================\n    print(\"Connecting to Milvus...\")\n    connections.connect(host='localhost', port='19530')\n    \n    collection_name = 'reviews'\n    collection = Collection(collection_name)\n    collection.load()  # Load collection into memory for searching\n    \n    # Generate embedding for the search query\n    print(\"Loading embedding model and encoding query...\")\n    model = SentenceTransformer('all-MiniLM-L6-v2')\n    search_text = \"high-quality service and fast turnaround\"\n    query_vector = model.encode([search_text])[0].tolist()\n    \n    # Prepare the filter expression using the business_ids from SQLite\n    # Note: Ensure the business_id field in Milvus is of type VARCHAR/String\n    expr = f\"business_id in {business_ids}\"\n    \n    search_params = {\n        \"metric_type\": \"L2\",  # Or \"IP\" depending on your index\n        \"params\": {\"nprobe\": 10}\n    }\n    \n    print(\"Searching for relevant reviews in Milvus...\")\n    results = collection.search(\n        data=[query_vector],\n        anns_field=\"embedding\",  # Replace with your actual vector field name if different (e.g., 'vector')\n        param=search_params,\n        limit=5,\n        expr=expr,\n        output_fields=[\"business_id\", \"text\"]  # Fetch business_id and review text\n    )\n    \n    # ==========================================\n    # Step 3: Process and Display Results\n    # ==========================================\n    print(f\"\\n--- Top Dry Cleaners in Sparks for '{search_text}' ---\\n\")\n    \n    # Keep track of displayed businesses to avoid duplicates if one business has multiple top reviews\n    displayed_businesses = set()\n    \n    for hits in results:\n        for hit in hits:\n            b_id = hit.entity.get(\"business_id\")\n            review_text = hit.entity.get(\"text\")\n            \n            if b_id not in displayed_businesses:\n                b_info = business_dict[b_id]\n                print(f\"Business Name : {b_info['name']}\")\n                print(f\"Address       : {b_info['address']}\")\n                print(f\"Overall Stars : {b_info['stars']}\")\n                print(f\"Match Score   : {hit.distance:.4f} (Lower L2 distance means higher similarity)\")\n                print(f\"Review Snippet: \\\"{review_text[:250]}...\\\"\\n\")\n                print(\"-\" * 60 + \"\\n\")\n                displayed_businesses.add(b_id)\n\nif __name__ == \"__main__\":\n    try:\n        find_best_dry_cleaners()\n    except Exception as e:\n        print(f\"An error occurred: {e}\")\n"
+    }
+  },
+{
+    "index": 58,
+    "question": "Which law firms in Saint Petersburg have experienced lawyers and good communication?",
+    "success": true,
+    "result": {
+      "analysis": "该问题需要结合结构化地理/类别过滤和非结构化语义搜索。首先，需要在SQLite的business表中筛选出位于'Saint Petersburg'且类别包含'Lawyers'或'Law Firms'的商家。其次，需要获取这些商家的所有评论ID。最后，在Milvus向量数据库中对这些特定评论进行语义搜索，寻找与'experienced lawyers and good communication'（经验丰富的律师和良好的沟通）最匹配的评论，从而推荐出符合条件的律所。",
+      "natural_question": "Which law firms in Saint Petersburg have experienced lawyers and good communication?",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "=": "Saint Petersburg"
+              },
+              "categories": {
+                "LIKE": "%Lawyers%"
+              }
+            }
+          },
+          "result_var": "business_mapping",
+          "description": {
+            "narrative": "在SQLite的business数据库中查询位于Saint Petersburg的律所，提取它们的business_id和name。",
+            "example_query": "SELECT business_id, name FROM business WHERE city = 'Saint Petersburg' AND (categories LIKE '%Lawyers%' OR categories LIKE '%Law Firms%')"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "review"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "IN": "business_mapping.keys()"
+              }
+            }
+          },
+          "result_var": "review_mapping",
+          "description": {
+            "narrative": "在SQLite的review数据库中，根据上一步获取的business_id，查询出所有相关的review_id，建立review_id到business_id的映射。",
+            "example_query": "SELECT review_id, business_id FROM review WHERE business_id IN (...)"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "Milvus: reviews"
+            ],
+            "filter_condition": {
+              "review_id": {
+                "IN": "review_mapping.keys()"
+              },
+              "vector": {
+                "SIMILARITY": "experienced lawyers and good communication"
+              }
+            }
+          },
+          "result_var": "top_law_firms",
+          "description": {
+            "narrative": "使用SentenceTransformer将查询文本向量化，然后在Milvus的reviews集合中进行向量相似度搜索。使用expr参数将搜索范围限制在上一步获取的review_id列表中，最后映射回律所名称。",
+            "example_query": "collection.search(data=[query_vector], expr=f\"review_id in {review_ids}\", limit=5)"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport json\nfrom pymilvus import connections, Collection\nfrom sentence_transformers import SentenceTransformer\n\n# 1. 数据库路径和配置\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\"\n}\nmilvus_host = 'localhost'\nmilvus_port = '19530'\ncollection_name = 'reviews'\n\ndef find_good_lawyers():\n    # ==========================================\n    # 步骤 1: 从 business.db 获取圣彼得堡的律所\n    # ==========================================\n    print(\"Step 1: Querying business.db for law firms in Saint Petersburg...\")\n    conn_biz = sqlite3.connect(sqlite_paths['business'])\n    cursor_biz = conn_biz.cursor()\n    \n    query_biz = \"\"\"\n        SELECT business_id, name \n        FROM business \n        WHERE city = 'Saint Petersburg' \n          AND (categories LIKE '%Lawyers%' OR categories LIKE '%Law Firms%')\n    \"\"\"\n    cursor_biz.execute(query_biz)\n    businesses = cursor_biz.fetchall()\n    conn_biz.close()\n    \n    if not businesses:\n        print(\"No law firms found in Saint Petersburg.\")\n        return\n        \n    business_mapping = {row[0]: row[1] for row in businesses}\n    business_ids = list(business_mapping.keys())\n    print(f\"Found {len(business_ids)} law firms in Saint Petersburg.\")\n\n    # ==========================================\n    # 步骤 2: 从 review.db 获取这些律所的评论ID\n    # ==========================================\n    print(\"Step 2: Querying review.db for associated reviews...\")\n    conn_rev = sqlite3.connect(sqlite_paths['review'])\n    cursor_rev = conn_rev.cursor()\n    \n    review_mapping = {} # review_id -> business_id\n    \n    # SQLite 的 IN 子句有变量数量限制 (通常是 999)，所以需要分块查询\n    chunk_size = 900\n    for i in range(0, len(business_ids), chunk_size):\n        chunk = business_ids[i:i+chunk_size]\n        placeholders = ','.join(['?'] * len(chunk))\n        query_rev = f\"SELECT review_id, business_id FROM review WHERE business_id IN ({placeholders})\"\n        cursor_rev.execute(query_rev, chunk)\n        for row in cursor_rev.fetchall():\n            review_mapping[row[0]] = row[1]\n            \n    conn_rev.close()\n    review_ids = list(review_mapping.keys())\n    print(f\"Found {len(review_ids)} reviews for these law firms.\")\n    \n    if not review_ids:\n        print(\"No reviews found for these law firms.\")\n        return\n\n    # ==========================================\n    # 步骤 3: 在 Milvus 中进行语义搜索\n    # ==========================================\n    print(\"Step 3: Performing vector search in Milvus...\")\n    # 连接 Milvus\n    connections.connect(\"default\", host=milvus_host, port=milvus_port)\n    collection = Collection(collection_name)\n    collection.load()\n    \n    # 加载向量化模型并对查询进行编码\n    print(\"Encoding search query...\")\n    model = SentenceTransformer('all-MiniLM-L6-v2')\n    search_text = \"experienced lawyers and good communication\"\n    query_vector = model.encode([search_text])[0].tolist()\n    \n    # 格式化 review_ids 用于 Milvus 的 expr 过滤\n    # 注意：如果 review_ids 数量极大，可能需要分批搜索。通常一个城市的特定类别评论数在 Milvus 的 IN 限制(65535)内\n    formatted_ids = [f\"'{rid}'\" for rid in review_ids]\n    expr = f\"review_id in [{','.join(formatted_ids)}]\"\n    \n    search_params = {\n        \"metric_type\": \"L2\",  # 或 \"IP\"，取决于索引类型\n        \"params\": {\"nprobe\": 10}\n    }\n    \n    print(\"Searching Milvus collection...\")\n    try:\n        results = collection.search(\n            data=[query_vector],\n            anns_field=\"embedding\", # 请根据实际 Milvus schema 中的向量字段名调整，通常为 'embedding' 或 'vector'\n            param=search_params,\n            limit=5, # 获取最匹配的5条评论\n            expr=expr,\n            output_fields=[\"review_id\"]\n        )\n        \n        # ==========================================\n        # 步骤 4: 处理并展示结果\n        # ==========================================\n        print(\"\\n--- Top Recommended Law Firms in Saint Petersburg ---\")\n        recommended_businesses = set()\n        \n        for hits in results:\n            for hit in hits:\n                rev_id = hit.entity.get(\"review_id\")\n                distance = hit.distance\n                \n                # 映射回 business_id 和 name\n                biz_id = review_mapping.get(rev_id)\n                biz_name = business_mapping.get(biz_id)\n                \n                if biz_id not in recommended_businesses:\n                    print(f\"Law Firm: {biz_name}\")\n                    print(f\"Business ID: {biz_id}\")\n                    print(f\"Matched Review ID: {rev_id} (Distance: {distance:.4f})\\n\")\n                    recommended_businesses.add(biz_id)\n                    \n    except Exception as e:\n        print(f\"An error occurred during Milvus search: {e}\")\n        print(\"Note: Please ensure the 'anns_field' matches your Milvus schema (e.g., 'embedding', 'vector', 'text_embedding').\")\n\nif __name__ == \"__main__\":\n    find_good_lawyers()\n"
+    }
+  },
+{
+    "index": 59,
+    "question": "I need a massage therapist in Tampa for back pain. Who specializes in pain relief?",
+    "success": true,
+    "result": {
+      "analysis": "该问题需要结合地理位置、业务类别（结构化数据）和特定服务效果（非结构化文本语义）进行查询。首先需要在SQLite中筛选出位于Tampa且类别包含按摩治疗（Massage Therapy）的商家，然后利用Milvus向量数据库在这些商家的评论中进行语义搜索，寻找提及“背痛（back pain）”和“缓解疼痛（pain relief）”的评论，从而找到最符合用户需求的按摩理疗师。",
+      "natural_question": "I need a massage therapist in Tampa for back pain. Who specializes in pain relief?",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "=": "Tampa"
+              },
+              "categories": {
+                "LIKE": "%Massage%"
+              }
+            }
+          },
+          "result_var": "tampa_massage_businesses",
+          "description": {
+            "narrative": "在SQLite的business数据库中查询位于Tampa且类别包含'Massage'的商家，获取它们的business_id和name。",
+            "example_query": "SELECT business_id, name, stars, review_count FROM business WHERE city = 'Tampa' AND categories LIKE '%Massage%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "reviews"
+            ],
+            "filter_condition": {
+              "text": {
+                "semantic_match": "massage therapist for back pain pain relief"
+              },
+              "business_id": {
+                "IN": "tampa_massage_businesses.business_id"
+              }
+            }
+          },
+          "result_var": "relevant_reviews",
+          "description": {
+            "narrative": "将用户的需求转化为向量，在Milvus的reviews集合中进行相似度搜索，同时使用第一步获取的business_id列表作为过滤条件，找出最相关的评论。",
+            "example_query": "client.search(collection_name='reviews', data=[query_vector], filter='business_id in [...]', limit=5, output_fields=['business_id', 'text', 'stars'])"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nfrom pymilvus import connections, Collection\nfrom sentence_transformers import SentenceTransformer\n\n# 1. 数据库连接配置\nSQLITE_BUSINESS_PATH = 'D:/Yelp-JSON/db/sqlite3/business.db'\nMILVUS_HOST = 'localhost'\nMILVUS_PORT = '19530'\nMILVUS_COLLECTION = 'reviews'\n\ndef find_massage_therapist_for_back_pain():\n    # 初始化向量化模型\n    print(\"Loading sentence transformer model...\")\n    model = SentenceTransformer('all-MiniLM-L6-v2')\n    \n    # 步骤 1: 在SQLite中查找Tampa的按摩店\n    print(\"\\nStep 1: Querying SQLite for Massage Therapists in Tampa...\")\n    try:\n        conn = sqlite3.connect(SQLITE_BUSINESS_PATH)\n        cursor = conn.cursor()\n        \n        sql_query = \"\"\"\n            SELECT business_id, name, stars, review_count \n            FROM business \n            WHERE city = 'Tampa' \n              AND (categories LIKE '%Massage Therapy%' OR categories LIKE '%Massage%')\n        \"\"\"\n        cursor.execute(sql_query)\n        businesses = cursor.fetchall()\n        \n        if not businesses:\n            print(\"No massage therapists found in Tampa.\")\n            return\n            \n        # 构建business_id列表和映射字典\n        business_dict = {row[0]: {'name': row[1], 'stars': row[2], 'review_count': row[3]} for row in businesses}\n        business_ids = list(business_dict.keys())\n        print(f\"Found {len(business_ids)} massage businesses in Tampa.\")\n        \n    except sqlite3.Error as e:\n        print(f\"SQLite error: {e}\")\n        return\n    finally:\n        if conn:\n            conn.close()\n\n    # 步骤 2: 在Milvus中进行语义搜索，寻找治疗背痛的评论\n    print(\"\\nStep 2: Searching Milvus for reviews mentioning back pain relief...\")\n    try:\n        connections.connect(host=MILVUS_HOST, port=MILVUS_PORT)\n        collection = Collection(MILVUS_COLLECTION)\n        collection.load()\n        \n        # 生成查询向量\n        search_text = \"massage therapist for back pain and pain relief\"\n        query_vector = model.encode(search_text).tolist()\n        \n        # 格式化business_id用于Milvus过滤\n        # 注意：如果business_ids列表过长，可能需要分批查询。这里假设Tampa的按摩店数量在Milvus表达式限制内\n        formatted_ids = \", \".join([f\"'{bid}'\" for bid in business_ids])\n        expr = f\"business_id in [{formatted_ids}]\"\n        \n        search_params = {\n            \"metric_type\": \"L2\",\n            \"params\": {\"nprobe\": 10}\n        }\n        \n        results = collection.search(\n            data=[query_vector],\n            anns_field=\"embedding\", # 假设向量字段名为embedding\n            param=search_params,\n            limit=5,\n            expr=expr,\n            output_fields=[\"business_id\", \"text\", \"stars\"]\n        )\n        \n        # 步骤 3: 处理和展示结果\n        print(\"\\n--- Recommended Massage Therapists for Back Pain in Tampa ---\")\n        if not results or not results[0]:\n            print(\"No specific reviews found mentioning back pain relief for these businesses.\")\n        else:\n            # 使用集合去重，避免同一个商家展示多次\n            seen_businesses = set()\n            for hit in results[0]:\n                bid = hit.entity.get('business_id')\n                if bid not in seen_businesses:\n                    seen_businesses.add(bid)\n                    b_info = business_dict[bid]\n                    review_text = hit.entity.get('text').replace('\\n', ' ').strip()\n                    # 截断过长的评论\n                    if len(review_text) > 150:\n                        review_text = review_text[:147] + \"...\"\n                        \n                    print(f\"\\nBusiness Name: {b_info['name']}\")\n                    print(f\"Overall Rating: {b_info['stars']} Stars ({b_info['review_count']} reviews)\")\n                    print(f\"Relevant Review Snippet: \\\"{review_text}\\\"\")\n                    print(f\"Review Rating: {hit.entity.get('stars')} Stars\")\n                    print(f\"Distance Score: {hit.distance:.4f}\")\n                    \n    except Exception as e:\n        print(f\"Milvus error: {e}\")\n    finally:\n        connections.disconnect(\"default\")\n\nif __name__ == '__main__':\n    find_massage_therapist_for_back_pain()\n"
+    }
+  },
+{
+    "index": 60,
+    "question": "I really want fresh seafood in Clearwater. Where can I get the best quality fish?",
+    "success": true,
+    "result": {
+      "analysis": "用户希望在Clearwater寻找提供最新鲜、高质量海鲜的餐厅。这需要结合结构化数据过滤和非结构化文本的语义搜索。首先，我们需要在SQLite的business数据库中筛选出位于Clearwater且类别包含'Seafood'的餐厅。然后，我们需要在Milvus向量数据库中对这些餐厅的评论进行语义搜索，寻找与'fresh seafood best quality fish'（新鲜海鲜、最优质的鱼）语义最接近的评论，从而找到真正以海鲜新鲜度闻名的餐厅。",
+      "natural_question": "I really want fresh seafood in Clearwater. Where can I get the best quality fish?",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business.db"
+            ],
+            "filter_condition": {
+              "city": {
+                "=": "Clearwater"
+              },
+              "categories": {
+                "LIKE": "%Seafood%"
+              }
+            }
+          },
+          "result_var": "clearwater_seafood_businesses",
+          "description": {
+            "narrative": "连接SQLite的business数据库，查询位于Clearwater且类别包含Seafood的餐厅，提取它们的business_id、名称、星级和地址。",
+            "example_query": "SELECT business_id, name, stars, address FROM business WHERE city = 'Clearwater' AND categories LIKE '%Seafood%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "Milvus: reviews"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "IN": "clearwater_seafood_businesses的ID列表"
+              },
+              "text_semantic": {
+                "SIMILARITY": "fresh seafood best quality fish"
+              }
+            }
+          },
+          "result_var": "top_seafood_reviews",
+          "description": {
+            "narrative": "使用SentenceTransformer将用户的查询意图'fresh seafood best quality fish'转换为向量。在Milvus的reviews集合中进行向量相似度搜索，同时使用expr参数将搜索范围限制在第一步获取的Clearwater海鲜餐厅的business_id列表中。",
+            "example_query": "collection.search(data=[query_vector], expr=f'business_id in {business_ids}', limit=10)"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [],
+            "filter_condition": {}
+          },
+          "result_var": "final_recommendations",
+          "description": {
+            "narrative": "将Milvus返回的包含高相关性评论的business_id与第一步获取的餐厅详细信息进行映射，去重后按相关度顺序输出推荐给用户的餐厅列表。",
+            "example_query": "Python data mapping and formatting"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nfrom pymilvus import connections, Collection\nfrom sentence_transformers import SentenceTransformer\n\n# ==========================================\n# Step 1: Get Seafood businesses in Clearwater\n# ==========================================\n# Connect to SQLite business database\nbusiness_db_path = 'D:/Yelp-JSON/db/sqlite3/business.db'\nconn = sqlite3.connect(business_db_path)\ncursor = conn.cursor()\n\n# Query for seafood restaurants in Clearwater\nsql_query = \"\"\"\n    SELECT business_id, name, stars, address\n    FROM business\n    WHERE city = 'Clearwater' AND categories LIKE '%Seafood%'\n\"\"\"\ncursor.execute(sql_query)\nbusinesses = cursor.fetchall()\nconn.close()\n\n# Create a dictionary for quick lookup and extract business_ids\nbusiness_dict = {b[0]: {'name': b[1], 'stars': b[2], 'address': b[3]} for b in businesses}\nbusiness_ids = list(business_dict.keys())\n\nif not business_ids:\n    print(\"No seafood restaurants found in Clearwater.\")\nelse:\n    # ==========================================\n    # Step 2: Vector search for fresh/quality fish\n    # ==========================================\n    # Connect to Milvus\n    connections.connect(host='localhost', port='19530')\n    collection = Collection('reviews')\n    collection.load()\n\n    # Initialize embedding model\n    model = SentenceTransformer('all-MiniLM-L6-v2')\n    search_text = \"fresh seafood best quality fish\"\n    query_vector = model.encode([search_text])[0].tolist()\n\n    # Prepare search parameters\n    search_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\n    \n    # Format business_ids for Milvus expression (list of strings)\n    expr_condition = f\"business_id in {business_ids}\"\n\n    # Execute vector search with scalar filtering\n    try:\n        results = collection.search(\n            data=[query_vector],\n            anns_field=\"embedding\",  # Replace with your actual vector field name if different\n            param=search_params,\n            limit=10,\n            expr=expr_condition,\n            output_fields=[\"business_id\"]\n        )\n\n        # ==========================================\n        # Step 3: Process and display results\n        # ==========================================\n        print(\"🐟 Top recommended places for fresh seafood in Clearwater based on reviews:\\n\")\n        seen_businesses = set()\n        \n        for hits in results:\n            for hit in hits:\n                b_id = hit.entity.get(\"business_id\")\n                if b_id not in seen_businesses:\n                    b_info = business_dict[b_id]\n                    print(f\"⭐ {b_info['name']} (Rating: {b_info['stars']} stars)\")\n                    print(f\"   📍 Address: {b_info['address']}\")\n                    print(f\"   🔍 Relevance Score (L2 Distance): {hit.distance:.4f}\\n\")\n                    seen_businesses.add(b_id)\n                    \n        if not seen_businesses:\n            print(\"Could not find specific reviews mentioning fresh/quality fish for these restaurants.\")\n            \n    except Exception as e:\n        print(f\"An error occurred during vector search: {e}\")\n"
+    }
+  }
+]
