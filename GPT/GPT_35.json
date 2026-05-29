@@ -1,0 +1,110 @@
+[
+{
+    "index": 341,
+    "question": "Which nearby restaurants are busiest at night?",
+    "success": true,
+    "result": {
+      "analysis": "用户想要找到附近在夜间最繁忙的餐厅。这个问题需要：1) 从SQLite中查询餐厅类别的商家信息；2) 从SQLite的checkin表中分析夜间时段（如18:00-23:59）的签到数据来衡量繁忙程度；3) 可以利用Neo4j图数据库查找地理位置上'附近'的餐厅关系。由于用户没有指定具体位置，我们将找出整体夜间签到量最高的餐厅，并展示它们的地理聚类关系。",
+      "natural_question": "哪些附近的餐厅在夜间最繁忙？",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "graph"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "categories": {
+                "$contains": "Restaurants"
+              },
+              "is_open": {
+                "$eq": 1
+              }
+            }
+          },
+          "result_var": "restaurant_list",
+          "description": {
+            "narrative": "从SQLite的business数据库中查询所有类别包含'Restaurants'且仍在营业的商家，获取business_id、名称、地址、城市、星级、经纬度等信息。",
+            "example_query": "SELECT business_id, name, address, city, state, stars, latitude, longitude, review_count FROM business WHERE categories LIKE '%Restaurants%' AND is_open = 1;"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "checkin"
+            ],
+            "filter_condition": {
+              "time_slot": {
+                "$in": [
+                  "18:00",
+                  "19:00",
+                  "20:00",
+                  "21:00",
+                  "22:00",
+                  "23:00"
+                ]
+              }
+            }
+          },
+          "result_var": "night_checkin_counts",
+          "description": {
+            "narrative": "从SQLite的checkin数据库中解析签到时间数据，筛选出夜间时段（18:00-23:59）的签到记录，按business_id聚合统计夜间签到总次数，以此衡量夜间繁忙程度。",
+            "example_query": "SELECT business_id, date FROM checkin;"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "restaurant_list",
+              "night_checkin_counts"
+            ]
+          },
+          "result_var": "busiest_night_restaurants",
+          "description": {
+            "narrative": "将餐厅信息与夜间签到数据进行关联合并，按夜间签到次数降序排列，获取夜间最繁忙的Top 20餐厅。",
+            "example_query": "JOIN restaurant_list with night_checkin_counts ON business_id, ORDER BY night_checkin_count DESC LIMIT 20"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "neo4j"
+            ],
+            "filter_condition": {
+              "relationship": "NEARBY",
+              "node_type": "Business"
+            }
+          },
+          "result_var": "nearby_clusters",
+          "description": {
+            "narrative": "利用Neo4j图数据库查询这些繁忙餐厅之间的地理邻近关系（NEARBY关系），找出哪些繁忙餐厅彼此靠近，形成夜间热门餐饮区域聚类。",
+            "example_query": "MATCH (b1:Business)-[:NEARBY]->(b2:Business) WHERE b1.business_id IN $top_ids AND b2.business_id IN $top_ids RETURN b1.name, b2.name, b1.business_id, b2.business_id"
+          }
+        },
+        {
+          "step": 5,
+          "parameters": {
+            "ms_names": [
+              "busiest_night_restaurants",
+              "nearby_clusters"
+            ]
+          },
+          "result_var": "final_result",
+          "description": {
+            "narrative": "整合所有数据，输出夜间最繁忙的餐厅列表及其附近关系，包括餐厅名称、地址、星级、夜间签到次数、以及附近的其他繁忙餐厅。",
+            "example_query": "FORMAT and DISPLAY final merged results"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport pandas as pd\nfrom neo4j import GraphDatabase\nfrom collections import defaultdict\nimport warnings\nwarnings.filterwarnings('ignore')\n\n# ============================================================\n# Database Configuration\n# ============================================================\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nneo4j_uri = 'bolt://localhost:7687'\nneo4j_auth = ('neo4j', 'password')\n\n# ============================================================\n# Step 1: Query restaurants from SQLite business database\n# ============================================================\nprint(\"=\" * 70)\nprint(\"Step 1: Fetching restaurant data from business database...\")\nprint(\"=\" * 70)\n\ntry:\n    conn_business = sqlite3.connect(sqlite_paths['business'])\n    query_restaurants = \"\"\"\n        SELECT business_id, name, address, city, state, stars, \n               latitude, longitude, review_count, categories\n        FROM business \n        WHERE categories LIKE '%Restaurants%' \n          AND is_open = 1\n    \"\"\"\n    restaurant_df = pd.read_sql_query(query_restaurants, conn_business)\n    conn_business.close()\n    print(f\"Found {len(restaurant_df)} open restaurants.\")\nexcept Exception as e:\n    print(f\"Error querying business database: {e}\")\n    restaurant_df = pd.DataFrame()\n\n# ============================================================\n# Step 2: Parse checkin data and count night-time checkins\n# ============================================================\nprint(\"\\n\" + \"=\" * 70)\nprint(\"Step 2: Analyzing night-time checkin data (18:00 - 23:59)...\")\nprint(\"=\" * 70)\n\ntry:\n    conn_checkin = sqlite3.connect(sqlite_paths['checkin'])\n    query_checkins = \"SELECT business_id, date FROM checkin\"\n    checkin_df = pd.read_sql_query(query_checkins, conn_checkin)\n    conn_checkin.close()\n    \n    # Parse checkin dates - the 'date' column contains comma-separated timestamps\n    night_checkin_counts = defaultdict(int)\n    night_hours = set(range(18, 24))  # 18:00 to 23:59\n    \n    for _, row in checkin_df.iterrows():\n        business_id = row['business_id']\n        dates_str = row['date']\n        if dates_str:\n            timestamps = [t.strip() for t in str(dates_str).split(',')]\n            for ts in timestamps:\n                try:\n                    # Format: \"2018-07-06 22:35:11\" or similar\n                    parts = ts.split(' ')\n                    if len(parts) >= 2:\n                        time_part = parts[1]\n                        hour = int(time_part.split(':')[0])\n                        if hour in night_hours:\n                            night_checkin_counts[business_id] += 1\n                except (ValueError, IndexError):\n                    continue\n    \n    night_df = pd.DataFrame([\n        {'business_id': bid, 'night_checkin_count': count}\n        for bid, count in night_checkin_counts.items()\n    ])\n    print(f\"Processed checkin data for {len(night_df)} businesses with night activity.\")\n    \nexcept Exception as e:\n    print(f\"Error querying checkin database: {e}\")\n    night_df = pd.DataFrame(columns=['business_id', 'night_checkin_count'])\n\n# ============================================================\n# Step 3: Merge restaurant info with night checkin counts\n# ============================================================\nprint(\"\\n\" + \"=\" * 70)\nprint(\"Step 3: Merging restaurant data with night-time checkin counts...\")\nprint(\"=\" * 70)\n\nif not restaurant_df.empty and not night_df.empty:\n    merged_df = restaurant_df.merge(night_df, on='business_id', how='inner')\n    merged_df = merged_df.sort_values('night_checkin_count', ascending=False)\n    top_restaurants = merged_df.head(20).reset_index(drop=True)\n    print(f\"Top {len(top_restaurants)} busiest restaurants at night:\")\n    print(\"-\" * 70)\n    for idx, row in top_restaurants.iterrows():\n        print(f\"  {idx+1:2d}. {row['name']}\")\n        print(f\"      Address: {row['address']}, {row['city']}, {row['state']}\")\n        print(f\"      Stars: {row['stars']} | Reviews: {row['review_count']} | Night Checkins: {row['night_checkin_count']}\")\n        print(f\"      Categories: {row['categories'][:80]}...\" if len(str(row['categories'])) > 80 else f\"      Categories: {row['categories']}\")\n        print()\nelse:\n    top_restaurants = pd.DataFrame()\n    print(\"No data available to merge.\")\n\n# ============================================================\n# Step 4: Query Neo4j for nearby relationships among top restaurants\n# ============================================================\nprint(\"\\n\" + \"=\" * 70)\nprint(\"Step 4: Querying Neo4j for nearby restaurant clusters...\")\nprint(\"=\" * 70)\n\nnearby_pairs = []\ntry:\n    driver = GraphDatabase.driver(neo4j_uri, auth=neo4j_auth)\n    \n    if not top_restaurants.empty:\n        top_ids = top_restaurants['business_id'].tolist()\n        \n        with driver.session() as session:\n            # Query nearby relationships between top busiest restaurants\n            cypher_query = \"\"\"\n                MATCH (b1:Business)-[:NEARBY]-(b2:Business)\n                WHERE b1.business_id IN $top_ids \n                  AND b2.business_id IN $top_ids\n                  AND b1.business_id < b2.business_id\n                RETURN b1.business_id AS id1, b1.name AS name1,\n                       b2.business_id AS id2, b2.name AS name2\n            \"\"\"\n            result = session.run(cypher_query, top_ids=top_ids)\n            nearby_pairs = [dict(record) for record in result]\n            \n            # Also find nearby restaurants not in top list but close to top ones\n            cypher_nearby = \"\"\"\n                MATCH (b1:Business)-[:NEARBY]-(b2:Business)\n                WHERE b1.business_id IN $top_ids\n                RETURN b1.business_id AS source_id, b1.name AS source_name,\n                       b2.business_id AS nearby_id, b2.name AS nearby_name\n                LIMIT 50\n            \"\"\"\n            result_nearby = session.run(cypher_nearby, top_ids=top_ids)\n            all_nearby = [dict(record) for record in result_nearby]\n    \n    driver.close()\n    \n    if nearby_pairs:\n        print(f\"Found {len(nearby_pairs)} nearby pairs among top busiest restaurants:\")\n        for pair in nearby_pairs:\n            print(f\"  - {pair['name1']}  <-->  {pair['name2']}\")\n    else:\n        print(\"No direct NEARBY relationships found among top restaurants.\")\n        print(\"Showing nearby restaurants to the busiest ones:\")\n        if 'all_nearby' in dir() and all_nearby:\n            for nb in all_nearby[:20]:\n                print(f\"  - {nb['source_name']}  -->  nearby: {nb['nearby_name']}\")\n\nexcept Exception as e:\n    print(f\"Neo4j query error (this is optional): {e}\")\n    print(\"Continuing with distance-based proximity analysis...\")\n    \n    # Fallback: Calculate geographic proximity using lat/lon\n    if not top_restaurants.empty:\n        from math import radians, cos, sin, asin, sqrt\n        \n        def haversine(lon1, lat1, lon2, lat2):\n            \"\"\"Calculate distance in km between two points.\"\"\"\n            lon1, lat1, lon2, lat2 = map(radians, [lon1, lat1, lon2, lat2])\n            dlon = lon2 - lon1\n            dlat = lat2 - lat1\n            a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2\n            c = 2 * asin(sqrt(a))\n            return 6371 * c\n        \n        print(\"\\nNearby restaurant clusters (within 2 km of each other):\")\n        print(\"-\" * 70)\n        cluster_found = False\n        for i, r1 in top_restaurants.iterrows():\n            nearby_list = []\n            for j, r2 in top_restaurants.iterrows():\n                if i >= j:\n                    continue\n                try:\n                    dist = haversine(\n                        float(r1['longitude']), float(r1['latitude']),\n                        float(r2['longitude']), float(r2['latitude'])\n                    )\n                    if dist <= 2.0:  # within 2 km\n                        nearby_list.append((r2['name'], round(dist, 2)))\n                except:\n                    continue\n            if nearby_list:\n                cluster_found = True\n                print(f\"\\n  {r1['name']} ({r1['city']}) - {r1['night_checkin_count']} night checkins\")\n                for name, dist in nearby_list:\n                    print(f\"    --> {name} ({dist} km away)\")\n        \n        if not cluster_found:\n            print(\"  No restaurants within 2km of each other in the top 20.\")\n\n# ============================================================\n# Step 5: Final Summary\n# ============================================================\nprint(\"\\n\" + \"=\" * 70)\nprint(\"FINAL SUMMARY: Busiest Nearby Restaurants at Night\")\nprint(\"=\" * 70)\n\nif not top_restaurants.empty:\n    # Group by city to show clusters\n    city_groups = top_restaurants.groupby('city')\n    print(f\"\\nTop night-busy restaurants across {len(city_groups)} cities:\\n\")\n    \n    for city, group in city_groups:\n        total_night = group['night_checkin_count'].sum()\n        print(f\"\\n  📍 {city} (Total night checkins: {total_night})\")\n        print(f\"  {'-' * 50}\")\n        for _, row in group.iterrows():\n            print(f\"    🍽️  {row['name']}\")\n            print(f\"       ⭐ {row['stars']} stars | 🌙 {row['night_checkin_count']} night checkins\")\n            print(f\"       📫 {row['address']}\")\n    \n    print(f\"\\n{'=' * 70}\")\n    print(f\"Total restaurants analyzed: {len(restaurant_df)}\")\n    print(f\"Restaurants with night activity: {len(merged_df) if 'merged_df' in dir() else 'N/A'}\")\n    print(f\"Top busiest shown: {len(top_restaurants)}\")\n    print(f\"Night hours analyzed: 18:00 - 23:59\")\nelse:\n    print(\"No results available.\")\n\nprint(\"\\nDone!\")\n"
+    }
+  }
+]

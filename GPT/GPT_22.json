@@ -1,0 +1,1093 @@
+[
+{
+    "index": 211,
+    "question": "I want to grab a coffee near my place in Tampa on weekday mornings, but I don’t want to wait in long lines. Are there any coffee shops that people say are usually not too crowded in the morning?",
+    "success": true,
+    "result": {
+      "analysis": "你的问题本质上是“在Tampa附近（或Tampa市内）找咖啡店，并且在工作日早晨通常不拥挤/不用排长队”。在Yelp多库架构中，可以用：1) SQLite的business表筛选Tampa咖啡店候选；2) SQLite的checkin表用工作日早晨(例如07:00-11:00)的签到强度作为“拥挤度”代理指标；3) Milvus对review/tip文本做语义检索，找出包含“早上不拥挤/不用排队/很快”等语义证据的店；最后融合排序并输出带证据的推荐列表。难点在于：checkin的时间字符串需要解析聚合；Milvus集合字段名可能与你本地略有差异，需要做容错。",
+      "natural_question": "在Tampa（靠近我住的地方）工作日早晨想买咖啡，但不想排长队。有没有一些咖啡店被评价为早上通常不太拥挤？",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "SQLite: business.db (business表)"
+            ],
+            "filter_condition": {
+              "city": {
+                "=": "Tampa"
+              },
+              "categories": {
+                "LIKE": [
+                  "%Coffee%",
+                  "%Coffee & Tea%"
+                ]
+              }
+            }
+          },
+          "result_var": "coffee_candidates",
+          "description": {
+            "narrative": "从business库筛出Tampa的咖啡相关商家作为候选集，并保留坐标、评分、review_count等字段。若你提供家庭经纬度，可再做半径过滤（例如5km）。",
+            "example_query": "SELECT business_id, name, address, city, state, postal_code, latitude, longitude, stars, review_count, categories\nFROM business\nWHERE city = 'Tampa'\n  AND (categories LIKE '%Coffee%' OR categories LIKE '%Coffee & Tea%');"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "SQLite: checkin.db (checkin表)"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "IN": "coffee_candidates.business_id"
+              },
+              "time_window": {
+                "weekday": "Mon-Fri",
+                "hour_range": "07:00-11:00"
+              }
+            }
+          },
+          "result_var": "morning_crowd_scores",
+          "description": {
+            "narrative": "解析checkin.date（通常是逗号分隔的时间戳），筛选工作日早晨的签到次数，计算每家店的“工作日早晨平均签到次数/天”或“总次数”作为拥挤度代理，值越低表示越不挤。",
+            "example_query": "SELECT business_id, date\nFROM checkin\nWHERE business_id = ?;"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "Milvus: reviews collection",
+              "Milvus: tips collection"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "IN": "coffee_candidates.business_id"
+              },
+              "semantic_query": {
+                "IN": [
+                  "usually not crowded in the morning",
+                  "no line in the morning",
+                  "quick service weekday morning",
+                  "quiet mornings"
+                ]
+              }
+            }
+          },
+          "result_var": "not_crowded_evidence",
+          "description": {
+            "narrative": "对review与tip向量库做语义检索，找出与“早晨不拥挤/不用排队/很快/安静”相关的文本，并按business聚合得到语义得分与证据片段。",
+            "example_query": "Milvus search (pseudo): collection.search(data=[query_embedding], anns_field='embedding', limit=50, expr='business_id in [..]')"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "SQLite: review.db (review表)",
+              "SQLite: tip.db (tip表)"
+            ],
+            "filter_condition": {
+              "review_id/tip_id": {
+                "IN": "not_crowded_evidence.ids"
+              }
+            }
+          },
+          "result_var": "evidence_texts",
+          "description": {
+            "narrative": "把Milvus命中的review_id/tip_id回表到SQLite取原文（更稳定、可控），截取包含关键信息的片段作为推荐理由。",
+            "example_query": "SELECT review_id, business_id, text, date, stars FROM review WHERE review_id IN (...);"
+          }
+        },
+        {
+          "step": 5,
+          "parameters": {
+            "ms_names": [
+              "Python融合排序"
+            ],
+            "filter_condition": {
+              "ranking": {
+                "low_morning_checkins": "ascending",
+                "semantic_not_crowded_score": "descending",
+                "min_evidence_count": ">=1"
+              }
+            }
+          },
+          "result_var": "final_recommendations",
+          "description": {
+            "narrative": "融合：更低的工作日早晨checkin强度 + 更高的“早晨不拥挤”语义证据分数，输出Top N咖啡店（可带距离、评分、证据摘录）。",
+            "example_query": "N/A (Python ranking)"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\\nimport math\\nimport re\\nfrom datetime import datetime\\nfrom collections import defaultdict\\n\\n# Optional but recommended\\ntry:\\n    import pandas as pd\\nexcept ImportError:\\n    pd = None\\n\\n# Milvus\\ntry:\\n    from pymilvus import connections, Collection\\nexcept ImportError:\\n    connections = None\\n    Collection = None\\n\\n# Embedding model (local)\\ntry:\\n    from sentence_transformers import SentenceTransformer\\nexcept ImportError:\\n    SentenceTransformer = None\\n\\n\\n# ----------------------------\\n# Fixed configuration (per requirement)\\n# ----------------------------\\nsqlite_paths = {\\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\\n}\\n\\nMILVUS_CONFIG = {\\n    'milvus_collections': {\\n        'reviews': 'reviews',\\n        'photos': 'photo_vector',\\n        'tips': 'milvus_tip'\\n    },\\n    'milvus_host': 'localhost',\\n    'milvus_port': '19530'\\n}\\n\\nNEO4J_CONFIG = {\\n    'neo4j_uri': 'bolt://localhost:7687',\\n    'neo4j_auth': ('neo4j', 'password')\\n}\\n\\n\\n# ----------------------------\\n# Helpers\\n# ----------------------------\\n\\ndef haversine_km(lat1, lon1, lat2, lon2):\\n    R = 6371.0\\n    phi1, phi2 = math.radians(lat1), math.radians(lat2)\\n    dphi = math.radians(lat2 - lat1)\\n    dlambda = math.radians(lon2 - lon1)\\n    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2\\n    return 2 * R * math.asin(math.sqrt(a))\\n\\n\\ndef parse_checkin_dates(date_str):\\n    \\\"\\\"\\\"Yelp checkin 'date' often looks like:\\n    '2018-10-05 00:41:22, 2018-10-05 18:12:03, ...'\\n    Return list[datetime].\\n    \\\"\\\"\\\"\\n    if not date_str:\\n        return []\\n    parts = [p.strip() for p in date_str.split(',') if p.strip()]\\n    dts = []\\n    for p in parts:\\n        # robust parse\\n        try:\\n            dts.append(datetime.strptime(p, \"%Y-%m-%d %H:%M:%S\"))\\n        except ValueError:\\n            # fallback: sometimes has microseconds or timezone; try to sanitize\\n            p2 = re.sub(r\"\\\\.\\\\d+\", \"\", p)\\n            try:\\n                dts.append(datetime.strptime(p2, \"%Y-%m-%d %H:%M:%S\"))\\n            except ValueError:\\n                continue\\n    return dts\\n\\n\\ndef safe_in_chunks(items, chunk_size=800):\\n    for i in range(0, len(items), chunk_size):\\n        yield items[i:i+chunk_size]\\n\\n\\n# ----------------------------\\n# Step 1: get coffee candidates in Tampa\\n# ----------------------------\\n\\ndef load_coffee_candidates(city=\"Tampa\", user_lat=None, user_lon=None, radius_km=5.0, limit=None):\\n    conn = sqlite3.connect(sqlite_paths[\"business\"])\\n    conn.row_factory = sqlite3.Row\\n\\n    sql = \"\"\"\\n    SELECT business_id, name, address, city, state, postal_code,\\n           latitude, longitude, stars, review_count, categories\\n    FROM business\\n    WHERE city = ?\\n      AND (categories LIKE '%Coffee%' OR categories LIKE '%Coffee & Tea%')\\n    \"\"\"\\n    rows = conn.execute(sql, (city,)).fetchall()\\n    conn.close()\\n\\n    candidates = []\\n    for r in rows:\\n        item = dict(r)\\n        # optional radius filter\\n        if user_lat is not None and user_lon is not None:\\n            if item.get(\"latitude\") is None or item.get(\"longitude\") is None:\\n                continue\\n            dist = haversine_km(user_lat, user_lon, item[\"latitude\"], item[\"longitude\"])\\n            if dist > radius_km:\\n                continue\\n            item[\"distance_km\"] = dist\\n        candidates.append(item)\\n\\n    # Optional limit for speed\\n    if limit is not None:\\n        candidates = sorted(candidates, key=lambda x: x.get(\"review_count\", 0), reverse=True)[:limit]\\n\\n    return candidates\\n\\n\\n# ----------------------------\\n# Step 2: compute weekday morning crowd proxy from checkins\\n# ----------------------------\\n\\ndef compute_weekday_morning_checkins(business_ids, start_hour=7, end_hour=11):\\n    \\\"\\\"\\\"Return dict business_id -> crowd_score.\\n    crowd_score here: average weekday-morning checkins per unique weekday date (Mon-Fri).\\n    \\\"\\\"\\\"\\n    if not business_ids:\\n        return {}\\n\\n    conn = sqlite3.connect(sqlite_paths[\"checkin\"])\\n    conn.row_factory = sqlite3.Row\\n\\n    # fetch checkins in chunks\\n    by_biz_dates = {}\\n    for chunk in safe_in_chunks(business_ids, chunk_size=700):\\n        placeholders = \",\".join([\"?\"] * len(chunk))\\n        sql = f\"SELECT business_id, date FROM checkin WHERE business_id IN ({placeholders})\"\\n        for r in conn.execute(sql, chunk).fetchall():\\n            by_biz_dates[r[\"business_id\"]] = r[\"date\"]\\n\\n    conn.close()\\n\\n    crowd = {}\\n    for bid in business_ids:\\n        date_str = by_biz_dates.get(bid)\\n        dts = parse_checkin_dates(date_str)\\n        # filter weekday morning\\n        morning = [dt for dt in dts if dt.weekday() < 5 and start_hour <= dt.hour < end_hour]\\n        if not morning:\\n            crowd[bid] = 0.0\\n            continue\\n\\n        # compute per unique weekday date\\n        per_day = defaultdict(int)\\n        for dt in morning:\\n            per_day[dt.date()] += 1\\n        avg_per_day = sum(per_day.values()) / max(len(per_day), 1)\\n        crowd[bid] = float(avg_per_day)\\n\\n    return crowd\\n\\n\\n# ----------------------------\\n# Step 3: Milvus semantic evidence search\\n# ----------------------------\\n\\ndef milvus_connect():\\n    if connections is None:\\n        raise RuntimeError(\"pymilvus not installed. pip install pymilvus\")\\n    connections.connect(alias=\"default\", host=MILVUS_CONFIG['milvus_host'], port=MILVUS_CONFIG['milvus_port'])\\n\\n\\ndef get_embedder(model_name=\"sentence-transformers/all-MiniLM-L6-v2\"):\\n    if SentenceTransformer is None:\\n        raise RuntimeError(\"sentence-transformers not installed. pip install sentence-transformers\")\\n    return SentenceTransformer(model_name)\\n\\n\\ndef milvus_search_evidence(business_ids, topk_per_query=50):\\n    \\\"\\\"\\\"Search in reviews and tips collections for 'not crowded morning' semantics.\\n    Returns list of hits: {source, id_field, id_value, business_id, score}\\n\\n    Notes: Field names in your Milvus schema may differ. This code tries common names.\\n    \\\"\\\"\\\"\\n    milvus_connect()\\n    embedder = get_embedder()\\n\\n    queries = [\\n        \"usually not crowded in the morning\",\\n        \"not too busy in the morning\",\\n        \"no line in the morning\",\\n        \"quick service weekday morning\",\\n        \"quiet mornings\",\\n        \"never a long line before work\"\\n    ]\\n\\n    results = []\\n\\n    def search_collection(collection_name, source_label):\\n        col = Collection(collection_name)\\n        col.load()\\n\\n        # try to infer field names\\n        schema_fields = {f.name for f in col.schema.fields}\\n        # guess embedding field\\n        emb_field = \"embedding\" if \"embedding\" in schema_fields else (\"vector\" if \"vector\" in schema_fields else None)\\n        if emb_field is None:\\n            raise RuntimeError(f\"Cannot find embedding field in Milvus collection {collection_name}. Fields={schema_fields}\")\\n\\n        # guess business_id field\\n        biz_field = \"business_id\" if \"business_id\" in schema_fields else None\\n\\n        # guess primary id field\\n        id_candidates = [\"review_id\", \"tip_id\", \"id\", \"pk\", \"uuid\"]\\n        id_field = next((c for c in id_candidates if c in schema_fields), None)\\n        if id_field is None:\\n            # fallback to first field if it looks like primary\\n            id_field = col.schema.fields[0].name\\n\\n        # expr filter if supported\\n        expr = None\\n        if biz_field is not None and business_ids:\\n            # Milvus expr expects like: business_id in [\"..\",\"..\"] if it's string\\n            # We'll build a JSON-like list with quotes.\\n            biz_list = \",\".join([f'\"{bid}\"' for bid in business_ids[:5000]])\\n            expr = f\"{biz_field} in [{biz_list}]\"\\n\\n        search_params = {\"metric_type\": \"IP\", \"params\": {\"nprobe\": 10}}\\n\\n        for q in queries:\\n            vec = embedder.encode([q], normalize_embeddings=True).tolist()\\n            try:\\n                hits = col.search(\\n                    data=vec,\\n                    anns_field=emb_field,\\n                    param=search_params,\\n                    limit=topk_per_query,\\n                    expr=expr,\\n                    output_fields=[f for f in [biz_field, id_field] if f is not None]\\n                )\\n            except Exception as e:\\n                # Some schemas use L2 or different params; retry with L2\\n                search_params2 = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\\n                hits = col.search(\\n                    data=vec,\\n                    anns_field=emb_field,\\n                    param=search_params2,\\n                    limit=topk_per_query,\\n                    expr=expr,\\n                    output_fields=[f for f in [biz_field, id_field] if f is not None]\\n                )\\n\\n            for h in hits[0]:\\n                ent = h.entity\\n                bid = None\\n                if biz_field is not None and biz_field in ent:\\n                    bid = ent[biz_field]\\n                # if expr not available, we'll filter later\\n                id_val = ent[id_field] if id_field in ent else None\\n                results.append({\\n                    \"source\": source_label,\\n                    \"id_field\": id_field,\\n                    \"id_value\": id_val,\\n                    \"business_id\": bid,\\n                    \"score\": float(h.score)\\n                })\\n\\n    # Search both\\n    search_collection(MILVUS_CONFIG['milvus_collections']['reviews'], \"review\")\\n    search_collection(MILVUS_CONFIG['milvus_collections']['tips'], \"tip\")\\n\\n    # Post-filter if business_id not returned or expr not supported\\n    biz_set = set(business_ids)\\n    filtered = []\\n    for r in results:\\n        if r[\"business_id\"] is None:\\n            # can't use it; keep but will be hard to join later\\n            continue\\n        if r[\"business_id\"] in biz_set:\\n            filtered.append(r)\\n\\n    return filtered\\n\\n\\n# ----------------------------\\n# Step 4: fetch evidence texts from SQLite\\n# ----------------------------\\n\\ndef fetch_review_texts(review_ids):\\n    if not review_ids:\\n        return {}\\n    conn = sqlite3.connect(sqlite_paths[\"review\"])\\n    conn.row_factory = sqlite3.Row\\n\\n    out = {}\\n    for chunk in safe_in_chunks(list(review_ids), chunk_size=800):\\n        placeholders = \",\".join([\"?\"] * len(chunk))\\n        sql = f\"\"\"\\n        SELECT review_id, business_id, date, stars, text\\n        FROM review\\n        WHERE review_id IN ({placeholders})\\n        \"\"\"\\n        for r in conn.execute(sql, chunk).fetchall():\\n            out[r[\"review_id\"]] = dict(r)\\n    conn.close()\\n    return out\\n\\n\\ndef fetch_tip_texts(tip_ids):\\n    if not tip_ids:\\n        return {}\\n    conn = sqlite3.connect(sqlite_paths[\"tip\"])\\n    conn.row_factory = sqlite3.Row\\n\\n    out = {}\\n    for chunk in safe_in_chunks(list(tip_ids), chunk_size=800):\\n        placeholders = \",\".join([\"?\"] * len(chunk))\\n        sql = f\"\"\"\\n        SELECT user_id, business_id, date, text\\n        FROM tip\\n        WHERE rowid IN ({placeholders})\\n        \"\"\"\\n        # NOTE: Yelp tip table may not have tip_id; sometimes uses rowid or (user_id,business_id,date).\\n        # Adjust this query to your schema if you have a real tip_id column.\\n        for r in conn.execute(sql, chunk).fetchall():\\n            out[str(r[\"date\"]) + \"|\" + r[\"business_id\"] + \"|\" + r[\"user_id\"]] = dict(r)\\n\\n    conn.close()\\n    return out\\n\\n\\ndef snippet(text, keywords=(\"crowded\", \"busy\", \"line\", \"wait\", \"morning\", \"quick\", \"quiet\"), max_len=220):\\n    if not text:\\n        return \"\"\\n    t = re.sub(r\"\\\\s+\", \" \", text).strip()\\n    # find first keyword occurrence\\n    idx = None\\n    low = t.lower()\\n    for kw in keywords:\\n        j = low.find(kw)\\n        if j != -1:\\n            idx = j\\n            break\\n    if idx is None:\\n        return (t[:max_len] + \"...\") if len(t) > max_len else t\\n    start = max(idx - 60, 0)\\n    end = min(idx + 160, len(t))\\n    s = t[start:end]\\n    if start > 0:\\n        s = \"...\" + s\\n    if end < len(t):\\n        s = s + \"...\"\\n    return s\\n\\n\\n# ----------------------------\\n# Step 5: fuse ranking\\n# ----------------------------\\n\\ndef recommend_not_crowded_coffee(city=\"Tampa\", user_lat=None, user_lon=None, radius_km=5.0,\\n                                 morning_start_hour=7, morning_end_hour=11, topn=10,\\n                                 candidate_limit=400):\\n    # 1) candidates\\n    candidates = load_coffee_candidates(city=city, user_lat=user_lat, user_lon=user_lon, radius_km=radius_km, limit=candidate_limit)\\n    if not candidates:\\n        return []\\n\\n    biz_ids = [c[\"business_id\"] for c in candidates]\\n    biz_map = {c[\"business_id\"]: c for c in candidates}\\n\\n    # 2) crowd proxy\\n    crowd = compute_weekday_morning_checkins(biz_ids, start_hour=morning_start_hour, end_hour=morning_end_hour)\\n\\n    # 3) milvus evidence\\n    try:\\n        hits = milvus_search_evidence(biz_ids, topk_per_query=60)\\n    except Exception as e:\\n        hits = []\\n\\n    # Aggregate evidence per business\\n    per_biz = defaultdict(lambda: {\"semantic_score\": 0.0, \"review_ids\": set(), \"tip_keys\": set(), \"evidence\": []})\\n    for h in hits:\\n        bid = h[\"business_id\"]\\n        per_biz[bid][\"semantic_score\"] += h[\"score\"]\\n        if h[\"source\"] == \"review\" and h[\"id_value\"] is not None:\\n            per_biz[bid][\"review_ids\"].add(str(h[\"id_value\"]))\\n        elif h[\"source\"] == \"tip\" and h[\"id_value\"] is not None:\\n            # tip id may not be stable depending on schema\\n            per_biz[bid][\"tip_keys\"].add(str(h[\"id_value\"]))\\n\\n    # 4) fetch texts for reviews (tips are schema-dependent; we only reliably fetch reviews here)\\n    all_review_ids = set()\\n    for bid, agg in per_biz.items():\\n        all_review_ids |= agg[\"review_ids\"]\\n    review_texts = fetch_review_texts(all_review_ids)\\n\\n    # attach snippets\\n    for bid, agg in per_biz.items():\\n        # take up to 2 review snippets\\n        snippets = []\\n        for rid in list(agg[\"review_ids\"])[:5]:\\n            r = review_texts.get(rid)\\n            if not r:\\n                continue\\n            snippets.append({\\n                \"source\": \"review\",\\n                \"date\": r.get(\"date\"),\\n                \"stars\": r.get(\"stars\"),\\n                \"text_snippet\": snippet(r.get(\"text\", \"\"))\\n            })\\n            if len(snippets) >= 2:\\n                break\\n        agg[\"evidence\"] = snippets\\n\\n    # 5) fuse ranking\\n    recs = []\\n    for bid in biz_ids:\\n        b = biz_map[bid]\\n        semantic = per_biz.get(bid, {}).get(\"semantic_score\", 0.0)\\n        evid = per_biz.get(bid, {}).get(\"evidence\", [])\\n        crowd_score = crowd.get(bid, 0.0)\\n\\n        # Composite score: prefer low crowd_score, high semantic\\n        # crowd component: invert with (1 / (1 + crowd))\\n        composite = (1.2 * semantic) + (3.0 * (1.0 / (1.0 + crowd_score)))\\n\\n        # If no evidence at all, downweight (still allow if checkins are very low)\\n        if not evid:\\n            composite *= 0.55\\n\\n        recs.append({\\n            \"business_id\": bid,\\n            \"name\": b.get(\"name\"),\\n            \"address\": b.get(\"address\"),\\n            \"city\": b.get(\"city\"),\\n            \"stars\": b.get(\"stars\"),\\n            \"review_count\": b.get(\"review_count\"),\\n            \"categories\": b.get(\"categories\"),\\n            \"distance_km\": b.get(\"distance_km\"),\\n            \"weekday_morning_avg_checkins\": crowd_score,\\n            \"semantic_not_crowded_score\": semantic,\\n            \"composite_score\": composite,\\n            \"evidence\": evid\\n        })\\n\\n    # sort\\n    recs.sort(key=lambda x: x[\"composite_score\"], reverse=True)\\n    return recs[:topn]\\n\\n\\nif __name__ == \"__main__\":\\n    # -------- User-tunable parameters --------\\n    CITY = \"Tampa\"\\n\\n    # If you want truly \"near my place\", fill these in; otherwise leave as None and it will use CITY only.\\n    USER_LAT = None   # e.g., 27.9506\\n    USER_LON = None   # e.g., -82.4572\\n    RADIUS_KM = 5.0\\n\\n    MORNING_START_HOUR = 7\\n    MORNING_END_HOUR = 11\\n    TOPN = 10\\n\\n    recs = recommend_not_crowded_coffee(\\n        city=CITY,\\n        user_lat=USER_LAT,\\n        user_lon=USER_LON,\\n        radius_km=RADIUS_KM,\\n        morning_start_hour=MORNING_START_HOUR,\\n        morning_end_hour=MORNING_END_HOUR,\\n        topn=TOPN,\\n        candidate_limit=400\\n    )\\n\\n    # Pretty print\\n    for i, r in enumerate(recs, 1):\\n        dist = r.get(\"distance_km\")\\n        dist_s = f\"{dist:.2f} km\" if isinstance(dist, (int, float)) else \"N/A\"\\n        print(f\"\\n#{i} {r['name']} | stars={r.get('stars')} ({r.get('review_count')} reviews) | dist={dist_s}\")\\n        print(f\"   Address: {r.get('address')}, {r.get('city')}\")\\n        print(f\"   Weekday morning avg checkins (proxy): {r.get('weekday_morning_avg_checkins'):.3f}\")\\n        print(f\"   Semantic 'not crowded' score: {r.get('semantic_not_crowded_score'):.3f}\")\\n        if r.get(\"evidence\"):\\n            for ev in r[\"evidence\"]:\\n                print(f\"   Evidence ({ev['source']} | {ev.get('date')} | stars={ev.get('stars')}): {ev.get('text_snippet')}\")\\n        else:\\n            print(\"   Evidence: (no strong review/tip semantic hit found; ranked mostly by low morning checkins)\")\\n"
+    }
+  },
+{
+    "index": 212,
+    "question": "I’m thinking about ordering takeout from a highly rated Italian restaurant in Reno, but I’m worried it might be slow during dinner time. Do recent reviews mention long waits or slow service in the evenings?",
+    "success": true,
+    "result": {
+      "analysis": "用户想在Reno点一家高评分意大利餐厅外卖，但担心晚餐时段出餐/服务慢；需要从“近期review文本”里找是否出现“长等/慢服务”并且与“晚上/晚餐时段”相关的描述。该问题核心是：先定位候选餐厅（Reno + Italian + 高评分 + 支持Takeout），再取近一段时间的评论，做文本证据抽取（关键词/正则）并可选用向量检索（Milvus）做语义补召回，最后按餐厅汇总：近期评论数、提及慢/等待的数量、带日期与星级的原文片段。难点在于：Yelp review通常没有结构化“就餐时段”字段，只能靠文本提及（dinner/evening/tonight/7pm等）推断；以及Milvus向量维度/embedding模型可能与本地环境不一致，因此代码需提供可运行的降级路径（纯SQLite文本检索）。",
+      "natural_question": "Reno 高评分意大利餐厅（可外卖）的近期评论里，是否有人提到晚餐/晚上时段等待很久或服务很慢？",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "SQLite.business.db (business表)"
+            ],
+            "filter_condition": {
+              "city": {
+                "=": "Reno"
+              },
+              "state": {
+                "=": "NV"
+              },
+              "categories": {
+                "LIKE": "%Italian%"
+              },
+              "stars": {
+                ">=": 4.0
+              },
+              "review_count": {
+                ">=": 50
+              },
+              "attributes": {
+                "LIKE_ANY": [
+                  "%RestaurantsTakeOut%True%",
+                  "%TakeOut%True%",
+                  "%Delivery%True%"
+                ]
+              }
+            }
+          },
+          "result_var": "candidate_businesses",
+          "description": {
+            "narrative": "从business库中筛选Reno的意大利餐厅，限定高评分与一定评论量，并尽量筛出支持外卖/外带（attributes里包含takeout/delivery为True的模式）。得到候选餐厅列表（business_id、name、stars等）。",
+            "example_query": "SELECT business_id, name, stars, review_count, categories, attributes\nFROM business\nWHERE city='Reno' AND state='NV'\n  AND categories LIKE '%Italian%'\n  AND stars >= 4.0 AND review_count >= 50\n  AND (\n    attributes LIKE '%RestaurantsTakeOut%True%'\n    OR attributes LIKE '%TakeOut%True%'\n    OR attributes LIKE '%Delivery%True%'\n  )\nORDER BY stars DESC, review_count DESC\nLIMIT 20;"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "SQLite.review.db (review表)"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "IN": "candidate_businesses.business_id"
+              },
+              "date": {
+                ">=": "近365天(可配置)"
+              }
+            }
+          },
+          "result_var": "recent_reviews",
+          "description": {
+            "narrative": "拉取候选餐厅近一年（可配置）的评论文本、日期与星级，为后续判断“慢/等待”和“晚餐/晚上”做准备。",
+            "example_query": "SELECT review_id, business_id, stars, date, text\nFROM review\nWHERE business_id IN (..business_ids..)\n  AND date >= '2025-03-23'\nORDER BY date DESC;"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "Python文本规则(正则/关键词)"
+            ],
+            "filter_condition": {
+              "text": {
+                "REGEX": "wait/slow/forever/over an hour 等 + dinner/evening/night/7pm 等"
+              }
+            }
+          },
+          "result_var": "evidence_mentions",
+          "description": {
+            "narrative": "在近期评论中，用关键词/正则标记两类信号：A) 等待/很慢（wait, took forever, slow service等）；B) 晚餐/晚上（dinner, evening, tonight, night, 7pm等）。优先输出同时满足A+B的评论作为“晚餐时段慢”的证据；同时也统计仅A的评论（可能未写时段）。",
+            "example_query": "（示意，SQLite LIKE版）\nSELECT *\nFROM review\nWHERE text LIKE '%wait%' AND (text LIKE '%dinner%' OR text LIKE '%evening%' OR text LIKE '%7pm%');"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "Milvus.reviews collection(可选)"
+            ],
+            "filter_condition": {
+              "semantic_query": {
+                "=": "long wait / slow service during dinner time"
+              },
+              "business_id": {
+                "IN": "candidate_businesses.business_id (若Milvus schema支持)"
+              }
+            }
+          },
+          "result_var": "vector_hits_optional",
+          "description": {
+            "narrative": "可选：用Milvus对“晚餐时段等待很久/服务慢”做语义检索，补充召回那些不用wait/slow关键词但表达相近的评论。若本地无embedding模型或Milvus字段不支持过滤，则自动降级跳过，不影响主流程输出。",
+            "example_query": "（示意，pymilvus）\ncollection.search(\n  data=[query_vector],\n  anns_field='embedding',\n  param={'metric_type':'IP','params':{'nprobe':16}},\n  limit=20,\n  expr=\"business_id in ['...','...']\"\n)"
+          }
+        },
+        {
+          "step": 5,
+          "parameters": {
+            "ms_names": [
+              "Python汇总输出"
+            ]
+          },
+          "result_var": "final_report",
+          "description": {
+            "narrative": "按餐厅汇总：近365天评论数、提及慢/等待数、明确提到晚餐/晚上且慢/等待数，并列出若干条最新证据（日期、星级、片段）。用于回答“最近评论有没有在晚餐时段抱怨慢”。",
+            "example_query": "（Python聚合）groupby(business_id).agg(total_reviews, slow_count, slow_evening_count)"
+          }
+        }
+      ],
+      "complete_code": "import re\nimport sqlite3\nfrom datetime import datetime, timedelta\nfrom collections import defaultdict\n\n# ----------------------------\n# Fixed configuration (as required)\n# ----------------------------\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nmilvus_cfg = {\n    'milvus_collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    },\n    'milvus_host': 'localhost',\n    'milvus_port': '19530'\n}\n\nneo4j_cfg = {\n    'neo4j_uri': 'bolt://localhost:7687',\n    'neo4j_auth': ('neo4j', 'password')\n}\n\n# ----------------------------\n# User-adjustable parameters\n# ----------------------------\nCITY = \"Reno\"\nSTATE = \"NV\"\nCATEGORY_KEYWORD = \"Italian\"\nMIN_STARS = 4.0\nMIN_REVIEW_COUNT = 50\nLOOKBACK_DAYS = 365\nTOP_N_BUSINESSES = 20\nMAX_EVIDENCE_PER_BIZ = 5\n\n# Keywords/regex\nWAIT_PATTERNS = [\n    r\"\\bwait\\b\", r\"\\bwaiting\\b\", r\"long\\s+wait\", r\"took\\s+forever\",\n    r\"\\bslow\\b\", r\"slow\\s+service\", r\"over\\s+an\\s+hour\",\n    r\"\\b(45|50|60|75|90)\\s*minutes\\b\", r\"\\bdelayed\\b\", r\"\\bline\\b\"\n]\nEVENING_PATTERNS = [\n    r\"\\bdinner\\b\", r\"\\bevening\\b\", r\"\\btonight\\b\", r\"\\bnight\\b\",\n    r\"\\b[5-9]\\s*pm\\b\", r\"\\b[5-9]:[0-5][0-9]\\s*pm\\b\", r\"\\bp\\.m\\.\\b\"\n]\n\nwait_re = re.compile(\"|\".join(WAIT_PATTERNS), re.IGNORECASE)\nevening_re = re.compile(\"|\".join(EVENING_PATTERNS), re.IGNORECASE)\n\n\ndef safe_connect(path: str):\n    conn = sqlite3.connect(path)\n    conn.row_factory = sqlite3.Row\n    return conn\n\n\ndef extract_snippet(text: str, match: re.Match, window: int = 80) -> str:\n    if not text:\n        return \"\"\n    start = max(match.start() - window, 0)\n    end = min(match.end() + window, len(text))\n    snippet = text[start:end].replace(\"\\n\", \" \").strip()\n    return snippet\n\n\ndef main():\n    # ----------------------------\n    # Step 1: Candidate Italian takeout businesses in Reno\n    # ----------------------------\n    business_conn = safe_connect(sqlite_paths[\"business\"])\n    review_conn = safe_connect(sqlite_paths[\"review\"])\n\n    # NOTE: attributes format differs by dataset build. We use LIKE heuristics for robustness.\n    biz_sql = \"\"\"\n    SELECT business_id, name, stars, review_count, categories, attributes\n    FROM business\n    WHERE city = ? AND state = ?\n      AND categories LIKE ?\n      AND stars >= ?\n      AND review_count >= ?\n      AND (\n        attributes LIKE '%RestaurantsTakeOut%True%'\n        OR attributes LIKE '%TakeOut%True%'\n        OR attributes LIKE '%Delivery%True%'\n      )\n    ORDER BY stars DESC, review_count DESC\n    LIMIT ?\n    \"\"\"\n\n    candidates = business_conn.execute(\n        biz_sql,\n        (CITY, STATE, f\"%{CATEGORY_KEYWORD}%\", MIN_STARS, MIN_REVIEW_COUNT, TOP_N_BUSINESSES)\n    ).fetchall()\n\n    if not candidates:\n        print(\"No candidate businesses found with the current filters.\")\n        return\n\n    biz_by_id = {row[\"business_id\"]: dict(row) for row in candidates}\n    biz_ids = list(biz_by_id.keys())\n\n    # ----------------------------\n    # Step 2: Pull recent reviews\n    # ----------------------------\n    cutoff = (datetime.today() - timedelta(days=LOOKBACK_DAYS)).strftime(\"%Y-%m-%d\")\n\n    # SQLite IN clause\n    placeholders = \",\".join([\"?\"] * len(biz_ids))\n    rev_sql = f\"\"\"\n    SELECT review_id, business_id, stars, date, text\n    FROM review\n    WHERE business_id IN ({placeholders})\n      AND date >= ?\n    ORDER BY date DESC\n    \"\"\"\n\n    recent_reviews = review_conn.execute(rev_sql, (*biz_ids, cutoff)).fetchall()\n\n    # ----------------------------\n    # Step 3: Find evidence mentions\n    # ----------------------------\n    stats = defaultdict(lambda: {\n        \"total_recent_reviews\": 0,\n        \"slow_or_wait_mentions\": 0,\n        \"slow_or_wait_evening_mentions\": 0,\n        \"evidence\": []\n    })\n\n    for r in recent_reviews:\n        bid = r[\"business_id\"]\n        text = r[\"text\"] or \"\"\n        stats[bid][\"total_recent_reviews\"] += 1\n\n        m_wait = wait_re.search(text)\n        m_evening = evening_re.search(text)\n\n        if m_wait:\n            stats[bid][\"slow_or_wait_mentions\"] += 1\n\n        # prioritize reviews that mention both wait/slow and evening/dinner\n        if m_wait and m_evening:\n            stats[bid][\"slow_or_wait_evening_mentions\"] += 1\n            # pick snippet around the wait match (usually the complaint)\n            snippet = extract_snippet(text, m_wait)\n            if len(stats[bid][\"evidence\"]) < MAX_EVIDENCE_PER_BIZ:\n                stats[bid][\"evidence\"].append({\n                    \"date\": r[\"date\"],\n                    \"review_stars\": r[\"stars\"],\n                    \"review_id\": r[\"review_id\"],\n                    \"snippet\": snippet\n                })\n\n    # ----------------------------\n    # Step 4 (optional): Milvus semantic recall\n    #   - This block is best-effort; it will NOT break the main result if unavailable.\n    # ----------------------------\n    vector_notes = []\n    try:\n        from pymilvus import connections, Collection, utility\n\n        connections.connect(\n            alias=\"default\",\n            host=milvus_cfg['milvus_host'],\n            port=milvus_cfg['milvus_port']\n        )\n\n        col_name = milvus_cfg['milvus_collections']['reviews']\n        if not utility.has_collection(col_name):\n            vector_notes.append(f\"Milvus collection '{col_name}' not found; skipped vector search.\")\n        else:\n            # Try to embed query (may fail if sentence-transformers isn't installed)\n            try:\n                from sentence_transformers import SentenceTransformer\n                model = SentenceTransformer(\"all-MiniLM-L6-v2\")\n                query_text = \"long wait slow service during dinner evening\"\n                qv = model.encode([query_text], normalize_embeddings=True)\n\n                col = Collection(col_name)\n                col.load()\n\n                # Attempt to guess embedding field\n                schema_fields = [f.name for f in col.schema.fields]\n                # Common choices\n                embed_field = None\n                for candidate in (\"embedding\", \"vector\", \"text_vector\", \"review_vector\"):\n                    if candidate in schema_fields:\n                        embed_field = candidate\n                        break\n                if embed_field is None:\n                    vector_notes.append(f\"Milvus collection '{col_name}' has no known embedding field; fields={schema_fields}. Skipped.\")\n                else:\n                    # If schema supports business_id filtering, try it; otherwise run without expr\n                    expr = None\n                    if \"business_id\" in schema_fields:\n                        # Milvus string escaping: use double quotes inside expr\n                        quoted = \",\".join([f'\"{x}\"' for x in biz_ids[:200]])\n                        expr = f\"business_id in [{quoted}]\"\n\n                    search_params = {\"metric_type\": \"IP\", \"params\": {\"nprobe\": 16}}\n                    hits = col.search(\n                        data=qv,\n                        anns_field=embed_field,\n                        param=search_params,\n                        limit=20,\n                        expr=expr,\n                        output_fields=[f for f in (\"review_id\", \"business_id\", \"date\") if f in schema_fields]\n                    )\n\n                    # We only report that vector search ran; we keep the main answer based on SQLite evidence.\n                    vector_notes.append(f\"Milvus vector search executed on field '{embed_field}'. Returned top {len(hits[0]) if hits else 0} hits (not fully merged).\")\n            except Exception as e:\n                vector_notes.append(f\"Milvus available but embedding/search step failed: {e}. Skipped vector search.\")\n\n    except Exception as e:\n        vector_notes.append(f\"Milvus not available or connection failed: {e}. Skipped vector search.\")\n\n    # ----------------------------\n    # Step 5: Summarize and print a report\n    # ----------------------------\n    # Rank: prioritize businesses with more 'slow+evening' mentions, then higher stars\n    def rank_key(bid: str):\n        s = stats[bid]\n        b = biz_by_id[bid]\n        return (\n            s[\"slow_or_wait_evening_mentions\"],\n            s[\"slow_or_wait_mentions\"],\n            s[\"total_recent_reviews\"],\n            b.get(\"stars\", 0),\n            b.get(\"review_count\", 0)\n        )\n\n    ranked = sorted(biz_ids, key=rank_key, reverse=True)\n\n    print(\"=\" * 80)\n    print(f\"Question: Do recent reviews mention long waits/slow service in the evenings for highly rated Italian takeout in {CITY}, {STATE}?\\n\")\n    print(f\"Filters: category~{CATEGORY_KEYWORD}, stars>={MIN_STARS}, review_count>={MIN_REVIEW_COUNT}, lookback_days={LOOKBACK_DAYS}\\n\")\n\n    if vector_notes:\n        print(\"[Vector search notes]\")\n        for n in vector_notes:\n            print(\"-\", n)\n        print()\n\n    for bid in ranked:\n        b = biz_by_id[bid]\n        s = stats[bid]\n\n        # Only show those with any relevant evidence; if none, still show brief line\n        print(\"-\" * 80)\n        print(f\"{b['name']}  (stars={b['stars']}, review_count={b['review_count']})\")\n        print(f\"business_id={bid}\")\n        print(f\"Recent reviews: {s['total_recent_reviews']} | Mentions wait/slow: {s['slow_or_wait_mentions']} | Mentions wait/slow + evening/dinner: {s['slow_or_wait_evening_mentions']}\")\n\n        if s[\"evidence\"]:\n            print(\"Evidence (most recent up to limit):\")\n            for ev in s[\"evidence\"]:\n                print(f\"  - {ev['date']} | stars={ev['review_stars']} | review_id={ev['review_id']}\")\n                print(f\"    \\\"{ev['snippet']}\\\"\")\n        else:\n            print(\"Evidence: No reviews in the lookback window matched BOTH (wait/slow) AND (evening/dinner) patterns.\")\n\n    business_conn.close()\n    review_conn.close()\n\n\nif __name__ == \"__main__\":\n    main()\n"
+    }
+  },
+{
+    "index": 213,
+    "question": "I’m planning to meet friends for brunch in Saint Petersburg this weekend. Are there any brunch places where parking is usually not a hassle, according to recent reviews?",
+    "success": true,
+    "result": {
+      "analysis": "问题意图：在 Yelp 数据集中找出 Saint Petersburg（城市字段）里适合“brunch/早午餐”的商家，并根据“近期评论”判断停车是否“通常不麻烦”。实现上需要两类信号：1）结构化过滤（城市、品类、营业状态等）来自 SQLite；2）对“停车不麻烦”这种语义表达做检索与聚合，适合用 Milvus 向量检索从评论中找出与“easy parking / plenty of parking / parking not an issue”等语义相近的近期评论，再回到 SQLite 校验日期、获取商家信息并按商家聚合排名。难点：Yelp 评论文本对停车的表述多样，向量检索可能召回负面停车（例如“parking is a nightmare”），因此需做简单的二次文本规则过滤（排除明显负面词）。",
+      "natural_question": "我这周末要在 Saint Petersburg 和朋友吃早午餐。根据近期评论，有没有停车通常不麻烦的 brunch 地点？",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "SQLite: business.db"
+            ],
+            "filter_condition": {
+              "city": {
+                "=": "Saint Petersburg"
+              },
+              "categories": {
+                "LIKE_ANY": [
+                  "%Brunch%",
+                  "%Breakfast%",
+                  "%Breakfast & Brunch%"
+                ]
+              },
+              "is_open": {
+                "=": 1
+              }
+            }
+          },
+          "result_var": "brunch_businesses",
+          "description": {
+            "narrative": "在 SQLite 的 business 表中筛选 Saint Petersburg 且品类包含 brunch/早餐相关的营业商家，得到 business_id 列表及名称、地址、评分、评论数等基础信息。",
+            "example_query": "SELECT business_id, name, address, city, state, stars, review_count, categories FROM business WHERE city = 'Saint Petersburg' AND is_open = 1 AND (categories LIKE '%Brunch%' OR categories LIKE '%Breakfast%' OR categories LIKE '%Breakfast & Brunch%');"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "SQLite: review.db"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "IN": "brunch_businesses.business_id"
+              },
+              "date": {
+                ">=": "today-365days"
+              }
+            }
+          },
+          "result_var": "recent_reviews",
+          "description": {
+            "narrative": "在 SQLite 的 review 表中取这些候选商家过去 12 个月的评论（可调窗口），得到 review_id、business_id、date、stars、text，用于后续与向量召回结果做交集。",
+            "example_query": "SELECT review_id, business_id, date, stars, text FROM review WHERE business_id IN (...) AND date >= '2025-03-23';"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "Milvus: reviews collection"
+            ],
+            "filter_condition": {
+              "semantic_query": {
+                "IN": [
+                  "parking was easy",
+                  "plenty of parking",
+                  "parking not a hassle",
+                  "easy to find parking"
+                ]
+              },
+              "top_k": 2000
+            }
+          },
+          "result_var": "parking_positive_review_candidates",
+          "description": {
+            "narrative": "将“停车不麻烦”的语义查询编码为向量，在 Milvus 的 reviews collection 做相似度检索，取回一批最相近的 review_id（及距离）。这一步不限制城市/日期（因为 Milvus 侧不一定有这些字段），稍后用 SQLite 做精确过滤。",
+            "example_query": "Milvus vector search (pseudo): search(collection='reviews', data=[embed('parking not a hassle')], anns_field='embedding', limit=2000, output_fields=['review_id'])"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "SQLite: review.db",
+              "SQLite: business.db"
+            ],
+            "filter_condition": {
+              "review_id": {
+                "IN": "parking_positive_review_candidates.review_id"
+              },
+              "date": {
+                ">=": "today-365days"
+              },
+              "business_id": {
+                "IN": "brunch_businesses.business_id"
+              },
+              "text_rule_filter": {
+                "exclude_if_contains_any": [
+                  "nightmare",
+                  "no parking",
+                  "hard to park",
+                  "difficult to park",
+                  "limited parking",
+                  "parking sucks",
+                  "parking is terrible"
+                ]
+              }
+            }
+          },
+          "result_var": "ranked_brunch_spots",
+          "description": {
+            "narrative": "把 Milvus 召回的 review_id 与“Saint Petersburg brunch 候选商家 + 近 12 个月评论”做交集，并对文本做简单负面排除。然后按 business_id 聚合：统计匹配到的“停车不麻烦”近期评论数、抽样评论片段、计算这些匹配评论的平均星级，并与商家基础信息 join，输出最值得去的前 N 家。",
+            "example_query": "SELECT business_id, COUNT(*) AS parking_ok_mentions FROM review WHERE review_id IN (...) AND date >= '2025-03-23' GROUP BY business_id ORDER BY parking_ok_mentions DESC;"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\\nimport datetime as dt\\nimport re\\nfrom collections import defaultdict\\n\\nimport pandas as pd\\n\\n# Milvus\\nfrom pymilvus import connections, Collection\\n\\n# Embedding model for the query -> MUST match (or be very close to) the model used to build Milvus embeddings\\nfrom sentence_transformers import SentenceTransformer\\n\\n\\ndef _connect_sqlite(path: str) -> sqlite3.Connection:\\n    conn = sqlite3.connect(path)\\n    conn.row_factory = sqlite3.Row\\n    return conn\\n\\n\\ndef _like_any_clause(column: str, patterns):\\n    # returns (sql, params)\\n    clauses = []\\n    params = []\\n    for p in patterns:\\n        clauses.append(f\"{column} LIKE ?\")\\n        params.append(p)\\n    return \"(\" + \" OR \".join(clauses) + \")\", params\\n\\n\\ndef main():\\n    # -----------------------------\\n    # Required exact configuration\\n    # -----------------------------\\n    sqlite_paths = {\\n        \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\\n        \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\\n        \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\\n        \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\\n        \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\\n        \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\\n    }\\n\\n    milvus_config = {\\n        'milvus_collections': {\\n            'reviews': 'reviews',\\n            'photos': 'photo_vector',\\n            'tips': 'milvus_tip'\\n        },\\n        'milvus_host': 'localhost',\\n        'milvus_port': '19530',\\n    }\\n\\n    neo4j_config = {\\n        'neo4j_uri': 'bolt://localhost:7687',\\n        'neo4j_auth': ('neo4j', 'password')\\n    }\\n    # (Neo4j not used for this question.)\\n\\n    # -----------------------------\\n    # Parameters you may tune\\n    # -----------------------------\\n    city = \"Saint Petersburg\"\\n    brunch_category_patterns = [\"%Brunch%\", \"%Breakfast%\", \"%Breakfast & Brunch%\"]\\n\\n    lookback_days = 365\\n    cutoff_date = (dt.date.today() - dt.timedelta(days=lookback_days)).isoformat()\\n\\n    # query phrases for semantic retrieval\\n    parking_queries = [\\n        \"parking was easy\",\\n        \"plenty of parking\",\\n        \"parking not a hassle\",\\n        \"easy to find parking\",\\n        \"lots of free parking\"\\n    ]\\n\\n    # heuristic negative filters to avoid obvious \"parking is awful\" matches\\n    negative_phrases = [\\n        \"nightmare\",\\n        \"no parking\",\\n        \"hard to park\",\\n        \"difficult to park\",\\n        \"limited parking\",\\n        \"parking sucks\",\\n        \"parking is terrible\",\\n        \"parking is awful\",\\n        \"couldn't find parking\",\\n        \"nowhere to park\"\\n    ]\\n    neg_re = re.compile(\"|\".join(re.escape(p) for p in negative_phrases), re.IGNORECASE)\\n\\n    top_k = 2000\\n    final_top_n = 10\\n\\n    # -----------------------------\\n    # Step 1: SQLite - candidate brunch businesses\\n    # -----------------------------\\n    try:\\n        biz_conn = _connect_sqlite(sqlite_paths[\"business\"])\\n    except Exception as e:\\n        raise RuntimeError(f\"Failed to connect to business SQLite at {sqlite_paths['business']}: {e}\")\\n\\n    like_sql, like_params = _like_any_clause(\"categories\", brunch_category_patterns)\\n    biz_sql = f\"\"\"\\n        SELECT business_id, name, address, city, state, postal_code, stars, review_count, categories\\n        FROM business\\n        WHERE city = ?\\n          AND is_open = 1\\n          AND {like_sql}\\n    \"\"\"\\n    biz_params = [city] + like_params\\n\\n    brunch_businesses = pd.read_sql_query(biz_sql, biz_conn, params=biz_params)\\n    if brunch_businesses.empty:\\n        print(f\"No open brunch/breakfast businesses found in city='{city}'.\")\\n        return\\n\\n    biz_ids = brunch_businesses[\"business_id\"].tolist()\\n\\n    # -----------------------------\\n    # Step 2: SQLite - recent reviews for these businesses\\n    # -----------------------------\\n    try:\\n        rev_conn = _connect_sqlite(sqlite_paths[\"review\"])\\n    except Exception as e:\\n        raise RuntimeError(f\"Failed to connect to review SQLite at {sqlite_paths['review']}: {e}\")\\n\\n    # chunk IN queries to avoid SQLite variable limits\\n    def fetch_recent_reviews(business_ids, cutoff):\\n        rows = []\\n        chunk = 800\\n        for i in range(0, len(business_ids), chunk):\\n            sub = business_ids[i:i+chunk]\\n            placeholders = \",\".join([\"?\"] * len(sub))\\n            sql = f\"\"\"\\n                SELECT review_id, business_id, date, stars, text\\n                FROM review\\n                WHERE business_id IN ({placeholders})\\n                  AND date >= ?\\n            \"\"\"\\n            params = sub + [cutoff]\\n            part = pd.read_sql_query(sql, rev_conn, params=params)\\n            if not part.empty:\\n                rows.append(part)\\n        return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame(columns=[\"review_id\",\"business_id\",\"date\",\"stars\",\"text\"])\\n\\n    recent_reviews = fetch_recent_reviews(biz_ids, cutoff_date)\\n    if recent_reviews.empty:\\n        print(f\"Found {len(biz_ids)} brunch candidates in {city}, but no reviews in the last {lookback_days} days.\")\\n        return\\n\\n    recent_review_ids = set(recent_reviews[\"review_id\"].tolist())\\n\\n    # -----------------------------\\n    # Step 3: Milvus - semantic search for parking-easy reviews\\n    # -----------------------------\\n    try:\\n        connections.connect(\\n            alias=\"default\",\\n            host=milvus_config[\"milvus_host\"],\\n            port=milvus_config[\"milvus_port\"],\\n        )\\n    except Exception as e:\\n        raise RuntimeError(f\"Failed to connect to Milvus at {milvus_config['milvus_host']}:{milvus_config['milvus_port']}: {e}\")\\n\\n    collection_name = milvus_config['milvus_collections']['reviews']\\n    try:\\n        col = Collection(collection_name)\\n        col.load()\\n    except Exception as e:\\n        raise RuntimeError(f\"Failed to load Milvus collection '{collection_name}': {e}\")\\n\\n    # You must use the same embedding model used when building the Milvus vectors.\\n    # If your pipeline used a different model, change this accordingly.\\n    model = SentenceTransformer(\"sentence-transformers/all-MiniLM-L6-v2\")\\n\\n    # Determine vector field name heuristically\\n    # (Common names: 'embedding', 'vector')\\n    schema_fields = [f.name for f in col.schema.fields]\\n    if \"embedding\" in schema_fields:\\n        vector_field = \"embedding\"\\n    elif \"vector\" in schema_fields:\\n        vector_field = \"vector\"\\n    else:\\n        raise RuntimeError(f\"Cannot find vector field in Milvus collection schema. Fields={schema_fields}\")\\n\\n    # Determine primary id field (often review_id)\\n    # We'll try to return 'review_id' if present, else primary field name\\n    output_id_field = \"review_id\" if \"review_id\" in schema_fields else col.schema.primary_field\\n\\n    # Search params: adjust metric_type to match your index (commonly IP/COSINE/L2)\\n    # We'll try COSINE-ish via IP; if your collection is L2, change accordingly.\\n    search_params = {\"metric_type\": \"IP\", \"params\": {\"nprobe\": 10}}\\n\\n    candidate_ids = set()\\n    for q in parking_queries:\\n        qvec = model.encode([q], normalize_embeddings=True)\\n        try:\\n            res = col.search(\\n                data=qvec,\\n                anns_field=vector_field,\\n                param=search_params,\\n                limit=top_k,\\n                output_fields=[output_id_field],\\n            )\\n        except Exception as e:\\n            raise RuntimeError(f\"Milvus search failed for query='{q}': {e}\")\\n\\n        # res is a list (per query vector) of hits\\n        for hit in res[0]:\\n            # hit.entity.get(...) works when output_fields included\\n            try:\\n                rid = hit.entity.get(output_id_field)\\n            except Exception:\\n                # fallback: sometimes primary key accessible via hit.id\\n                rid = getattr(hit, \"id\", None)\\n            if rid is not None:\\n                candidate_ids.add(str(rid))\\n\\n    if not candidate_ids:\\n        print(\"Milvus returned no candidates for parking-related queries.\")\\n        return\\n\\n    # -----------------------------\\n    # Step 4: Intersect + filter + aggregate\\n    # -----------------------------\\n    # Keep only those that are (a) recent and (b) among our brunch businesses\\n    candidates_in_recent = recent_reviews[recent_reviews[\"review_id\"].astype(str).isin(candidate_ids)].copy()\\n    if candidates_in_recent.empty:\\n        print(\"No Milvus parking-related reviews overlap with recent reviews for Saint Petersburg brunch candidates.\")\\n        return\\n\\n    # Exclude obvious negative parking mentions\\n    candidates_in_recent[\"_neg\"] = candidates_in_recent[\"text\"].fillna(\"\").apply(lambda t: bool(neg_re.search(t)))\\n    parking_ok = candidates_in_recent[~candidates_in_recent[\"_neg\"]].copy()\\n\\n    if parking_ok.empty:\\n        print(\"All parking-related candidate reviews looked negative after heuristic filtering. Consider adjusting negative phrases or using a re-ranker.\")\\n        return\\n\\n    # Aggregate by business\\n    def sample_snippet(text: str, max_len: int = 180) -> str:\\n        text = re.sub(r\"\\s+\", \" \", (text or \"\").strip())\\n        return text[:max_len] + (\"...\" if len(text) > max_len else \"\")\\n\\n    parking_ok[\"snippet\"] = parking_ok[\"text\"].apply(sample_snippet)\\n\\n    agg = (\\n        parking_ok.groupby(\"business_id\")\\n        .agg(\\n            parking_ok_mentions=(\"review_id\", \"count\"),\\n            avg_stars_in_mentions=(\"stars\", \"mean\"),\\n            latest_mention_date=(\"date\", \"max\"),\\n        )\\n        .reset_index()\\n    )\\n\\n    # attach 2 example snippets per business\\n    snippets = defaultdict(list)\\n    for _, row in parking_ok.sort_values([\"business_id\", \"date\"], ascending=[True, False]).iterrows():\\n        bid = row[\"business_id\"]\\n        if len(snippets[bid]) < 2:\\n            snippets[bid].append(row[\"snippet\"])\\n\\n    agg[\"example_mentions\"] = agg[\"business_id\"].apply(lambda bid: snippets.get(bid, []))\\n\\n    # Join business info\\n    out = agg.merge(brunch_businesses, on=\"business_id\", how=\"left\")\\n\\n    # Ranking: prioritize more parking-ok mentions, then higher business stars, then review_count\\n    out = out.sort_values(\\n        by=[\"parking_ok_mentions\", \"stars\", \"review_count\"],\\n        ascending=[False, False, False]\\n    ).head(final_top_n)\\n\\n    # Format output\\n    cols = [\\n        \"name\", \"address\", \"city\", \"state\", \"postal_code\",\\n        \"stars\", \"review_count\",\\n        \"parking_ok_mentions\", \"avg_stars_in_mentions\", \"latest_mention_date\",\\n        \"categories\", \"example_mentions\"\\n    ]\\n    out = out[cols]\\n\\n    pd.set_option(\"display.max_colwidth\", 120)\\n    print(f\"Top {len(out)} brunch spots in {city} with recent reviews suggesting parking is usually not a hassle (last {lookback_days} days):\")\\n    print(out.to_string(index=False))\\n\\n\\nif __name__ == \"__main__\":\\n    main()\\n"
+    }
+  },
+{
+    "index": 214,
+    "question": "I’ve just moved to Edmonton and don’t know many places yet. Are there any restaurants that people with similar taste to mine tend to go to and rate highly?",
+    "success": true,
+    "result": {
+      "analysis": "你的问题本质上是在做“个性化推荐”：找出与你口味相近的人（相似用户）在 Edmonton 常去且评分高的餐厅。要做到这一点，通常需要你提供一些“口味锚点”，例如：你在 Yelp 上的 user_id（能做协同过滤/相似用户），或你喜欢的餐厅/菜系/口味描述（能做语义向量检索）。在本多数据库架构下，我们可以组合：SQLite 用于筛 Edmonton 的餐厅与评分统计；Milvus 用于用你的口味文本在评论中做语义检索并回溯到餐厅；Neo4j 用于找相似用户并做基于图的协同过滤推荐。若你没有 user_id，也可以仅用 Milvus+SQLite 做“语义偏好推荐”。",
+      "natural_question": "我刚搬到 Edmonton，不太熟悉餐厅；有没有与我口味相近的人经常去并且评分很高的餐厅推荐？",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector",
+        "graph"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "SQLite: business.db"
+            ],
+            "filter_condition": {
+              "city": {
+                "=": "Edmonton"
+              },
+              "categories": {
+                "LIKE": "%Restaurants%"
+              }
+            }
+          },
+          "result_var": "edm_restaurants",
+          "description": {
+            "narrative": "先从 SQLite 的 business 表筛出 Edmonton 的餐厅作为候选集，并保留 business_id、name、stars、review_count、categories、address 等字段。",
+            "example_query": "SELECT business_id, name, stars, review_count, categories, address, city, state\nFROM business\nWHERE city = 'Edmonton'\n  AND categories LIKE '%Restaurants%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "Milvus: reviews collection",
+              "SQLite: review.db"
+            ],
+            "filter_condition": {
+              "preference_text": {
+                "semantic_search": "用户口味描述文本（例如：喜欢辣、川菜、麻辣香锅、爱喝精酿）"
+              }
+            }
+          },
+          "result_var": "matched_reviews",
+          "description": {
+            "narrative": "把用户的口味描述转成向量，在 Milvus 的 reviews collection 里做相似评论检索，取 TopK review_id；再用 SQLite review 表把 review_id 映射到 business_id，并与 Edmonton 餐厅候选集取交集。",
+            "example_query": "Milvus: search(preference_vector) -> [review_id...]\nSQL: SELECT review_id, business_id, stars, date\n     FROM review\n     WHERE review_id IN (...);"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "SQLite: business.db",
+              "SQLite: review.db"
+            ],
+            "filter_condition": {
+              "min_avg_stars": {
+                ">=": 4.0
+              },
+              "min_review_count": {
+                ">=": 50
+              }
+            }
+          },
+          "result_var": "vector_ranked_recos",
+          "description": {
+            "narrative": "把 Step2 命中的评论按 business 聚合：计算(1)语义相似度加权得分、(2)该 business 的平均星级/评论数，并进行综合排序，得到“与你口味语义最接近、且总体评分高”的 Edmonton 餐厅推荐。",
+            "example_query": "SELECT b.business_id, b.name, b.stars, b.review_count\nFROM business b\nWHERE b.business_id IN (...)\nORDER BY b.stars DESC, b.review_count DESC;"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "Neo4j"
+            ],
+            "filter_condition": {
+              "user_id": {
+                "=": "可选：如果你提供 Yelp user_id"
+              },
+              "stars": {
+                ">=": 4
+              }
+            }
+          },
+          "result_var": "graph_cf_recos",
+          "description": {
+            "narrative": "（可选）若提供 user_id：在 Neo4j 中找到与你给高分的餐厅有重合的“相似用户”，再推荐这些相似用户在 Edmonton 给高分、但你没去过的餐厅，作为协同过滤结果。",
+            "example_query": "MATCH (me:User {user_id:$uid})-[r1:REVIEWED]->(b:Business)\nWHERE r1.stars >= 4\nMATCH (other:User)-[r2:REVIEWED]->(b)\nWHERE other <> me AND r2.stars >= 4\nWITH other, count(DISTINCT b) AS overlap\nORDER BY overlap DESC\nLIMIT 50\nMATCH (other)-[r3:REVIEWED]->(rec:Business)\nWHERE r3.stars >= 4 AND rec.city = 'Edmonton' AND rec.categories CONTAINS 'Restaurants'\nRETURN rec.business_id AS business_id, avg(r3.stars) AS score\nORDER BY score DESC\nLIMIT 50;"
+          }
+        },
+        {
+          "step": 5,
+          "parameters": {
+            "ms_names": [
+              "SQLite",
+              "Milvus",
+              "Neo4j"
+            ],
+            "filter_condition": {
+              "blend": {
+                "final_score": "0.7 * 语义偏好得分 + 0.3 * 协同过滤得分（若无 user_id 则只用语义偏好得分）"
+              }
+            }
+          },
+          "result_var": "final_recommendations",
+          "description": {
+            "narrative": "将语义推荐与图协同过滤推荐融合（若可用），输出 TopN 餐厅，并附上：名称、地址、总体星级/评论数、为什么推荐（命中评论片段或相似用户信号）。",
+            "example_query": "N/A（融合与排序在 Python 中实现）"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport math\nfrom dataclasses import dataclass\nfrom typing import List, Dict, Any, Optional, Tuple\n\n# --- Required exact configuration (do not change) ---\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nconfig = {\n    'milvus_collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    },\n    'milvus_host': 'localhost',\n    'milvus_port': '19530',\n    'neo4j_uri': 'bolt://localhost:7687',\n    'neo4j_auth': ('neo4j', 'password')\n}\n\n# -------------------- User inputs --------------------\n# Option A (no Yelp history): describe your taste in free text\npreference_text = \"I like spicy food, Sichuan, hot pot, cozy casual places, craft beer\"\n\n# Option B (if you have it): your Yelp user_id in this dataset (enables Neo4j collaborative filtering)\nyelp_user_id: Optional[str] = None  # e.g., \"abc123...\" or keep None\n\nCITY = \"Edmonton\"\nCATEGORY_KEYWORD = \"Restaurants\"\nTOPK_MILVUS = 200\nTOPN_OUTPUT = 15\n\n# Milvus schema assumptions (adjust if your collection uses different field names)\nMILVUS_COLLECTION = config['milvus_collections']['reviews']\nMILVUS_VECTOR_FIELD = \"embedding\"   # common choices: \"embedding\", \"vector\"\nMILVUS_ID_FIELD = \"review_id\"       # common choices: \"review_id\", \"id\"\n\n# -------------------- Helpers --------------------\n\ndef dict_factory(cursor, row):\n    d = {}\n    for idx, col in enumerate(cursor.description):\n        d[col[0]] = row[idx]\n    return d\n\n\ndef connect_sqlite(path: str) -> sqlite3.Connection:\n    conn = sqlite3.connect(path)\n    conn.row_factory = dict_factory\n    return conn\n\n\ndef safe_like(s: str) -> str:\n    # basic escaping for LIKE wildcards\n    return s.replace('%', '\\\\%').replace('_', '\\\\_')\n\n\n@dataclass\nclass Candidate:\n    business_id: str\n    name: str\n    stars: float\n    review_count: int\n    categories: str\n    address: str\n    city: str\n    state: str\n    semantic_score: float = 0.0\n    cf_score: float = 0.0\n    final_score: float = 0.0\n\n\n# -------------------- Step 1: Edmonton restaurant candidates (SQLite) --------------------\n\ndef load_edmonton_restaurants() -> Dict[str, Candidate]:\n    conn = connect_sqlite(sqlite_paths['business'])\n    try:\n        q = \"\"\"\n        SELECT business_id, name, stars, review_count, categories, address, city, state\n        FROM business\n        WHERE city = ?\n          AND categories LIKE ?\n        \"\"\"\n        rows = conn.execute(q, (CITY, f\"%{CATEGORY_KEYWORD}%\")).fetchall()\n        out: Dict[str, Candidate] = {}\n        for r in rows:\n            out[r['business_id']] = Candidate(\n                business_id=r['business_id'],\n                name=r.get('name') or \"\",\n                stars=float(r.get('stars') or 0.0),\n                review_count=int(r.get('review_count') or 0),\n                categories=r.get('categories') or \"\",\n                address=r.get('address') or \"\",\n                city=r.get('city') or \"\",\n                state=r.get('state') or \"\",\n            )\n        return out\n    finally:\n        conn.close()\n\n\n# -------------------- Step 2: Milvus semantic search over reviews --------------------\n\ndef embed_text(text: str) -> List[float]:\n    \"\"\"Create an embedding for user preference text.\n\n    Uses sentence-transformers if available.\n    \"\"\"\n    try:\n        from sentence_transformers import SentenceTransformer\n        model = SentenceTransformer(\"sentence-transformers/all-MiniLM-L6-v2\")\n        vec = model.encode([text], normalize_embeddings=True)[0]\n        return vec.tolist()\n    except Exception as e:\n        raise RuntimeError(\n            \"Failed to embed text. Please install sentence-transformers: pip install sentence-transformers\"\n        ) from e\n\n\ndef milvus_search_reviews(pref_vector: List[float], topk: int = TOPK_MILVUS) -> List[Tuple[str, float]]:\n    \"\"\"Return list of (review_id, similarity_score).\n\n    Note: Milvus returns distance; interpretation depends on metric.\n    We'll treat 'score' as (1 - distance) for cosine/IP-like distance if needed.\n    \"\"\"\n    try:\n        from pymilvus import connections, Collection\n    except Exception as e:\n        raise RuntimeError(\"Please install pymilvus: pip install pymilvus\") from e\n\n    connections.connect(alias=\"default\", host=config['milvus_host'], port=config['milvus_port'])\n\n    col = Collection(MILVUS_COLLECTION)\n    col.load()\n\n    # Try common search params; adjust based on your index\n    search_params = {\n        \"metric_type\": \"COSINE\",\n        \"params\": {\"nprobe\": 10}\n    }\n\n    # We request the id field back\n    output_fields = [MILVUS_ID_FIELD]\n\n    res = col.search(\n        data=[pref_vector],\n        anns_field=MILVUS_VECTOR_FIELD,\n        param=search_params,\n        limit=topk,\n        output_fields=output_fields\n    )\n\n    hits = []\n    for hit in res[0]:\n        # hit.distance semantics depend on metric; for COSINE in Milvus, distance is usually (1 - cosine_similarity)\n        review_id = None\n        try:\n            review_id = hit.entity.get(MILVUS_ID_FIELD)\n        except Exception:\n            # fallback to primary key\n            review_id = getattr(hit, \"id\", None)\n        dist = float(hit.distance)\n        sim = 1.0 - dist  # good default for COSINE distance\n        hits.append((str(review_id), sim))\n\n    return hits\n\n\ndef map_review_ids_to_business(review_ids: List[str]) -> Dict[str, List[str]]:\n    \"\"\"Return business_id -> [review_id...]\"\"\"\n    if not review_ids:\n        return {}\n\n    conn = connect_sqlite(sqlite_paths['review'])\n    try:\n        # SQLite has parameter limit; chunk if necessary\n        chunk_size = 800\n        biz_to_reviews: Dict[str, List[str]] = {}\n        for i in range(0, len(review_ids), chunk_size):\n            chunk = review_ids[i:i+chunk_size]\n            placeholders = \",\".join([\"?\"] * len(chunk))\n            q = f\"\"\"\n            SELECT review_id, business_id\n            FROM review\n            WHERE review_id IN ({placeholders})\n            \"\"\"\n            rows = conn.execute(q, chunk).fetchall()\n            for r in rows:\n                biz_to_reviews.setdefault(r['business_id'], []).append(r['review_id'])\n        return biz_to_reviews\n    finally:\n        conn.close()\n\n\n# -------------------- Step 4 (optional): Neo4j collaborative filtering --------------------\n\ndef neo4j_cf_recommendations(uid: str, limit: int = 50) -> Dict[str, float]:\n    \"\"\"Return business_id -> cf_score.\n\n    Assumes a Neo4j model with labels :User, :Business and relationship :REVIEWED(stars).\n    If your graph uses different labels/props, adjust the Cypher.\n    \"\"\"\n    try:\n        from neo4j import GraphDatabase\n    except Exception as e:\n        raise RuntimeError(\"Please install neo4j driver: pip install neo4j\") from e\n\n    driver = GraphDatabase.driver(config['neo4j_uri'], auth=config['neo4j_auth'])\n    cypher = \"\"\"\n    MATCH (me:User {user_id:$uid})-[r1:REVIEWED]->(b:Business)\n    WHERE r1.stars >= 4\n    MATCH (other:User)-[r2:REVIEWED]->(b)\n    WHERE other <> me AND r2.stars >= 4\n    WITH other, count(DISTINCT b) AS overlap\n    ORDER BY overlap DESC\n    LIMIT 50\n    MATCH (other)-[r3:REVIEWED]->(rec:Business)\n    WHERE r3.stars >= 4\n      AND rec.city = $city\n      AND rec.categories CONTAINS $cat\n      AND NOT (me)-[:REVIEWED]->(rec)\n    RETURN rec.business_id AS business_id,\n           avg(r3.stars) AS score,\n           count(r3) AS n\n    ORDER BY score DESC, n DESC\n    LIMIT $limit;\n    \"\"\"\n\n    out: Dict[str, float] = {}\n    with driver.session() as session:\n        try:\n            rows = session.run(cypher, uid=uid, city=CITY, cat=CATEGORY_KEYWORD, limit=limit)\n            for r in rows:\n                out[str(r['business_id'])] = float(r['score'])\n        except Exception:\n            # If schema mismatched, just return empty\n            out = {}\n\n    driver.close()\n    return out\n\n\n# -------------------- Step 3/5: scoring & output --------------------\n\ndef recommend() -> List[Candidate]:\n    edm = load_edmonton_restaurants()\n    if not edm:\n        raise RuntimeError(f\"No Edmonton restaurants found in business.db (city={CITY}).\")\n\n    # Semantic route\n    semantic_business_scores: Dict[str, float] = {}\n    if preference_text and preference_text.strip():\n        pref_vec = embed_text(preference_text)\n        hits = milvus_search_reviews(pref_vec, topk=TOPK_MILVUS)\n        review_id_to_sim = {rid: sim for rid, sim in hits}\n        biz_to_reviews = map_review_ids_to_business([rid for rid, _ in hits])\n\n        # Aggregate similarity per business (max or sum). We'll use sum of positive sims.\n        for biz_id, rids in biz_to_reviews.items():\n            if biz_id not in edm:\n                continue\n            sims = [review_id_to_sim.get(rid, 0.0) for rid in rids]\n            # keep only meaningful sims\n            sims = [s for s in sims if s > 0]\n            if not sims:\n                continue\n            semantic_business_scores[biz_id] = float(sum(sims))\n\n    # CF route (optional)\n    cf_scores: Dict[str, float] = {}\n    if yelp_user_id:\n        cf_scores = neo4j_cf_recommendations(yelp_user_id, limit=200)\n\n    # Normalize helper\n    def minmax(d: Dict[str, float]) -> Dict[str, float]:\n        if not d:\n            return {}\n        vals = list(d.values())\n        lo, hi = min(vals), max(vals)\n        if math.isclose(lo, hi):\n            return {k: 1.0 for k in d}\n        return {k: (v - lo) / (hi - lo) for k, v in d.items()}\n\n    sem_n = minmax(semantic_business_scores)\n    cf_n = minmax(cf_scores)\n\n    # Build candidates\n    candidates: List[Candidate] = []\n    for biz_id, c in edm.items():\n        c.semantic_score = float(sem_n.get(biz_id, 0.0))\n        c.cf_score = float(cf_n.get(biz_id, 0.0))\n\n        # basic quality prior from business stars & review_count\n        quality = (c.stars / 5.0) * (1.0 - math.exp(-c.review_count / 200.0))\n\n        if yelp_user_id:\n            c.final_score = 0.55 * c.semantic_score + 0.25 * c.cf_score + 0.20 * quality\n        else:\n            # no CF available\n            c.final_score = 0.75 * c.semantic_score + 0.25 * quality\n\n        candidates.append(c)\n\n    # If semantic search returned nothing, fall back to top-rated in Edmonton\n    if preference_text and not semantic_business_scores:\n        candidates.sort(key=lambda x: (x.stars, x.review_count), reverse=True)\n        return candidates[:TOPN_OUTPUT]\n\n    # Otherwise, filter to reasonably good places\n    filtered = [c for c in candidates if c.review_count >= 20 and c.stars >= 3.5]\n    filtered.sort(key=lambda x: (x.final_score, x.stars, x.review_count), reverse=True)\n    return filtered[:TOPN_OUTPUT]\n\n\nif __name__ == \"__main__\":\n    try:\n        recs = recommend()\n        print(f\"Top recommendations in {CITY} (n={len(recs)}):\\n\")\n        for i, r in enumerate(recs, 1):\n            print(f\"{i:02d}. {r.name}\")\n            print(f\"    business_id: {r.business_id}\")\n            print(f\"    address: {r.address}, {r.city}, {r.state}\")\n            print(f\"    stars/reviews: {r.stars:.2f} ({r.review_count})\")\n            print(f\"    scores: semantic={r.semantic_score:.3f}, cf={r.cf_score:.3f}, final={r.final_score:.3f}\")\n            print(f\"    categories: {r.categories}\\n\")\n\n        if yelp_user_id is None:\n            print(\"Tip: If you can provide a Yelp user_id from this dataset, the Neo4j graph CF step can further personalize results.\")\n            print(\"Also, you can refine 'preference_text' with cuisines, vibe, budget, dietary needs, and example dishes.\")\n\n    except Exception as e:\n        print(\"Error:\", e)\n        print(\"\\nTroubleshooting:\")\n        print(\"1) Ensure SQLite db files exist at the configured paths.\")\n        print(\"2) Ensure Milvus is running and the reviews collection schema matches MILVUS_VECTOR_FIELD and MILVUS_ID_FIELD.\")\n        print(\"3) Install dependencies: pip install pymilvus neo4j sentence-transformers\")\n"
+    }
+  },
+{
+    "index": 215,
+    "question": "Azul Taco最近整体评价是否下降？我的朋友最近是否去过并给出较低评分，说明它变差了？",
+    "success": true,
+    "result": {
+      "analysis": "你的问题包含两部分：\n1) “Azul Taco 最近整体评价是否下降”：需要按时间对该店的 review 星级做趋势/分段对比（例如近180天 vs 更早180天、或近12个月回归斜率）。这主要用 SQLite(review.db) 完成。\n2) “我的朋友最近是否去过并给出较低评分”：需要先确定“朋友”是谁（a) 你指定某个 friend_user_id；或 b) 你给出你的 my_user_id，然后从 Neo4j 的好友关系取出 friends，再去 SQLite 查这些好友是否对该店有最近低分评论）。这是 Neo4j(图关系) + SQLite(评论事实表) 的跨库联动。\n难点在于：Azul Taco 可能不止一家（多城市/多店名相同），以及你需要提供 user_id（或你的 user_id）才能严格回答“朋友是否去过”。",
+      "natural_question": "Azul Taco 最近整体评价是否下降？我的朋友最近是否去过并给出较低评分，从而说明它变差了？",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "graph"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "SQLite: business.db / business"
+            ],
+            "filter_condition": {
+              "name": {
+                "LIKE": "%Azul Taco%"
+              }
+            }
+          },
+          "result_var": "biz_candidates",
+          "description": {
+            "narrative": "在 business 库中用店名模糊匹配找出 Azul Taco 的候选门店，并按 review_count、stars 等信息排序。若有多家，需要选定分析的 business_id（代码会默认选 review_count 最大的一家，也支持参数指定 business_id）。",
+            "example_query": "SELECT business_id, name, city, state, stars, review_count\nFROM business\nWHERE name LIKE '%Azul Taco%'\nORDER BY review_count DESC\nLIMIT 10;"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "SQLite: review.db / review"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "=": "<chosen_business_id>"
+              }
+            }
+          },
+          "result_var": "reviews_df",
+          "description": {
+            "narrative": "抽取该门店所有评论（至少包含 date、stars、user_id），并做两类衡量：\n- 分段对比：近N天平均星级 vs 更早N天平均星级（例如180天/365天），给出差值。\n- 趋势回归：最近一年按日期对星级做线性回归，估计是否呈下降趋势（斜率<0）。",
+            "example_query": "SELECT review_id, user_id, stars, date, text\nFROM review\nWHERE business_id = '<chosen_business_id>'\nORDER BY date;"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "Neo4j: User-[:FRIEND]-User"
+            ],
+            "filter_condition": {
+              "my_user_id": {
+                "=": "<my_user_id_optional>"
+              }
+            }
+          },
+          "result_var": "friend_ids",
+          "description": {
+            "narrative": "如果你提供 my_user_id，则从 Neo4j 图中取出你的好友 user_id 列表，作为后续在 SQLite(review) 中筛选“朋友是否最近给了低分”的集合。",
+            "example_query": "MATCH (u:User {user_id: $my_user_id})-[:FRIEND]->(f:User)\nRETURN f.user_id AS friend_user_id;"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "SQLite: review.db / review"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "=": "<chosen_business_id>"
+              },
+              "user_id": {
+                "IN": "<friend_ids or [friend_user_id]>"
+              },
+              "date": {
+                ">=": "<today - since_days>"
+              },
+              "stars": {
+                "<=": 3
+              }
+            }
+          },
+          "result_var": "friend_low_reviews",
+          "description": {
+            "narrative": "将 Neo4j 得到的好友 user_id（或你直接给的 friend_user_id）带入 SQLite(review) 查询：好友是否在最近 X 天内评论过该店，并筛出低分（默认<=3星）的记录，输出日期、星级、文本摘要等。",
+            "example_query": "SELECT review_id, user_id, stars, date, substr(text,1,200) AS text_snippet\nFROM review\nWHERE business_id = '<chosen_business_id>'\n  AND user_id IN ('id1','id2','...')\n  AND date >= '2025-01-01'\n  AND stars <= 3\nORDER BY date DESC;"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport pandas as pd\nimport numpy as np\nfrom datetime import datetime, timedelta\nfrom neo4j import GraphDatabase\nimport argparse\nimport sys\n\n# ====== Fixed configuration (as required) ======\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nmilvus_cfg = {\n    'milvus_collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    },\n    'milvus_host': 'localhost',\n    'milvus_port': '19530',\n}\n\nneo4j_cfg = {\n    'neo4j_uri': 'bolt://localhost:7687',\n    'neo4j_auth': ('neo4j', 'password')\n}\n\n\ndef connect_sqlite(db_path: str):\n    conn = sqlite3.connect(db_path)\n    conn.row_factory = sqlite3.Row\n    return conn\n\n\ndef find_business_candidates(name_like: str, limit: int = 10) -> pd.DataFrame:\n    conn = connect_sqlite(sqlite_paths[\"business\"])\n    try:\n        q = \"\"\"\n        SELECT business_id, name, city, state, stars, review_count\n        FROM business\n        WHERE name LIKE ?\n        ORDER BY review_count DESC\n        LIMIT ?;\n        \"\"\"\n        df = pd.read_sql_query(q, conn, params=(f\"%{name_like}%\", limit))\n        return df\n    finally:\n        conn.close()\n\n\ndef load_reviews_for_business(business_id: str) -> pd.DataFrame:\n    conn = connect_sqlite(sqlite_paths[\"review\"])\n    try:\n        q = \"\"\"\n        SELECT review_id, user_id, stars, date, text\n        FROM review\n        WHERE business_id = ?\n        ORDER BY date;\n        \"\"\"\n        df = pd.read_sql_query(q, conn, params=(business_id,))\n        if df.empty:\n            return df\n        df[\"date\"] = pd.to_datetime(df[\"date\"], errors=\"coerce\")\n        df = df.dropna(subset=[\"date\"])\n        return df\n    finally:\n        conn.close()\n\n\ndef analyze_rating_trend(reviews_df: pd.DataFrame, recent_days: int = 180, slope_days: int = 365):\n    \"\"\"Return a dict summary about recent-vs-previous and regression slope.\"\"\"\n    if reviews_df is None or reviews_df.empty:\n        return {\n            \"has_data\": False,\n            \"message\": \"No reviews found for this business_id in review.db\"\n        }\n\n    now = reviews_df[\"date\"].max()  # use max review date as reference (dataset may be historical)\n    recent_start = now - pd.Timedelta(days=recent_days)\n    prev_start = now - pd.Timedelta(days=2 * recent_days)\n\n    recent = reviews_df[(reviews_df[\"date\"] > recent_start) & (reviews_df[\"date\"] <= now)]\n    prev = reviews_df[(reviews_df[\"date\"] > prev_start) & (reviews_df[\"date\"] <= recent_start)]\n\n    def safe_mean(x):\n        return float(x.mean()) if len(x) else None\n\n    recent_mean = safe_mean(recent[\"stars\"])\n    prev_mean = safe_mean(prev[\"stars\"])\n    delta = (recent_mean - prev_mean) if (recent_mean is not None and prev_mean is not None) else None\n\n    # Regression slope over last slope_days\n    slope_start = now - pd.Timedelta(days=slope_days)\n    window = reviews_df[(reviews_df[\"date\"] >= slope_start) & (reviews_df[\"date\"] <= now)].copy()\n    slope = None\n    if len(window) >= 10:\n        # Convert date to numeric days from start\n        x = (window[\"date\"] - window[\"date\"].min()).dt.total_seconds() / 86400.0\n        y = window[\"stars\"].astype(float)\n        # simple least squares: slope = cov(x,y)/var(x)\n        vx = np.var(x)\n        if vx > 0:\n            slope = float(np.cov(x, y, bias=True)[0, 1] / vx)  # stars per day\n\n    return {\n        \"has_data\": True,\n        \"reference_now\": str(now.date()),\n        \"recent_days\": recent_days,\n        \"recent_count\": int(len(recent)),\n        \"recent_mean\": recent_mean,\n        \"prev_count\": int(len(prev)),\n        \"prev_mean\": prev_mean,\n        \"delta_recent_minus_prev\": delta,\n        \"slope_days\": slope_days,\n        \"slope_stars_per_day\": slope,\n        \"slope_stars_per_30d\": (slope * 30.0) if slope is not None else None\n    }\n\n\ndef connect_neo4j():\n    return GraphDatabase.driver(neo4j_cfg['neo4j_uri'], auth=neo4j_cfg['neo4j_auth'])\n\n\ndef get_friend_ids_from_neo4j(my_user_id: str) -> list[str]:\n    driver = connect_neo4j()\n    try:\n        with driver.session() as session:\n            cypher = \"\"\"\n            MATCH (u:User {user_id: $my_user_id})-[:FRIEND]->(f:User)\n            RETURN f.user_id AS friend_user_id\n            \"\"\"\n            res = session.run(cypher, my_user_id=my_user_id)\n            return [r[\"friend_user_id\"] for r in res if r.get(\"friend_user_id\")]\n    finally:\n        driver.close()\n\n\ndef query_friend_reviews(business_id: str, user_ids: list[str], since_days: int = 180, low_threshold: int = 3) -> pd.DataFrame:\n    if not user_ids:\n        return pd.DataFrame()\n\n    conn = connect_sqlite(sqlite_paths[\"review\"])\n    try:\n        # Use dataset max date as \"now\" reference for reproducibility; we compute in SQL by filtering date >= a string\n        # But we need a reference date; simplest: use today's date. If your dataset is old, consider passing custom since_date.\n        since_date = (datetime.today() - timedelta(days=since_days)).date().isoformat()\n\n        # Build parameter placeholders\n        placeholders = \",\".join([\"?\"] * len(user_ids))\n        q = f\"\"\"\n        SELECT review_id, user_id, stars, date, text\n        FROM review\n        WHERE business_id = ?\n          AND user_id IN ({placeholders})\n          AND date >= ?\n          AND stars <= ?\n        ORDER BY date DESC;\n        \"\"\"\n        params = [business_id] + user_ids + [since_date, low_threshold]\n        df = pd.read_sql_query(q, conn, params=params)\n        if df.empty:\n            return df\n        df[\"date\"] = pd.to_datetime(df[\"date\"], errors=\"coerce\")\n        df[\"text_snippet\"] = df[\"text\"].fillna(\"\").str.slice(0, 220)\n        return df[[\"review_id\", \"user_id\", \"stars\", \"date\", \"text_snippet\"]]\n    finally:\n        conn.close()\n\n\ndef choose_business_id(candidates: pd.DataFrame, business_id: str | None):\n    if business_id:\n        return business_id\n    if candidates is None or candidates.empty:\n        return None\n    # Heuristic: pick the one with most reviews\n    return str(candidates.iloc[0][\"business_id\"])\n\n\ndef main():\n    parser = argparse.ArgumentParser(description=\"Analyze Azul Taco rating trend and whether friends gave low ratings recently\")\n    parser.add_argument(\"--name\", type=str, default=\"Azul Taco\", help=\"Business name to search\")\n    parser.add_argument(\"--business_id\", type=str, default=None, help=\"Explicit business_id to analyze (overrides name search)\")\n    parser.add_argument(\"--recent_days\", type=int, default=180, help=\"Window size for recent vs previous comparison\")\n    parser.add_argument(\"--my_user_id\", type=str, default=None, help=\"Your user_id (to fetch friends from Neo4j)\")\n    parser.add_argument(\"--friend_user_id\", type=str, default=None, help=\"A specific friend's user_id to check\")\n    parser.add_argument(\"--since_days\", type=int, default=180, help=\"How many days back to look for friend reviews\")\n    parser.add_argument(\"--low_threshold\", type=int, default=3, help=\"Low rating threshold (<= this is considered low)\")\n    args = parser.parse_args()\n\n    # Step 1: find business candidates\n    candidates = find_business_candidates(args.name, limit=10)\n    print(\"\\n=== Business candidates (top 10) ===\")\n    if candidates.empty:\n        print(f\"No business found with name like: {args.name}\")\n        sys.exit(1)\n    print(candidates.to_string(index=False))\n\n    chosen_business_id = choose_business_id(candidates, args.business_id)\n    if not chosen_business_id:\n        print(\"Could not choose a business_id.\")\n        sys.exit(1)\n\n    chosen_row = candidates[candidates[\"business_id\"] == chosen_business_id]\n    print(\"\\n=== Chosen business_id ===\")\n    print(chosen_business_id)\n    if not chosen_row.empty:\n        print(chosen_row.to_string(index=False))\n    else:\n        print(\"(Chosen business_id not in top-10 candidates table; you provided it explicitly.)\")\n\n    # Step 2: load reviews and analyze trend\n    reviews_df = load_reviews_for_business(chosen_business_id)\n    trend = analyze_rating_trend(reviews_df, recent_days=args.recent_days, slope_days=365)\n\n    print(\"\\n=== Rating trend summary ===\")\n    if not trend.get(\"has_data\"):\n        print(trend.get(\"message\"))\n    else:\n        print(f\"Reference date (max review date in dataset): {trend['reference_now']}\")\n        print(f\"Recent {trend['recent_days']}d mean ({trend['recent_count']} reviews): {trend['recent_mean']}\")\n        print(f\"Previous {trend['recent_days']}d mean ({trend['prev_count']} reviews): {trend['prev_mean']}\")\n        print(f\"Delta (recent - previous): {trend['delta_recent_minus_prev']}\")\n        if trend[\"slope_stars_per_day\"] is not None:\n            print(f\"Slope over last {trend['slope_days']}d: {trend['slope_stars_per_day']:.6f} stars/day (~{trend['slope_stars_per_30d']:.3f} per 30d)\")\n        else:\n            print(\"Slope over last 365d: not enough data (need >=10 reviews in that window)\")\n\n        # A simple interpretation\n        if trend[\"delta_recent_minus_prev\"] is not None:\n            if trend[\"delta_recent_minus_prev\"] <= -0.3:\n                print(\"Interpretation: Recent average looks meaningfully lower than previous window (possible decline).\")\n            elif trend[\"delta_recent_minus_prev\"] >= 0.3:\n                print(\"Interpretation: Recent average looks higher than previous window (possible improvement).\")\n            else:\n                print(\"Interpretation: Recent average is roughly stable vs previous window.\")\n\n    # Step 3/4: friend low reviews\n    friend_ids = []\n    if args.friend_user_id:\n        friend_ids = [args.friend_user_id]\n        print(\"\\n=== Checking a specific friend_user_id ===\")\n        print(friend_ids[0])\n    elif args.my_user_id:\n        print(\"\\n=== Fetching friends from Neo4j for my_user_id ===\")\n        print(args.my_user_id)\n        try:\n            friend_ids = get_friend_ids_from_neo4j(args.my_user_id)\n            print(f\"Found {len(friend_ids)} friends in Neo4j.\")\n        except Exception as e:\n            print(\"Failed to fetch friends from Neo4j. Check Neo4j service/credentials and that FRIEND relationships exist.\")\n            print(\"Error:\", repr(e))\n            friend_ids = []\n    else:\n        print(\"\\n=== Friend check skipped ===\")\n        print(\"Provide --friend_user_id (specific friend) or --my_user_id (to fetch friends from Neo4j).\")\n\n    if friend_ids:\n        low_df = query_friend_reviews(\n            business_id=chosen_business_id,\n            user_ids=friend_ids,\n            since_days=args.since_days,\n            low_threshold=args.low_threshold\n        )\n        print(\"\\n=== Friend low-rating reviews (recent) ===\")\n        if low_df.empty:\n            print(f\"No friend low-rating reviews found in last {args.since_days} days with stars <= {args.low_threshold}.\")\n        else:\n            print(low_df.to_string(index=False))\n            print(\"\\nInterpretation: If these are truly your friend(s), they did review recently with a low rating.\")\n\n\nif __name__ == \"__main__\":\n    main()\n"
+    }
+  },
+{
+    "index": 216,
+    "question": "I’m really hungry and want to order food in Tucson, but I don’t want a place with tiny portions. Are there restaurants where people often say the portions are big or filling?",
+    "success": true,
+    "result": {
+      "analysis": "用户想在Tucson找“分量大/很顶饱”的餐厅，这类信息通常体现在评论文本里而不是结构化字段。最佳做法是：先用SQLite筛出Tucson且为餐厅的business候选集，再用Milvus对“big portions / filling / generous portions”等语义做向量检索找到相关评论，最后回到SQLite聚合每家店命中次数/相似度并抽取证据评论文本输出。难点在于跨库ID映射（Milvus命中的review_id/business_id要能回查SQLite）以及规模控制（候选餐厅数和向量检索topK的平衡）。",
+      "natural_question": "I’m really hungry and want to order food in Tucson, but I don’t want a place with tiny portions. Are there restaurants where people often say the portions are big or filling?",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "SQLite.business (business.db)"
+            ],
+            "filter_condition": {
+              "city": {
+                "=": "Tucson"
+              },
+              "categories": {
+                "LIKE": "%Restaurants%"
+              },
+              "is_open": {
+                "=": 1
+              }
+            }
+          },
+          "result_var": "tucson_restaurants",
+          "description": {
+            "narrative": "在SQLite里先筛出Tucson的餐厅候选集（business_id、name、stars、review_count、address等）。为控制后续计算量，可按review_count排序取前N家作为候选（例如3000）。",
+            "example_query": "SELECT business_id, name, stars, review_count, address, city, state, categories\nFROM business\nWHERE city = 'Tucson'\n  AND is_open = 1\n  AND categories LIKE '%Restaurants%'\nORDER BY review_count DESC\nLIMIT 3000;"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "Milvus.reviews (collection: reviews)"
+            ],
+            "filter_condition": {
+              "semantic_query": {
+                "IN": [
+                  "big portions",
+                  "large portions",
+                  "generous portions",
+                  "huge portions",
+                  "filling",
+                  "very filling",
+                  "lots of food",
+                  "great value and big portions"
+                ]
+              }
+            }
+          },
+          "result_var": "portion_related_hits",
+          "description": {
+            "narrative": "对“分量大/顶饱”意图做向量检索，拿到最相关的评论（含review_id、business_id、相似度分数），并在Python里只保留属于步骤1候选餐厅集合的命中。",
+            "example_query": "Milvus search (conceptual):\ncollection.search(\n  data=[embedding(\"big portions\")],\n  anns_field=\"embedding\",\n  limit=2000,\n  output_fields=[\"review_id\",\"business_id\"]\n)"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "SQLite.review (review.db)",
+              "SQLite.business (business.db)"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "IN": "top_k_business_ids"
+              },
+              "review_id": {
+                "IN": "matched_review_ids"
+              }
+            }
+          },
+          "result_var": "ranked_restaurants_with_evidence",
+          "description": {
+            "narrative": "按餐厅聚合命中评论数、平均相似度、以及抽取若干条证据评论文本；再结合business星级/评论数做综合排序，输出“分量大/顶饱”最常被提到的Tucson餐厅清单。",
+            "example_query": "SELECT review_id, business_id, stars, date, text\nFROM review\nWHERE review_id IN (?,?,?,...?);"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nfrom collections import defaultdict\nfrom dataclasses import dataclass\nfrom typing import List, Dict, Any, Tuple\n\n# Milvus\nfrom pymilvus import connections, Collection\n\n# Embeddings\ntry:\n    from sentence_transformers import SentenceTransformer\nexcept ImportError as e:\n    raise ImportError(\n        \"Missing dependency: sentence-transformers. Install with: pip install sentence-transformers\"\n    ) from e\n\n\n# -------------------------------\n# Required exact configuration\n# -------------------------------\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nconfig = {\n    'milvus_collections': {\n        'reviews': 'reviews',  # review的text存储成向量在reviews这个collection里面\n        'photos': 'photo_vector',  # photo存储在photo_vector里面\n        'tips': 'milvus_tip'  # tip的text存储在milvus_tip这个collection里面\n    },\n    'milvus_host': 'localhost',\n    'milvus_port': '19530',\n    'neo4j_uri': 'bolt://localhost:7687',\n    'neo4j_auth': ('neo4j', 'password')\n}\n\n\n# -------------------------------\n# Helpers\n# -------------------------------\n\ndef connect_sqlite(path: str) -> sqlite3.Connection:\n    conn = sqlite3.connect(path)\n    conn.row_factory = sqlite3.Row\n    return conn\n\n\n@dataclass\nclass Business:\n    business_id: str\n    name: str\n    stars: float\n    review_count: int\n    address: str\n    city: str\n    state: str\n    categories: str\n\n\ndef fetch_tucson_restaurants(conn_business: sqlite3.Connection, limit: int = 3000) -> List[Business]:\n    # Note: categories in Yelp is a comma-separated string.\n    sql = \"\"\"\n    SELECT business_id, name, stars, review_count, address, city, state, categories\n    FROM business\n    WHERE city = ?\n      AND is_open = 1\n      AND categories LIKE '%Restaurants%'\n    ORDER BY review_count DESC\n    LIMIT ?;\n    \"\"\"\n    rows = conn_business.execute(sql, (\"Tucson\", limit)).fetchall()\n    return [\n        Business(\n            business_id=r[\"business_id\"],\n            name=r[\"name\"],\n            stars=float(r[\"stars\"] or 0.0),\n            review_count=int(r[\"review_count\"] or 0),\n            address=r[\"address\"] or \"\",\n            city=r[\"city\"] or \"\",\n            state=r[\"state\"] or \"\",\n            categories=r[\"categories\"] or \"\",\n        )\n        for r in rows\n    ]\n\n\ndef fetch_reviews_by_ids(conn_review: sqlite3.Connection, review_ids: List[str]) -> Dict[str, Dict[str, Any]]:\n    if not review_ids:\n        return {}\n    # SQLite parameter limit: commonly 999. Chunk to be safe.\n    out: Dict[str, Dict[str, Any]] = {}\n    chunk_size = 900\n    for i in range(0, len(review_ids), chunk_size):\n        chunk = review_ids[i:i + chunk_size]\n        placeholders = \",\".join([\"?\"] * len(chunk))\n        sql = f\"\"\"\n        SELECT review_id, business_id, stars, date, text\n        FROM review\n        WHERE review_id IN ({placeholders});\n        \"\"\"\n        rows = conn_review.execute(sql, chunk).fetchall()\n        for r in rows:\n            out[r[\"review_id\"]] = {\n                \"review_id\": r[\"review_id\"],\n                \"business_id\": r[\"business_id\"],\n                \"stars\": r[\"stars\"],\n                \"date\": r[\"date\"],\n                \"text\": r[\"text\"]\n            }\n    return out\n\n\ndef main(\n    candidate_limit: int = 3000,\n    milvus_topk_per_query: int = 2000,\n    final_top_businesses: int = 15,\n    evidence_reviews_per_business: int = 3,\n    model_name: str = \"sentence-transformers/all-MiniLM-L6-v2\",\n):\n    # 1) SQLite: candidate restaurants in Tucson\n    conn_business = connect_sqlite(sqlite_paths[\"business\"])\n    conn_review = connect_sqlite(sqlite_paths[\"review\"])\n\n    tucson_restaurants = fetch_tucson_restaurants(conn_business, limit=candidate_limit)\n    if not tucson_restaurants:\n        print(\"No open restaurants found in Tucson with categories like 'Restaurants'.\")\n        return\n\n    candidate_set = set(b.business_id for b in tucson_restaurants)\n    business_by_id = {b.business_id: b for b in tucson_restaurants}\n\n    # 2) Milvus vector search on portion-related intent\n    connections.connect(\n        alias=\"default\",\n        host=config[\"milvus_host\"],\n        port=config[\"milvus_port\"],\n    )\n\n    collection_name = config[\"milvus_collections\"][\"reviews\"]\n    col = Collection(collection_name)\n    try:\n        col.load()\n    except Exception:\n        # load can fail if already loaded depending on Milvus version; continue.\n        pass\n\n    # IMPORTANT: These field names must match your Milvus schema.\n    # Assumption: collection has fields: embedding (vector), review_id (string), business_id (string)\n    anns_field = \"embedding\"\n    output_fields = [\"review_id\", \"business_id\"]\n\n    model = SentenceTransformer(model_name)\n\n    portion_queries = [\n        \"big portions\",\n        \"large portions\",\n        \"generous portions\",\n        \"huge portions\",\n        \"very filling\",\n        \"filling and satisfying\",\n        \"lots of food\",\n        \"great value and big portions\",\n        \"hearty portions\",\n        \"portion size is big\",\n    ]\n\n    # Collect hits per business\n    # hits_by_business[business_id] -> list of (score, review_id)\n    hits_by_business: Dict[str, List[Tuple[float, str]]] = defaultdict(list)\n\n    search_params = {\"metric_type\": \"IP\", \"params\": {\"nprobe\": 10}}\n\n    for q in portion_queries:\n        emb = model.encode([q], normalize_embeddings=True)\n        results = col.search(\n            data=emb,\n            anns_field=anns_field,\n            param=search_params,\n            limit=milvus_topk_per_query,\n            output_fields=output_fields,\n        )\n\n        # results is a list (per query vector) of hits\n        for hit in results[0]:\n            try:\n                biz_id = hit.entity.get(\"business_id\")\n                rev_id = hit.entity.get(\"review_id\")\n            except Exception:\n                # For some pymilvus versions, access pattern differs.\n                biz_id = getattr(hit, \"business_id\", None)\n                rev_id = getattr(hit, \"review_id\", None)\n\n            if not biz_id or not rev_id:\n                continue\n            if biz_id not in candidate_set:\n                continue\n\n            # In IP/cosine-like similarity, higher is more similar.\n            score = float(hit.score)\n            hits_by_business[biz_id].append((score, rev_id))\n\n    if not hits_by_business:\n        print(\"No portion-related review hits found in Milvus for Tucson restaurant candidates.\")\n        return\n\n    # 3) Aggregate and rank\n    agg = []\n    for biz_id, hits in hits_by_business.items():\n        # Deduplicate reviews per business, keep best score per review_id\n        best_by_review = {}\n        for score, rid in hits:\n            if rid not in best_by_review or score > best_by_review[rid]:\n                best_by_review[rid] = score\n\n        scores = list(best_by_review.values())\n        agg.append({\n            \"business_id\": biz_id,\n            \"hit_review_count\": len(best_by_review),\n            \"avg_similarity\": sum(scores) / max(len(scores), 1),\n            \"top_review_ids\": [rid for rid, _ in sorted(best_by_review.items(), key=lambda x: x[1], reverse=True)][: max(10, evidence_reviews_per_business)],\n        })\n\n    # Ranking heuristic:\n    # - primary: hit_review_count (more people mention it)\n    # - secondary: avg_similarity\n    # - tie-breakers: business stars and review_count\n    def rank_key(x):\n        b = business_by_id.get(x[\"business_id\"])\n        stars = b.stars if b else 0.0\n        rcount = b.review_count if b else 0\n        return (x[\"hit_review_count\"], x[\"avg_similarity\"], stars, rcount)\n\n    agg_sorted = sorted(agg, key=rank_key, reverse=True)[:final_top_businesses]\n\n    # Fetch evidence review texts from SQLite\n    all_review_ids = []\n    for a in agg_sorted:\n        all_review_ids.extend(a[\"top_review_ids\"])\n    review_map = fetch_reviews_by_ids(conn_review, list(dict.fromkeys(all_review_ids)))\n\n    # Output\n    print(\"\\nTucson restaurants frequently described as having big/filling portions (from review semantics):\\n\")\n    for i, a in enumerate(agg_sorted, 1):\n        b = business_by_id.get(a[\"business_id\"])\n        if not b:\n            continue\n\n        print(f\"#{i} {b.name}\")\n        print(f\"   Address: {b.address}, {b.city}, {b.state}\")\n        print(f\"   Yelp stars: {b.stars} | Yelp review_count: {b.review_count}\")\n        print(f\"   Portion-related hits: {a['hit_review_count']} | avg_similarity: {a['avg_similarity']:.4f}\")\n        print(f\"   Categories: {b.categories}\")\n\n        # Evidence snippets\n        shown = 0\n        for rid in a[\"top_review_ids\"]:\n            r = review_map.get(rid)\n            if not r:\n                continue\n            text = (r[\"text\"] or \"\").replace(\"\\n\", \" \").strip()\n            if len(text) > 280:\n                text = text[:277] + \"...\"\n            print(f\"     - Review ({r['date']}, stars={r['stars']}): {text}\")\n            shown += 1\n            if shown >= evidence_reviews_per_business:\n                break\n        print()\n\n\nif __name__ == \"__main__\":\n    # You can tune these parameters based on performance/coverage.\n    main(\n        candidate_limit=3000,\n        milvus_topk_per_query=2000,\n        final_top_businesses=15,\n        evidence_reviews_per_business=3,\n        model_name=\"sentence-transformers/all-MiniLM-L6-v2\",\n    )\n"
+    }
+  },
+{
+    "index": 217,
+    "question": "I need to pick a restaurant in Reno for a work dinner and don’t want to take any risks. Are there places that people in my network have been to multiple times and usually rate well?",
+    "success": true,
+    "result": {
+      "analysis": "用户想在Reno选一家适合工作晚餐、低风险的餐厅，并且希望依据“我社交网络里的人（朋友/朋友的朋友）”的真实行为来做决策：这些人是否多次去过（用多次互动作为代理：多条review/tip、或多人反复互动）以及是否通常给高分（朋友review平均星级高、方差低）。该问题需要先定义“我的网络”（基于Neo4j里的好友关系，必要时可fallback到SQLite user.friends），再用SQLite在review/tip/business库里做聚合与筛选排序。属于跨库（图 + SQL）分析型查询。",
+      "natural_question": "在Reno为工作晚餐选餐厅：有哪些餐厅是我社交网络里的人去过多次（多次互动/多人互动）并且评分通常较高的？",
+      "difficulty": "medium",
+      "query_types": [
+        "graph",
+        "sql"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "neo4j(User-FRIEND-User)"
+            ],
+            "filter_condition": {
+              "user_id": {
+                "=": "<YOUR_USER_ID>"
+              },
+              "depth": {
+                "<=": 2
+              }
+            }
+          },
+          "result_var": "network_user_ids",
+          "description": {
+            "narrative": "从Neo4j中取出“我的网络”用户集合（朋友或朋友的朋友）。如果Neo4j里没有对应schema/数据，则在代码里fallback到SQLite的user表friends字段解析。",
+            "example_query": "MATCH (u:User {user_id:$user_id})-[:FRIEND*1..$depth]->(f:User)\nRETURN DISTINCT f.user_id AS friend_id"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "sqlite(review.db: review)",
+              "sqlite(tip.db: tip)"
+            ],
+            "filter_condition": {
+              "user_id": {
+                "IN": "network_user_ids"
+              }
+            }
+          },
+          "result_var": "network_interactions",
+          "description": {
+            "narrative": "从SQLite中拉取网络用户在review与tip里的互动数据。review用于“评分通常较高”的判定；tip用于补充“多次去过/多次互动”的信号（同一人对同一商家可能有多条tip）。",
+            "example_query": "SELECT business_id, user_id, stars, date\nFROM review\nWHERE user_id IN (?,?,...);\n\nSELECT business_id, user_id, date\nFROM tip\nWHERE user_id IN (?,?,...);"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "sqlite(business.db: business)"
+            ],
+            "filter_condition": {
+              "city": {
+                "=": "Reno"
+              },
+              "categories": {
+                "LIKE": "%Restaurants%"
+              }
+            }
+          },
+          "result_var": "reno_restaurants",
+          "description": {
+            "narrative": "从business库取出Reno的餐厅候选集合，用于把网络互动限定到Reno餐厅，并补齐餐厅名称、地址、总体星级、总体review_count等信息。",
+            "example_query": "SELECT business_id, name, address, city, state, stars, review_count, categories\nFROM business\nWHERE city = 'Reno'\n  AND categories LIKE '%Restaurants%';"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "python(pandas aggregation)"
+            ],
+            "filter_condition": {
+              "min_avg_stars_network": {
+                ">=": 4.0
+              },
+              "min_distinct_people": {
+                ">=": 2
+              },
+              "min_total_interactions": {
+                ">=": 3
+              }
+            }
+          },
+          "result_var": "ranked_recommendations",
+          "description": {
+            "narrative": "聚合网络口碑与互动：计算每家餐厅网络review平均分、评分标准差、网络review数、网络tip数、网络互动总数、网络参与人数。筛选“低风险”（高均分、多人背书、互动次数足够、且可选地要求方差低），并按综合得分排序输出Top N。",
+            "example_query": "（聚合在Python里做）\nscore = 0.6*avg_stars_network + 0.2*log1p(distinct_people) + 0.2*log1p(total_interactions) - 0.1*stdev_stars"
+          }
+        }
+      ],
+      "complete_code": "import math\nimport sqlite3\nfrom dataclasses import dataclass\nfrom typing import List, Set, Optional, Dict, Any\n\nimport pandas as pd\n\n# Neo4j driver (pip install neo4j)\nfrom neo4j import GraphDatabase\n\n\n# -------------------------\n# Fixed configuration (as required)\n# -------------------------\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nmilvus_config = {\n    'milvus_collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    },\n    'milvus_host': 'localhost',\n    'milvus_port': '19530'\n}\n\nneo4j_config = {\n    'neo4j_uri': 'bolt://localhost:7687',\n    'neo4j_auth': ('neo4j', 'password')\n}\n\n\n# -------------------------\n# Helpers\n# -------------------------\n\ndef _connect_sqlite(db_path: str) -> sqlite3.Connection:\n    conn = sqlite3.connect(db_path)\n    conn.row_factory = sqlite3.Row\n    return conn\n\n\ndef _chunked(seq: List[Any], n: int) -> List[List[Any]]:\n    return [seq[i:i + n] for i in range(0, len(seq), n)]\n\n\ndef _sql_in_clause_params(values: List[Any]) -> str:\n    # returns '(?,?,...)'\n    return '(' + ','.join(['?'] * len(values)) + ')'\n\n\n# -------------------------\n# Step 1: Network users from Neo4j (with SQLite fallback)\n# -------------------------\n\ndef get_network_user_ids_neo4j(user_id: str, depth: int = 2) -> Set[str]:\n    \"\"\"Try to fetch network user ids from Neo4j. Assumes :User{user_id} and :FRIEND relationships.\"\"\"\n    driver = GraphDatabase.driver(neo4j_config['neo4j_uri'], auth=neo4j_config['neo4j_auth'])\n    cypher = (\n        \"MATCH (u:User {user_id:$user_id})-[:FRIEND*1..$depth]->(f:User) \"\n        \"RETURN DISTINCT f.user_id AS friend_id\"\n    )\n    out: Set[str] = set()\n    try:\n        with driver.session() as session:\n            rows = session.run(cypher, user_id=user_id, depth=int(depth))\n            for r in rows:\n                if r.get('friend_id'):\n                    out.add(r['friend_id'])\n    finally:\n        driver.close()\n    return out\n\n\ndef get_network_user_ids_sqlite_fallback(user_id: str, depth: int = 1) -> Set[str]:\n    \"\"\"Fallback: parse user.friends from SQLite user.db.\n    Assumes a table named 'user' with columns: user_id, friends (comma-separated).\n    depth=1 only in this fallback (friends-of-friends requires more joins/parsing).\n    \"\"\"\n    if depth != 1:\n        raise ValueError(\"SQLite fallback supports only depth=1 (direct friends) in this sample.\")\n\n    conn = _connect_sqlite(sqlite_paths['user'])\n    try:\n        # Many Yelp SQLite builds name the table 'user'. If your table name differs, adjust here.\n        row = conn.execute(\"SELECT friends FROM user WHERE user_id = ?\", (user_id,)).fetchone()\n        if not row or not row['friends']:\n            return set()\n        friends = [x.strip() for x in str(row['friends']).split(',') if x.strip()]\n        return set(friends)\n    finally:\n        conn.close()\n\n\ndef get_network_user_ids(user_id: str, depth: int = 2) -> Set[str]:\n    \"\"\"Primary: Neo4j. Fallback: SQLite parsing.\"\"\"\n    try:\n        ids = get_network_user_ids_neo4j(user_id=user_id, depth=depth)\n        if ids:\n            return ids\n    except Exception as e:\n        print(f\"[WARN] Neo4j network query failed, fallback to SQLite user.friends. Reason: {e}\")\n\n    try:\n        return get_network_user_ids_sqlite_fallback(user_id=user_id, depth=1)\n    except Exception as e:\n        print(f\"[WARN] SQLite fallback network query failed. Reason: {e}\")\n        return set()\n\n\n# -------------------------\n# Step 2/3: Pull interactions + Reno restaurants\n# -------------------------\n\ndef load_reno_restaurants(city: str = \"Reno\") -> pd.DataFrame:\n    conn = _connect_sqlite(sqlite_paths['business'])\n    try:\n        df = pd.read_sql_query(\n            \"\"\"\n            SELECT business_id, name, address, city, state, stars AS overall_stars,\n                   review_count AS overall_review_count, categories\n            FROM business\n            WHERE city = ?\n              AND categories LIKE '%Restaurants%'\n            \"\"\",\n            conn,\n            params=(city,)\n        )\n        return df\n    finally:\n        conn.close()\n\n\ndef load_network_reviews(network_user_ids: List[str]) -> pd.DataFrame:\n    if not network_user_ids:\n        return pd.DataFrame(columns=['business_id', 'user_id', 'stars', 'date'])\n\n    conn = _connect_sqlite(sqlite_paths['review'])\n    try:\n        dfs = []\n        # SQLite has a limit on number of bound vars; chunk to be safe.\n        for chunk in _chunked(network_user_ids, 800):\n            q = f\"SELECT business_id, user_id, stars, date FROM review WHERE user_id IN {_sql_in_clause_params(chunk)}\"\n            dfs.append(pd.read_sql_query(q, conn, params=chunk))\n        return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame(columns=['business_id', 'user_id', 'stars', 'date'])\n    finally:\n        conn.close()\n\n\ndef load_network_tips(network_user_ids: List[str]) -> pd.DataFrame:\n    if not network_user_ids:\n        return pd.DataFrame(columns=['business_id', 'user_id', 'date'])\n\n    conn = _connect_sqlite(sqlite_paths['tip'])\n    try:\n        dfs = []\n        for chunk in _chunked(network_user_ids, 800):\n            q = f\"SELECT business_id, user_id, date FROM tip WHERE user_id IN {_sql_in_clause_params(chunk)}\"\n            dfs.append(pd.read_sql_query(q, conn, params=chunk))\n        return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame(columns=['business_id', 'user_id', 'date'])\n    finally:\n        conn.close()\n\n\n# -------------------------\n# Step 4: Aggregate + rank\n# -------------------------\n\ndef rank_low_risk_spots(\n    reno_restaurants: pd.DataFrame,\n    reviews_df: pd.DataFrame,\n    tips_df: pd.DataFrame,\n    min_avg_stars_network: float = 4.0,\n    min_distinct_people: int = 2,\n    min_total_interactions: int = 3,\n    max_star_stdev: Optional[float] = 1.0,\n    top_n: int = 10\n) -> pd.DataFrame:\n\n    if reno_restaurants.empty:\n        return pd.DataFrame()\n\n    # Keep only interactions on Reno restaurants\n    reno_ids = set(reno_restaurants['business_id'].astype(str).tolist())\n\n    reviews_df = reviews_df.copy()\n    tips_df = tips_df.copy()\n\n    if not reviews_df.empty:\n        reviews_df['business_id'] = reviews_df['business_id'].astype(str)\n        reviews_df = reviews_df[reviews_df['business_id'].isin(reno_ids)]\n\n    if not tips_df.empty:\n        tips_df['business_id'] = tips_df['business_id'].astype(str)\n        tips_df = tips_df[tips_df['business_id'].isin(reno_ids)]\n\n    # Aggregate review metrics\n    if reviews_df.empty:\n        review_agg = pd.DataFrame(columns=[\n            'business_id', 'avg_stars_network', 'stdev_stars_network',\n            'network_review_count', 'distinct_network_reviewers'\n        ])\n    else:\n        review_agg = (reviews_df\n                      .groupby('business_id')\n                      .agg(\n                          avg_stars_network=('stars', 'mean'),\n                          stdev_stars_network=('stars', 'std'),\n                          network_review_count=('stars', 'count'),\n                          distinct_network_reviewers=('user_id', 'nunique')\n                      )\n                      .reset_index())\n\n    # Aggregate tip metrics\n    if tips_df.empty:\n        tip_agg = pd.DataFrame(columns=['business_id', 'network_tip_count', 'distinct_network_tippers'])\n    else:\n        tip_agg = (tips_df\n                   .groupby('business_id')\n                   .agg(\n                       network_tip_count=('date', 'count'),\n                       distinct_network_tippers=('user_id', 'nunique')\n                   )\n                   .reset_index())\n\n    # Merge with business\n    out = reno_restaurants.copy()\n    out['business_id'] = out['business_id'].astype(str)\n\n    out = out.merge(review_agg, on='business_id', how='left')\n    out = out.merge(tip_agg, on='business_id', how='left')\n\n    # Fill NaNs\n    for col in ['avg_stars_network', 'stdev_stars_network', 'network_review_count', 'distinct_network_reviewers',\n                'network_tip_count', 'distinct_network_tippers']:\n        if col in out.columns:\n            out[col] = out[col].fillna(0)\n\n    # Define “repeat visits / multiple times” proxy\n    out['total_network_interactions'] = out['network_review_count'] + out['network_tip_count']\n    out['distinct_network_people'] = out[['distinct_network_reviewers', 'distinct_network_tippers']].max(axis=1)\n\n    # Optional: stdev filter; when only 1 review, std is 0 in our fillna, which is OK\n    filt = (\n        (out['avg_stars_network'] >= float(min_avg_stars_network)) &\n        (out['distinct_network_people'] >= int(min_distinct_people)) &\n        (out['total_network_interactions'] >= int(min_total_interactions))\n    )\n    if max_star_stdev is not None:\n        filt = filt & (out['stdev_stars_network'] <= float(max_star_stdev))\n\n    out = out[filt].copy()\n\n    if out.empty:\n        return out\n\n    # Ranking score: emphasize network avg stars, then breadth (people), then depth (interactions), penalize variance\n    def safe_log1p(x: float) -> float:\n        return math.log1p(max(0.0, float(x)))\n\n    out['rank_score'] = (\n        0.65 * out['avg_stars_network'] +\n        0.20 * out['distinct_network_people'].map(safe_log1p) +\n        0.15 * out['total_network_interactions'].map(safe_log1p) -\n        0.10 * out['stdev_stars_network']\n    )\n\n    out = out.sort_values(\n        by=['rank_score', 'avg_stars_network', 'distinct_network_people', 'total_network_interactions'],\n        ascending=[False, False, False, False]\n    )\n\n    cols = [\n        'name', 'address', 'city', 'state',\n        'avg_stars_network', 'stdev_stars_network',\n        'distinct_network_people', 'total_network_interactions',\n        'network_review_count', 'network_tip_count',\n        'overall_stars', 'overall_review_count',\n        'categories', 'business_id'\n    ]\n    cols = [c for c in cols if c in out.columns]\n    return out[cols].head(top_n)\n\n\n# -------------------------\n# Main runnable\n# -------------------------\n\ndef main():\n    # TODO: Replace with your Yelp user_id (the id used in your dataset)\n    my_user_id = \"<YOUR_USER_ID>\"\n\n    # Tunables for “don’t take risks”\n    city = \"Reno\"\n    network_depth = 2\n    min_avg = 4.0\n    min_people = 2\n    min_interactions = 3\n    max_stdev = 1.0  # lower => more consistent ratings\n    top_n = 10\n\n    if my_user_id == \"<YOUR_USER_ID>\":\n        raise ValueError(\"Please set my_user_id to a real Yelp user_id from your dataset.\")\n\n    network_ids = get_network_user_ids(user_id=my_user_id, depth=network_depth)\n    network_ids.add(my_user_id)  # include yourself\n\n    print(f\"Network size (including self): {len(network_ids)}\")\n\n    reno_restaurants = load_reno_restaurants(city=city)\n    reviews_df = load_network_reviews(sorted(network_ids))\n    tips_df = load_network_tips(sorted(network_ids))\n\n    ranked = rank_low_risk_spots(\n        reno_restaurants=reno_restaurants,\n        reviews_df=reviews_df,\n        tips_df=tips_df,\n        min_avg_stars_network=min_avg,\n        min_distinct_people=min_people,\n        min_total_interactions=min_interactions,\n        max_star_stdev=max_stdev,\n        top_n=top_n\n    )\n\n    if ranked.empty:\n        print(\"No results matched your low-risk constraints. Try relaxing thresholds, e.g. min_people=1 or max_stdev=None.\")\n        return\n\n    pd.set_option('display.max_colwidth', 80)\n    print(\"\\nTop low-risk Reno restaurants based on your network:\\n\")\n    print(ranked.to_string(index=False))\n\n\nif __name__ == \"__main__\":\n    main()\n"
+    }
+  },
+{
+    "index": 218,
+    "question": "I’m looking for a restaurant in Boise that’s generally reliable. Are there places where reviews are mostly consistent, instead of being very hit or miss?",
+    "success": true,
+    "result": {
+      "analysis": "你的问题本质是在 Boise 找“评价稳定/不太踩雷”的餐厅。可操作的量化方式是：在 Boise、且属于 Restaurants 类别的商家里，基于 review 的星级分布计算“离散程度”（例如标准差stddev或方差），标准差越小表示越一致；再加上最低评论数门槛（避免样本太小造成假稳定），并设置最低平均分，得到“总体口碑不错且评价一致”的候选清单。这主要是跨两个 SQLite 库（business.db + review.db）的聚合分析查询。",
+      "natural_question": "I’m looking for a restaurant in Boise that’s generally reliable. Are there places where reviews are mostly consistent, instead of being very hit or miss?",
+      "difficulty": "medium",
+      "query_types": [
+        "sql"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "sqlite:business.db"
+            ],
+            "filter_condition": {
+              "city": {
+                "=": "Boise"
+              },
+              "state": {
+                "=": "ID"
+              },
+              "categories": {
+                "LIKE": "%Restaurants%"
+              },
+              "is_open": {
+                "=": 1
+              }
+            }
+          },
+          "result_var": "boise_restaurants",
+          "description": {
+            "narrative": "从 business.db 里筛选出 Boise, ID 的餐厅（categories 包含 Restaurants），并且只取营业中的商家，得到候选 business 列表。",
+            "example_query": "SELECT business_id, name, address, stars, review_count, categories FROM business WHERE city='Boise' AND state='ID' AND is_open=1 AND categories LIKE '%Restaurants%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "sqlite:review.db"
+            ],
+            "filter_condition": {
+              "review_stars": {
+                "BETWEEN": [
+                  1,
+                  5
+                ]
+              }
+            }
+          },
+          "result_var": "review_stats",
+          "description": {
+            "narrative": "将 review.db 的每条评论按 business_id 聚合，计算评论数、平均分、以及评分标准差（用 sqrt(E[x^2]-E[x]^2) 在 SQLite 中实现），作为“是否稳定”的核心指标。",
+            "example_query": "SELECT business_id, COUNT(*) AS n_reviews, AVG(stars) AS avg_review_stars, sqrt(AVG(stars*stars) - AVG(stars)*AVG(stars)) AS stddev_review_stars FROM review GROUP BY business_id;"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "sqlite:business.db",
+              "sqlite:review.db"
+            ],
+            "filter_condition": {
+              "min_reviews": {
+                ">=": 30
+              },
+              "min_avg_stars": {
+                ">=": 3.5
+              }
+            }
+          },
+          "result_var": "reliable_restaurants",
+          "description": {
+            "narrative": "把 Boise 餐厅列表与评论聚合指标 join 起来，过滤掉评论数太少、或平均分过低的商家；按标准差从小到大排序（越小越一致），再以评论数作为次级排序，输出最“稳定靠谱”的餐厅。",
+            "example_query": "SELECT b.business_id, b.name, b.address, b.stars AS yelp_business_stars, b.review_count AS yelp_business_review_count, rs.n_reviews, rs.avg_review_stars, rs.stddev_review_stars FROM business b JOIN (SELECT business_id, COUNT(*) AS n_reviews, AVG(stars) AS avg_review_stars, sqrt(AVG(stars*stars) - AVG(stars)*AVG(stars)) AS stddev_review_stars FROM review GROUP BY business_id) rs ON b.business_id=rs.business_id WHERE b.city='Boise' AND b.state='ID' AND b.is_open=1 AND b.categories LIKE '%Restaurants%' AND rs.n_reviews>=30 AND rs.avg_review_stars>=3.5 ORDER BY rs.stddev_review_stars ASC, rs.n_reviews DESC LIMIT 20;"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\\nimport math\\nimport pandas as pd\\n\\n# --- Fixed configuration (per requirement) ---\\nsqlite_paths = {\\n    \\\"business\\\": \\\"D:/Yelp-JSON/db/sqlite3/business.db\\\",\\n    \\\"checkin\\\": \\\"D:/Yelp-JSON/db/sqlite3/checkin.db\\\",\\n    \\\"photo\\\": \\\"D:/Yelp-JSON/db/sqlite3/photo.db\\\",\\n    \\\"review\\\": \\\"D:/Yelp-JSON/db/sqlite3/review.db\\\",\\n    \\\"tip\\\": \\\"D:/Yelp-JSON/db/sqlite3/tip.db\\\",\\n    \\\"user\\\": \\\"D:/Yelp-JSON/db/sqlite3/user.db\\\"\\n}\\n\\n# Milvus/Neo4j config present but not required for this question\\nconfig = {\\n    'milvus_collections': {\\n        'reviews': 'reviews',\\n        'photos': 'photo_vector',\\n        'tips': 'milvus_tip'\\n    },\\n    'milvus_host': 'localhost',\\n    'milvus_port': '19530',\\n    'neo4j_uri': 'bolt://localhost:7687',\\n    'neo4j_auth': ('neo4j', 'password')\\n}\\n\\ndef find_consistent_boiese_restaurants(\\n    city='Boise',\\n    state='ID',\\n    min_reviews=30,\\n    min_avg_stars=3.5,\\n    only_open=True,\\n    limit=20\\n):\\n    \\\"\\\"\\\"\\n    Return Boise restaurants with the most consistent ratings.\\n\\n    Consistency metric: stddev of review stars (lower = more consistent).\\n    Implemented in SQLite as sqrt(E[x^2] - (E[x])^2).\\n    \\\"\\\"\\\"\\n\\n    # Use an in-memory connection and ATTACH both DBs so we can join across files\\n    con = sqlite3.connect(':memory:')\\n    con.execute('PRAGMA foreign_keys = OFF;')\\n\\n    try:\\n        con.execute(f\\\"ATTACH DATABASE '{sqlite_paths['business']}' AS business_db;\\\")\\n        con.execute(f\\\"ATTACH DATABASE '{sqlite_paths['review']}' AS review_db;\\\")\\n\\n        open_clause = \\\"AND b.is_open = 1\\\" if only_open else \\\"\\\"\\n\\n        query = f\\\"\\\"\\\"\\n        WITH boise_restaurants AS (\\n            SELECT\\n                b.business_id,\\n                b.name,\\n                b.address,\\n                b.city,\\n                b.state,\\n                b.stars AS yelp_business_stars,\\n                b.review_count AS yelp_business_review_count,\\n                b.categories\\n            FROM business_db.business b\\n            WHERE b.city = ?\\n              AND b.state = ?\\n              {open_clause}\\n              AND b.categories LIKE '%Restaurants%'\\n        ),\\n        review_stats AS (\\n            SELECT\\n                r.business_id,\\n                COUNT(*) AS n_reviews,\\n                AVG(r.stars) AS avg_review_stars,\\n                -- stddev = sqrt(E[x^2] - (E[x])^2)\\n                CASE\\n                    WHEN COUNT(*) > 1 THEN\\n                        sqrt(AVG(r.stars * r.stars) - AVG(r.stars) * AVG(r.stars))\\n                    ELSE NULL\\n                END AS stddev_review_stars\\n            FROM review_db.review r\\n            GROUP BY r.business_id\\n        )\\n        SELECT\\n            br.business_id,\\n            br.name,\\n            br.address,\\n            br.city,\\n            br.state,\\n            br.yelp_business_stars,\\n            br.yelp_business_review_count,\\n            rs.n_reviews,\\n            ROUND(rs.avg_review_stars, 3) AS avg_review_stars,\\n            ROUND(rs.stddev_review_stars, 3) AS stddev_review_stars,\\n            br.categories\\n        FROM boise_restaurants br\\n        JOIN review_stats rs\\n          ON br.business_id = rs.business_id\\n        WHERE rs.n_reviews >= ?\\n          AND rs.avg_review_stars >= ?\\n          AND rs.stddev_review_stars IS NOT NULL\\n        ORDER BY rs.stddev_review_stars ASC, rs.n_reviews DESC\\n        LIMIT ?;\\n        \\\"\\\"\\\"\\n\\n        df = pd.read_sql_query(query, con, params=[city, state, min_reviews, min_avg_stars, limit])\\n        return df\\n\\n    finally:\\n        try:\\n            con.execute('DETACH DATABASE business_db;')\\n        except Exception:\\n            pass\\n        try:\\n            con.execute('DETACH DATABASE review_db;')\\n        except Exception:\\n            pass\\n        con.close()\\n\\n\\nif __name__ == '__main__':\\n    # You can tune these thresholds:\\n    # - min_reviews: higher -> more statistically reliable\\n    # - min_avg_stars: higher -> better overall rating\\n    # - limit: number of results\\n    df = find_consistent_boiese_restaurants(\\n        city='Boise',\\n        state='ID',\\n        min_reviews=30,\\n        min_avg_stars=3.5,\\n        only_open=True,\\n        limit=20\\n    )\\n\\n    if df.empty:\\n        print('No restaurants matched the criteria. Try lowering min_reviews or min_avg_stars.')\\n    else:\\n        # Display the most useful columns\\n        cols = [\\n            'name', 'address',\\n            'avg_review_stars', 'stddev_review_stars', 'n_reviews',\\n            'yelp_business_stars', 'yelp_business_review_count'\\n        ]\\n        print(df[cols].to_string(index=False))\\n\\n        # Optional: save\\n        # df.to_csv('boise_consistent_restaurants.csv', index=False)\\n"
+    }
+  },
+{
+    "index": 219,
+    "question": "I want to find a café in Reno that looks nice and is good for photos. Are there places where people upload a lot of good-looking photos, not just food shots?",
+    "success": true,
+    "result": {
+      "analysis": "你的问题核心是在Reno里找“适合拍照、环境好看”的咖啡馆，并且想避免“照片几乎全是食物”的店。Yelp数据里可以用SQLite的business表筛出Reno的咖啡馆；再用SQLite的photo表按label（inside/outside/food/drink/menu）统计每家店的照片结构，优先选inside/outside多且food占比不高的；如果你们的Milvus里存了照片向量（photo_vector），还能用文本查询（如“aesthetic cafe interior”）做向量检索，把“更符合好看/氛围感”的照片对应到店，再对店做加权排序。这属于SQL统计 + 向量检索的组合查询。",
+      "natural_question": "在Reno找一家看起来很漂亮、适合拍照的咖啡馆：是否有那种用户上传了很多好看的环境照（室内/室外/氛围），而不只是食物照的店？",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "sqlite:business.db (business表)"
+            ],
+            "filter_condition": {
+              "city": {
+                "=": "Reno"
+              },
+              "state": {
+                "=": "NV"
+              },
+              "categories": {
+                "LIKE": "%Cafes%"
+              }
+            }
+          },
+          "result_var": "reno_cafes_df",
+          "description": {
+            "narrative": "先从business表筛出Reno, NV 且类别包含Cafes的商家，拿到business_id、name、stars、review_count等基础信息。",
+            "example_query": "SELECT business_id, name, address, city, state, stars, review_count, categories\nFROM business\nWHERE city='Reno' AND state='NV'\n  AND categories LIKE '%Cafes%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "sqlite:photo.db (photo表)"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "IN": "reno_cafes_df.business_id"
+              }
+            }
+          },
+          "result_var": "photo_stats_df",
+          "description": {
+            "narrative": "在photo表里对这些咖啡馆做照片统计：总照片数、inside/outside数量（更像“环境照/氛围照”）、food数量（食物照）、drink数量等，并计算inside/outside占比、food占比，用于排除“几乎全是食物照”的店。",
+            "example_query": "SELECT business_id,\n       COUNT(*) AS total_photos,\n       SUM(CASE WHEN label IN ('inside','outside') THEN 1 ELSE 0 END) AS inside_outside_photos,\n       SUM(CASE WHEN label='food' THEN 1 ELSE 0 END) AS food_photos,\n       SUM(CASE WHEN label='drink' THEN 1 ELSE 0 END) AS drink_photos,\n       SUM(CASE WHEN label='menu' THEN 1 ELSE 0 END) AS menu_photos\nFROM photo\nWHERE business_id IN ( ... )\nGROUP BY business_id;"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "sql:business+photo聚合结果(reno_cafes_df JOIN photo_stats_df)"
+            ],
+            "filter_condition": {
+              "total_photos": {
+                ">=": 10
+              },
+              "inside_outside_ratio": {
+                ">=": 0.4
+              },
+              "food_ratio": {
+                "<=": 0.6
+              }
+            }
+          },
+          "result_var": "candidates_df",
+          "description": {
+            "narrative": "把商家信息与照片统计合并后做规则筛选：要求照片数量足够、inside/outside占比高、food占比不高。先给出“结构上更像好拍照的店”的候选列表，并按inside/outside照片数、评分等排序。",
+            "example_query": "（示意：在Python里对聚合结果做ratio计算与过滤/排序）"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "milvus:photo_vector (按文本查询做向量检索)"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "IN": "candidates_df.business_id(TopN)"
+              }
+            }
+          },
+          "result_var": "vector_rank_df",
+          "description": {
+            "narrative": "（可选增强）用Milvus对“好看/氛围感/适合拍照”的文本提示词生成文本向量，在photo_vector里做相似度搜索，并限制business_id在候选集合里。把命中的高相似照片按商家聚合（比如每家取TopK照片的平均分/最大分），得到更“审美相关”的最终排序。",
+            "example_query": "Milvus search（伪代码）：\ncollection.search(\n  data=[text_emb],\n  anns_field='vector',\n  param={'metric_type':'IP','params':{'nprobe':10}},\n  limit=200,\n  expr=\"business_id in ['id1','id2',...]\",\n  output_fields=['photo_id','business_id']\n)"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport math\nfrom typing import List, Dict, Any\n\nimport pandas as pd\n\n# -----------------------------\n# Fixed configuration (as required)\n# -----------------------------\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nCONFIG = {\n    'milvus_collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    },\n    'milvus_host': 'localhost',\n    'milvus_port': '19530',\n    'neo4j_uri': 'bolt://localhost:7687',\n    'neo4j_auth': ('neo4j', 'password')\n}\n\n\ndef sql_in_list(items: List[str]) -> str:\n    # Safe-ish helper for building IN (...) lists for SQLite when you already trust ids.\n    # For fully safe parameterization with variable-length lists, use temp tables.\n    return \"(\" + \",\".join([\"'\" + x.replace(\"'\", \"''\") + \"'\" for x in items]) + \")\"\n\n\ndef get_reno_cafes() -> pd.DataFrame:\n    con = sqlite3.connect(sqlite_paths[\"business\"])\n    try:\n        q = \"\"\"\n        SELECT business_id, name, address, city, state, stars, review_count, categories\n        FROM business\n        WHERE city = 'Reno' AND state = 'NV'\n          AND categories LIKE '%Cafes%'\n        \"\"\"\n        df = pd.read_sql_query(q, con)\n        return df\n    finally:\n        con.close()\n\n\ndef get_photo_stats(business_ids: List[str]) -> pd.DataFrame:\n    if not business_ids:\n        return pd.DataFrame(columns=[\n            \"business_id\", \"total_photos\", \"inside_outside_photos\", \"food_photos\", \"drink_photos\", \"menu_photos\"\n        ])\n\n    con = sqlite3.connect(sqlite_paths[\"photo\"])\n    try:\n        in_clause = sql_in_list(business_ids)\n        q = f\"\"\"\n        SELECT business_id,\n               COUNT(*) AS total_photos,\n               SUM(CASE WHEN label IN ('inside','outside') THEN 1 ELSE 0 END) AS inside_outside_photos,\n               SUM(CASE WHEN label='food' THEN 1 ELSE 0 END) AS food_photos,\n               SUM(CASE WHEN label='drink' THEN 1 ELSE 0 END) AS drink_photos,\n               SUM(CASE WHEN label='menu' THEN 1 ELSE 0 END) AS menu_photos\n        FROM photo\n        WHERE business_id IN {in_clause}\n        GROUP BY business_id\n        \"\"\"\n        df = pd.read_sql_query(q, con)\n        return df\n    finally:\n        con.close()\n\n\ndef pick_candidates(reno_cafes_df: pd.DataFrame,\n                    photo_stats_df: pd.DataFrame,\n                    min_total_photos: int = 10,\n                    min_inside_outside_ratio: float = 0.40,\n                    max_food_ratio: float = 0.60) -> pd.DataFrame:\n\n    df = reno_cafes_df.merge(photo_stats_df, on=\"business_id\", how=\"left\")\n    # Fill NaNs for businesses with no photos\n    for col in [\"total_photos\", \"inside_outside_photos\", \"food_photos\", \"drink_photos\", \"menu_photos\"]:\n        df[col] = df[col].fillna(0).astype(int)\n\n    df[\"inside_outside_ratio\"] = df.apply(\n        lambda r: (r[\"inside_outside_photos\"] / r[\"total_photos\"]) if r[\"total_photos\"] > 0 else 0.0,\n        axis=1\n    )\n    df[\"food_ratio\"] = df.apply(\n        lambda r: (r[\"food_photos\"] / r[\"total_photos\"]) if r[\"total_photos\"] > 0 else 0.0,\n        axis=1\n    )\n\n    candidates = df[\n        (df[\"total_photos\"] >= min_total_photos) &\n        (df[\"inside_outside_ratio\"] >= min_inside_outside_ratio) &\n        (df[\"food_ratio\"] <= max_food_ratio)\n    ].copy()\n\n    # A simple score: prioritize lots of inside/outside photos, then rating, then review_count\n    candidates[\"photo_focus_score\"] = (\n        candidates[\"inside_outside_photos\"]\n        + 0.5 * candidates[\"drink_photos\"]\n        - 0.25 * candidates[\"food_photos\"]\n    )\n\n    candidates = candidates.sort_values(\n        by=[\"photo_focus_score\", \"inside_outside_photos\", \"stars\", \"review_count\"],\n        ascending=[False, False, False, False]\n    )\n\n    return candidates\n\n\n# -----------------------------\n# Optional: Milvus re-ranking by aesthetic text query\n# -----------------------------\n\ndef try_milvus_rerank(candidates_df: pd.DataFrame,\n                      text_query: str = \"aesthetic cafe interior, beautiful cozy cafe, photogenic\",\n                      topn_businesses: int = 30,\n                      search_limit: int = 200,\n                      topk_per_business: int = 5) -> pd.DataFrame:\n    \"\"\"Returns a dataframe with columns: business_id, milvus_score, matched_photos\n\n    Notes:\n    - This assumes Milvus collection CONFIG['milvus_collections']['photos'] has fields:\n      - 'vector' : FloatVector\n      - 'photo_id' : string\n      - 'business_id' : string\n    - If your schema uses different field names, adjust anns_field/output_fields accordingly.\n    - Requires: pymilvus + open_clip_torch (or compatible CLIP text encoder).\n    \"\"\"\n\n    if candidates_df.empty:\n        return pd.DataFrame(columns=[\"business_id\", \"milvus_score\", \"matched_photos\"])\n\n    # Import lazily so the script still runs without these optional deps\n    try:\n        from pymilvus import connections, Collection\n    except Exception as e:\n        print(\"[WARN] pymilvus not available; skipping Milvus rerank.\", e)\n        return pd.DataFrame(columns=[\"business_id\", \"milvus_score\", \"matched_photos\"])\n\n    # Build text embedding using CLIP (must match what you used to embed images)\n    # If you used a different embedding model, replace this part accordingly.\n    try:\n        import torch\n        import open_clip\n\n        model, _, preprocess = open_clip.create_model_and_transforms('ViT-B-32', pretrained='openai')\n        tokenizer = open_clip.get_tokenizer('ViT-B-32')\n        model.eval()\n\n        with torch.no_grad():\n            tokens = tokenizer([text_query])\n            text_features = model.encode_text(tokens)\n            text_features = text_features / text_features.norm(dim=-1, keepdim=True)\n            query_vec = text_features.cpu().numpy()[0].tolist()\n    except Exception as e:\n        print(\"[WARN] open_clip/torch not available (or failed); skipping Milvus rerank.\", e)\n        return pd.DataFrame(columns=[\"business_id\", \"milvus_score\", \"matched_photos\"])\n\n    # Connect Milvus\n    connections.connect(host=CONFIG['milvus_host'], port=CONFIG['milvus_port'])\n    col_name = CONFIG['milvus_collections']['photos']\n    collection = Collection(col_name)\n\n    # Limit to top-N candidates for efficiency\n    top_candidates = candidates_df.head(topn_businesses).copy()\n    biz_ids = top_candidates[\"business_id\"].tolist()\n\n    # Milvus expr\n    expr = \"business_id in [\" + \",\".join([\"'\" + b.replace(\"'\", \"\\\\'\") + \"'\" for b in biz_ids]) + \"]\"\n\n    # Search\n    search_params = {\"metric_type\": \"IP\", \"params\": {\"nprobe\": 10}}\n\n    try:\n        results = collection.search(\n            data=[query_vec],\n            anns_field=\"vector\",\n            param=search_params,\n            limit=search_limit,\n            expr=expr,\n            output_fields=[\"photo_id\", \"business_id\"]\n        )\n    except Exception as e:\n        print(\"[WARN] Milvus search failed; skipping rerank.\", e)\n        return pd.DataFrame(columns=[\"business_id\", \"milvus_score\", \"matched_photos\"])\n\n    # Aggregate per business: take top-k photo scores average\n    # results is a list (nq) of hits\n    hits = results[0]\n    per_biz: Dict[str, List[Dict[str, Any]]] = {}\n    for h in hits:\n        b = h.entity.get(\"business_id\")\n        pid = h.entity.get(\"photo_id\")\n        score = float(h.score)\n        per_biz.setdefault(b, []).append({\"photo_id\": pid, \"score\": score})\n\n    rows = []\n    for b, lst in per_biz.items():\n        lst_sorted = sorted(lst, key=lambda x: x[\"score\"], reverse=True)[:topk_per_business]\n        avg_score = sum(x[\"score\"] for x in lst_sorted) / max(1, len(lst_sorted))\n        rows.append({\n            \"business_id\": b,\n            \"milvus_score\": avg_score,\n            \"matched_photos\": [x[\"photo_id\"] for x in lst_sorted]\n        })\n\n    out = pd.DataFrame(rows)\n    if out.empty:\n        return out\n    return out.sort_values(\"milvus_score\", ascending=False)\n\n\ndef main():\n    # 1) Reno cafes\n    reno_cafes_df = get_reno_cafes()\n    print(f\"Found {len(reno_cafes_df)} cafes in Reno (categories contains 'Cafes').\")\n\n    # 2) Photo stats\n    photo_stats_df = get_photo_stats(reno_cafes_df[\"business_id\"].tolist())\n\n    # 3) Rule-based candidates\n    candidates_df = pick_candidates(\n        reno_cafes_df,\n        photo_stats_df,\n        min_total_photos=10,\n        min_inside_outside_ratio=0.40,\n        max_food_ratio=0.60\n    )\n\n    if candidates_df.empty:\n        print(\"No candidates matched the photo-structure filters. Try lowering thresholds.\")\n        return\n\n    # 4) Optional Milvus rerank\n    vector_rank_df = try_milvus_rerank(candidates_df)\n\n    final_df = candidates_df.copy()\n    if not vector_rank_df.empty:\n        final_df = final_df.merge(vector_rank_df, on=\"business_id\", how=\"left\")\n        final_df[\"milvus_score\"] = final_df[\"milvus_score\"].fillna(float('-inf'))\n        # Combined sorting: prioritize milvus_score when available, then photo stats\n        final_df = final_df.sort_values(\n            by=[\"milvus_score\", \"inside_outside_photos\", \"stars\", \"review_count\"],\n            ascending=[False, False, False, False]\n        )\n    else:\n        final_df[\"milvus_score\"] = None\n        final_df[\"matched_photos\"] = None\n\n    # Output top results\n    cols = [\n        \"name\", \"address\", \"stars\", \"review_count\",\n        \"total_photos\", \"inside_outside_photos\", \"inside_outside_ratio\",\n        \"food_photos\", \"food_ratio\", \"drink_photos\",\n        \"milvus_score\", \"matched_photos\", \"categories\"\n    ]\n\n    print(\"\\nTop photogenic cafe candidates (favor inside/outside photos, not mostly food):\\n\")\n    print(final_df[cols].head(15).to_string(index=False))\n\n\nif __name__ == \"__main__\":\n    main()\n"
+    }
+  },
+{
+    "index": 220,
+    "question": "I’m looking for a café in Tampa where I can sit down and get some work done for a couple of hours. Do reviews mention places that are quiet, have Wi?Fi, or don’t rush you out?",
+    "success": true,
+    "result": {
+      "analysis": "你的需求是“在Tampa找适合坐下工作2小时的café”，并且希望证据来自评论：安静(quiet)、有Wi‑Fi、不会催人走(doesn’t rush you out / can linger)。这类问题最适合用“向量语义检索”在评论里找相关表述，再用SQLite把评论命中的business映射回Tampa的咖啡馆名单并汇总成推荐列表。难点在于：Milvus里通常只有向量与ID，需要再回SQLite review表取原文；另外需要先从SQLite筛出Tampa咖啡馆候选集，再在Milvus里限定business_id范围做向量检索，避免全库搜索噪声过大。",
+      "natural_question": "在Tampa找一家适合坐下安静工作两小时的咖啡馆：评论里是否提到安静、有Wi‑Fi、不会催你离开？",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "sqlite:business.db/business"
+            ],
+            "filter_condition": {
+              "city": {
+                "=": "Tampa"
+              },
+              "state": {
+                "=": "FL"
+              },
+              "categories": {
+                "LIKE(any)": [
+                  "%Cafe%",
+                  "%Café%",
+                  "%Coffee%",
+                  "%Coffee & Tea%"
+                ]
+              }
+            }
+          },
+          "result_var": "candidate_businesses",
+          "description": {
+            "narrative": "先从SQLite的business表筛出Tampa, FL里类别像咖啡馆/咖啡店的候选商家，并按review_count、stars做一个合理排序，取Top N作为后续向量检索范围。",
+            "example_query": "SELECT business_id, name, address, city, state, stars, review_count, categories\nFROM business\nWHERE city = 'Tampa' AND state = 'FL'\n  AND (\n    categories LIKE '%Cafe%' OR categories LIKE '%Café%'\n    OR categories LIKE '%Coffee%' OR categories LIKE '%Coffee & Tea%'\n  )\nORDER BY review_count DESC, stars DESC\nLIMIT 200;"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "milvus:reviews(collection=reviews)"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "IN": "candidate_businesses.business_id"
+              }
+            }
+          },
+          "result_var": "matched_reviews",
+          "description": {
+            "narrative": "把用户意图组织成检索query（例如：'quiet cafe with wifi good for working not rushed'），生成向量embedding，然后在Milvus的reviews collection做相似度搜索，并用expr把搜索限制在候选business_id集合内，拿到最相关的review_id与business_id。",
+            "example_query": "Milvus search (pseudo):\ncollection.search(\n  data=[query_vector],\n  anns_field='text_vector',\n  param={'metric_type': 'IP', 'params': {'nprobe': 16}},\n  limit=200,\n  expr=\"business_id in ['id1','id2',...]\",\n  output_fields=['review_id','business_id']\n)"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "sqlite:review.db/review"
+            ],
+            "filter_condition": {
+              "review_id": {
+                "IN": "matched_reviews.review_id"
+              }
+            }
+          },
+          "result_var": "review_texts",
+          "description": {
+            "narrative": "用Milvus返回的review_id去SQLite的review表取回原始评论文本与星级等字段，方便做证据片段展示与关键词打分（quiet/Wi‑Fi/linger等）。",
+            "example_query": "SELECT review_id, business_id, stars, date, text\nFROM review\nWHERE review_id IN ('r1','r2','r3',...);"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "python-aggregation"
+            ],
+            "filter_condition": {
+              "signals": {
+                "contains_any": [
+                  "quiet",
+                  "wifi",
+                  "wi-fi",
+                  "work",
+                  "study",
+                  "laptop",
+                  "outlet",
+                  "not rushed",
+                  "linger",
+                  "stay awhile"
+                ]
+              }
+            }
+          },
+          "result_var": "ranked_recommendations",
+          "description": {
+            "narrative": "在Python里把评论按business聚合：统计与“安静/ Wi‑Fi /适合工作/不催人走”相关的命中次数，并为每个店挑选2-3条最有代表性的评论片段，最后输出推荐列表（含地址、评分、review_count与证据）。",
+            "example_query": "Python pseudo:\nfor each business_id:\n  score = w1*quiet_hits + w2*wifi_hits + w3*work_hits + w4*linger_hits\n  pick top snippets\nsort by score desc"
+          }
+        }
+      ],
+      "complete_code": "import re\nimport sqlite3\nfrom typing import List, Dict, Any, Tuple\n\n# Milvus\nfrom pymilvus import connections, Collection\n\n# Embedding\nfrom sentence_transformers import SentenceTransformer\n\n\n# -----------------------------\n# Fixed configuration (per spec)\n# -----------------------------\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nmilvus_config = {\n    \"milvus_collections\": {\n        \"reviews\": \"reviews\",\n        \"photos\": \"photo_vector\",\n        \"tips\": \"milvus_tip\"\n    },\n    \"milvus_host\": \"localhost\",\n    \"milvus_port\": \"19530\"\n}\n\nneo4j_config = {\n    \"neo4j_uri\": \"bolt://localhost:7687\",\n    \"neo4j_auth\": (\"neo4j\", \"password\")\n}\n\n\n# -----------------------------\n# Helpers\n# -----------------------------\ndef sqlite_connect(db_path: str) -> sqlite3.Connection:\n    conn = sqlite3.connect(db_path)\n    conn.row_factory = sqlite3.Row\n    return conn\n\n\ndef chunk_list(xs: List[str], n: int) -> List[List[str]]:\n    return [xs[i:i + n] for i in range(0, len(xs), n)]\n\n\ndef safe_in_clause(ids: List[str]) -> str:\n    # For Milvus expr: business_id in ['a','b']\n    # Escape single quotes minimally\n    esc = [x.replace(\"'\", \"\\\\'\") for x in ids]\n    return \"[\" + \",\".join([f\"'{x}'\" for x in esc]) + \"]\"\n\n\ndef normalize_text(s: str) -> str:\n    return (s or \"\").lower()\n\n\ndef find_signals(text: str) -> Dict[str, int]:\n    t = normalize_text(text)\n\n    # Simple pattern buckets\n    patterns = {\n        \"quiet\": [r\"\\bquiet\\b\", r\"\\bpeaceful\\b\", r\"not too loud\", r\"low noise\"],\n        \"wifi\": [r\"\\bwifi\\b\", r\"wi-?fi\", r\"wireless\"],\n        \"work\": [r\"\\bwork\\b\", r\"\\bstudy\\b\", r\"laptop\", r\"remote work\", r\"get work done\"],\n        \"outlets\": [r\"\\boutlet\\b\", r\"power\\s*socket\", r\"plug\"],\n        \"linger\": [r\"not rushed\", r\"never rushed\", r\"didn'?t rush\", r\"stay awhile\", r\"linger\", r\"hang out\", r\"camp out\"],\n    }\n\n    hits = {}\n    for k, pats in patterns.items():\n        hits[k] = 0\n        for p in pats:\n            if re.search(p, t):\n                hits[k] += 1\n    return hits\n\n\ndef make_snippet(text: str, max_len: int = 260) -> str:\n    text = (text or \"\").strip().replace(\"\\n\", \" \")\n    if len(text) <= max_len:\n        return text\n    return text[:max_len - 3] + \"...\"\n\n\n# -----------------------------\n# Step 1: Candidate businesses from SQLite\n# -----------------------------\ndef get_candidate_businesses(city: str = \"Tampa\", state: str = \"FL\", limit: int = 200) -> List[Dict[str, Any]]:\n    q = \"\"\"\n    SELECT business_id, name, address, city, state, stars, review_count, categories\n    FROM business\n    WHERE city = ? AND state = ?\n      AND (\n        categories LIKE '%Cafe%' OR categories LIKE '%Café%'\n        OR categories LIKE '%Coffee%' OR categories LIKE '%Coffee & Tea%'\n      )\n    ORDER BY review_count DESC, stars DESC\n    LIMIT ?\n    \"\"\"\n    conn = sqlite_connect(sqlite_paths[\"business\"])\n    try:\n        rows = conn.execute(q, (city, state, limit)).fetchall()\n        return [dict(r) for r in rows]\n    finally:\n        conn.close()\n\n\n# -----------------------------\n# Step 2: Vector search reviews in Milvus within candidate businesses\n# -----------------------------\ndef milvus_search_reviews(\n    business_ids: List[str],\n    query_text: str,\n    top_k: int = 200,\n    nprobe: int = 16,\n    batch_in: int = 200\n) -> List[Dict[str, Any]]:\n    \"\"\"Returns list of {review_id, business_id, score} from Milvus.\"\"\"\n\n    # Connect\n    connections.connect(\n        alias=\"default\",\n        host=milvus_config[\"milvus_host\"],\n        port=milvus_config[\"milvus_port\"],\n    )\n\n    col_name = milvus_config[\"milvus_collections\"][\"reviews\"]\n    col = Collection(col_name)\n    col.load()\n\n    # Embed\n    model = SentenceTransformer(\"sentence-transformers/all-MiniLM-L6-v2\")\n    qvec = model.encode([query_text], normalize_embeddings=True).tolist()\n\n    # NOTE: We assume Milvus schema has:\n    # - vector field: 'text_vector'\n    # - scalar fields: 'review_id', 'business_id'\n    # Adjust these names if your collection uses different ones.\n    anns_field = \"text_vector\"\n    output_fields = [\"review_id\", \"business_id\"]\n\n    search_param = {\"metric_type\": \"IP\", \"params\": {\"nprobe\": nprobe}}\n\n    results: List[Dict[str, Any]] = []\n\n    # expr with IN can get too long; chunk business_ids\n    for chunk in chunk_list(business_ids, batch_in):\n        expr = f\"business_id in {safe_in_clause(chunk)}\"\n        res = col.search(\n            data=qvec,\n            anns_field=anns_field,\n            param=search_param,\n            limit=min(top_k, 200),\n            expr=expr,\n            output_fields=output_fields\n        )\n\n        # res is a list (nq) of hits; we have nq=1\n        for hit in res[0]:\n            ent = hit.entity\n            results.append({\n                \"review_id\": ent.get(\"review_id\"),\n                \"business_id\": ent.get(\"business_id\"),\n                \"score\": float(hit.score)\n            })\n\n    # Deduplicate by review_id, keep best score\n    best = {}\n    for r in results:\n        rid = r[\"review_id\"]\n        if rid is None:\n            continue\n        if rid not in best or r[\"score\"] > best[rid][\"score\"]:\n            best[rid] = r\n\n    # Sort by similarity score desc\n    return sorted(best.values(), key=lambda x: x[\"score\"], reverse=True)[:top_k]\n\n\n# -----------------------------\n# Step 3: Fetch review text from SQLite\n# -----------------------------\ndef fetch_reviews_text(review_ids: List[str]) -> List[Dict[str, Any]]:\n    if not review_ids:\n        return []\n\n    conn = sqlite_connect(sqlite_paths[\"review\"])\n    try:\n        out: List[Dict[str, Any]] = []\n        # SQLite IN has variable limits; chunk it\n        for chunk in chunk_list(review_ids, 500):\n            placeholders = \",\".join([\"?\"] * len(chunk))\n            q = f\"\"\"\n            SELECT review_id, business_id, stars, date, text\n            FROM review\n            WHERE review_id IN ({placeholders})\n            \"\"\"\n            rows = conn.execute(q, chunk).fetchall()\n            out.extend([dict(r) for r in rows])\n        return out\n    finally:\n        conn.close()\n\n\n# -----------------------------\n# Step 4: Aggregate and rank businesses\n# -----------------------------\ndef recommend_from_reviews(\n    candidates: List[Dict[str, Any]],\n    milvus_hits: List[Dict[str, Any]],\n    reviews: List[Dict[str, Any]],\n    top_n: int = 10\n) -> List[Dict[str, Any]]:\n    cand_map = {c[\"business_id\"]: c for c in candidates}\n    review_map = {r[\"review_id\"]: r for r in reviews}\n\n    # Join hits -> review text\n    joined = []\n    for h in milvus_hits:\n        rid = h.get(\"review_id\")\n        r = review_map.get(rid)\n        if not r:\n            continue\n        bid = r.get(\"business_id\") or h.get(\"business_id\")\n        if bid not in cand_map:\n            continue\n        text = r.get(\"text\") or \"\"\n        sig = find_signals(text)\n        joined.append({\n            \"business_id\": bid,\n            \"review_id\": rid,\n            \"similarity\": h.get(\"score\", 0.0),\n            \"stars\": r.get(\"stars\"),\n            \"date\": r.get(\"date\"),\n            \"text\": text,\n            \"signals\": sig\n        })\n\n    # Aggregate per business\n    agg: Dict[str, Any] = {}\n    for j in joined:\n        bid = j[\"business_id\"]\n        if bid not in agg:\n            agg[bid] = {\n                \"business_id\": bid,\n                \"signal_counts\": {\"quiet\": 0, \"wifi\": 0, \"work\": 0, \"outlets\": 0, \"linger\": 0},\n                \"snippets\": []\n            }\n        for k in agg[bid][\"signal_counts\"].keys():\n            agg[bid][\"signal_counts\"][k] += int(j[\"signals\"].get(k, 0) > 0)\n\n        # store snippet candidates\n        agg[bid][\"snippets\"].append({\n            \"similarity\": j[\"similarity\"],\n            \"signals\": j[\"signals\"],\n            \"stars\": j[\"stars\"],\n            \"date\": j[\"date\"],\n            \"snippet\": make_snippet(j[\"text\"])\n        })\n\n    # Score businesses\n    def score_business(b: Dict[str, Any]) -> float:\n        sc = b[\"signal_counts\"]\n        # Weights tuned for your intent\n        return (\n            2.0 * sc[\"quiet\"] +\n            2.0 * sc[\"wifi\"] +\n            1.5 * sc[\"work\"] +\n            1.0 * sc[\"outlets\"] +\n            1.5 * sc[\"linger\"]\n        )\n\n    ranked = []\n    for bid, a in agg.items():\n        meta = cand_map.get(bid, {})\n        snippets = sorted(a[\"snippets\"], key=lambda x: (x[\"similarity\"], sum(1 for v in x[\"signals\"].values() if v > 0)), reverse=True)\n        ranked.append({\n            \"business_id\": bid,\n            \"name\": meta.get(\"name\"),\n            \"address\": meta.get(\"address\"),\n            \"city\": meta.get(\"city\"),\n            \"state\": meta.get(\"state\"),\n            \"stars\": meta.get(\"stars\"),\n            \"review_count\": meta.get(\"review_count\"),\n            \"categories\": meta.get(\"categories\"),\n            \"signal_counts\": a[\"signal_counts\"],\n            \"score\": score_business(a),\n            \"evidence\": snippets[:3]\n        })\n\n    ranked.sort(key=lambda x: (x[\"score\"], x.get(\"review_count\") or 0, x.get(\"stars\") or 0), reverse=True)\n    return ranked[:top_n]\n\n\ndef main():\n    # You can tweak this query text to emphasize specific needs.\n    query_text = (\n        \"quiet cafe with wifi good for working studying laptop outlets \"\n        \"not rushed can stay awhile comfortable to sit for hours\"\n    )\n\n    # 1) candidates\n    candidates = get_candidate_businesses(city=\"Tampa\", state=\"FL\", limit=250)\n    if not candidates:\n        print(\"No candidate cafes found in Tampa, FL (check business table schema/city names).\")\n        return\n\n    business_ids = [c[\"business_id\"] for c in candidates]\n\n    # 2) milvus hits\n    try:\n        hits = milvus_search_reviews(business_ids, query_text=query_text, top_k=300)\n    except Exception as e:\n        print(\"Milvus search failed. Common causes: wrong vector field name, collection not loaded, server not running.\")\n        raise\n\n    if not hits:\n        print(\"No relevant reviews found via Milvus for the candidate cafes.\")\n        return\n\n    # 3) fetch review texts\n    review_ids = [h[\"review_id\"] for h in hits if h.get(\"review_id\")]\n    reviews = fetch_reviews_text(review_ids)\n\n    # 4) aggregate\n    recs = recommend_from_reviews(candidates, hits, reviews, top_n=10)\n\n    # Output\n    for i, r in enumerate(recs, 1):\n        print(\"=\" * 80)\n        print(f\"#{i} {r.get('name')}  |  {r.get('stars')}★  ({r.get('review_count')} reviews)\")\n        print(f\"Address: {r.get('address')}, {r.get('city')}, {r.get('state')}\")\n        print(f\"Signals (review mentions): {r.get('signal_counts')}  | score={r.get('score')}\")\n        print(f\"Categories: {r.get('categories')}\")\n        print(\"Evidence snippets:\")\n        for ev in r.get(\"evidence\", []):\n            sig = {k: v for k, v in ev[\"signals\"].items() if v > 0}\n            print(f\" - [{ev.get('date')}] {ev.get('stars')}★ signals={list(sig.keys())}: {ev.get('snippet')}\")\n\n\nif __name__ == \"__main__\":\n    main()\n"
+    }
+  }
+]

@@ -1,0 +1,755 @@
+[
+{
+    "index": 281,
+    "question": "In Sparks, where is good for late-night food after 1am?",
+    "success": true,
+    "result": {
+      "analysis": "The user is looking for businesses in Sparks (likely Sparks, NV) that are open late-night, specifically after 1 AM. This requires querying the SQLite business database to find restaurants/food establishments in Sparks that have late-night hours. The business table contains 'hours' fields for each day of the week, and we need to parse closing times to find places open after 1:00 AM. We also want to check reviews/tips for quality indicators. This is a medium difficulty query involving SQL for structured data filtering, and optionally vector search for sentiment about 'late-night food' experiences.",
+      "natural_question": "In Sparks, where is good for late-night food after 1am?",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Sparks"
+              },
+              "categories": {
+                "like": "%Food%|%Restaurant%|%Bar%|%Pizza%|%Burger%|%Diner%"
+              },
+              "is_open": {
+                "eq": 1
+              },
+              "hours": {
+                "late_night_after": "1:00"
+              }
+            }
+          },
+          "result_var": "late_night_businesses",
+          "description": {
+            "narrative": "Query the SQLite business database to find food-related businesses in Sparks that are currently open (is_open=1) and have operating hours extending past 1:00 AM on any day of the week. We parse the hours columns to identify late-night establishments and sort by star rating.",
+            "example_query": "SELECT business_id, name, address, stars, review_count, categories, hours_Friday, hours_Saturday FROM business WHERE city = 'Sparks' AND is_open = 1 AND categories LIKE '%Food%' AND (hours_Friday LIKE '%1:%' OR hours_Friday LIKE '%2:%' ...)"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "reviews"
+            ],
+            "filter_condition": {
+              "search_text": "late night food after midnight great open late",
+              "business_ids": "from step 1"
+            }
+          },
+          "result_var": "late_night_reviews",
+          "description": {
+            "narrative": "Use Milvus vector search on the reviews collection to find reviews semantically related to 'late night food open after midnight great experience' for the businesses found in Step 1. This helps identify places that are genuinely recommended for late-night dining.",
+            "example_query": "collection.search(data=[embedding('late night food after midnight great')], anns_field='embedding', param={'metric_type': 'L2', 'params': {'nprobe': 10}}, limit=20, expr='business_id in [...]')"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "business",
+              "reviews"
+            ],
+            "filter_condition": {}
+          },
+          "result_var": "final_recommendations",
+          "description": {
+            "narrative": "Combine the structured data from SQLite (hours, ratings, location) with the semantic review insights from Milvus to produce a ranked list of the best late-night food options in Sparks after 1 AM, including address, hours, ratings, and relevant review snippets.",
+            "example_query": "Merge and rank results from Step 1 and Step 2 by combined score of star rating and review relevance."
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport json\nimport re\nfrom datetime import datetime, timedelta\nfrom pymilvus import connections, Collection\nfrom sentence_transformers import SentenceTransformer\n\n# ============================================================\n# Configuration\n# ============================================================\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\"\n}\n\nmilvus_config = {\n    'host': 'localhost',\n    'port': '19530',\n    'collections': {\n        'reviews': 'reviews',\n        'tips': 'milvus_tip'\n    }\n}\n\n# ============================================================\n# Step 1: Find late-night food businesses in Sparks from SQLite\n# ============================================================\nprint(\"=\" * 70)\nprint(\"Step 1: Searching for late-night food places in Sparks (open after 1 AM)\")\nprint(\"=\" * 70)\n\ndef is_open_after_1am(hours_str):\n    \"\"\"Check if a business hours string indicates closing after 1:00 AM.\n    Hours format is typically 'HH:MM-HH:MM' (e.g., '11:0-2:0' means 11AM to 2AM).\n    If closing time is between 0:00 and 6:00, it likely means after midnight.\"\"\"\n    if not hours_str or hours_str == 'None' or hours_str == '':\n        return False\n    try:\n        parts = hours_str.split('-')\n        if len(parts) != 2:\n            return False\n        close_time = parts[1].strip()\n        close_parts = close_time.split(':')\n        close_hour = int(close_parts[0])\n        close_min = int(close_parts[1]) if len(close_parts) > 1 else 0\n        # If closing hour is between 1 and 6 (early morning), it's open past midnight\n        # Specifically after 1 AM\n        if 1 <= close_hour < 6:\n            return True\n        # Also check if it's 0:00 with minutes > 0 won't count (that's midnight)\n        # 0:00 closing = midnight, not after 1am\n        return False\n    except (ValueError, IndexError):\n        return False\n\ndef get_closing_time_str(hours_str):\n    \"\"\"Extract closing time as readable string.\"\"\"\n    if not hours_str or hours_str == 'None' or hours_str == '':\n        return 'N/A'\n    try:\n        parts = hours_str.split('-')\n        if len(parts) != 2:\n            return 'N/A'\n        open_time = parts[0].strip()\n        close_time = parts[1].strip()\n        return f\"{open_time} - {close_time}\"\n    except:\n        return 'N/A'\n\ntry:\n    conn_biz = sqlite3.connect(sqlite_paths['business'])\n    conn_biz.row_factory = sqlite3.Row\n    cursor_biz = conn_biz.cursor()\n\n    # Get column names to understand the schema\n    cursor_biz.execute(\"PRAGMA table_info(business)\")\n    columns = [col[1] for col in cursor_biz.fetchall()]\n    print(f\"Business table columns: {columns}\")\n\n    # Find food-related categories in Sparks\n    food_keywords = ['%Restaurant%', '%Food%', '%Pizza%', '%Burger%', '%Bar%', '%Diner%',\n                     '%Taco%', '%Mexican%', '%Chinese%', '%Sandwich%', '%Grill%',\n                     '%Fast Food%', '%Cafe%', '%Bakery%', '%Wings%', '%Chicken%',\n                     '%Sushi%', '%Noodle%', '%BBQ%', '%Steak%', '%Breakfast%',\n                     '%American%', '%Italian%']\n\n    category_conditions = ' OR '.join([f\"categories LIKE '{kw}'\" for kw in food_keywords])\n\n    # Identify hours columns\n    hours_columns = [c for c in columns if c.startswith('hours')]\n    print(f\"Hours columns found: {hours_columns}\")\n\n    query = f\"\"\"\n    SELECT business_id, name, address, city, state, stars, review_count, categories,\n           {', '.join(hours_columns)}\n    FROM business\n    WHERE city = 'Sparks'\n      AND is_open = 1\n      AND ({category_conditions})\n    ORDER BY stars DESC, review_count DESC\n    \"\"\"\n\n    cursor_biz.execute(query)\n    all_food_businesses = cursor_biz.fetchall()\n    print(f\"\\nTotal food businesses found in Sparks: {len(all_food_businesses)}\")\n\n    # Filter for late-night (open after 1 AM)\n    late_night_businesses = []\n    day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']\n\n    for biz in all_food_businesses:\n        biz_dict = dict(biz)\n        late_night_days = []\n\n        for hcol in hours_columns:\n            hours_val = biz_dict.get(hcol, None)\n            if hours_val and is_open_after_1am(str(hours_val)):\n                # Extract day name from column\n                day = hcol.replace('hours_', '').replace('hours.', '')\n                late_night_days.append((day, str(hours_val)))\n\n        if late_night_days:\n            biz_dict['late_night_days'] = late_night_days\n            late_night_businesses.append(biz_dict)\n\n    print(f\"Businesses open after 1 AM: {len(late_night_businesses)}\")\n\n    # Sort by stars and review_count\n    late_night_businesses.sort(key=lambda x: (x['stars'], x['review_count']), reverse=True)\n\n    # Display results\n    print(\"\\n\" + \"-\" * 70)\n    print(\"LATE-NIGHT FOOD SPOTS IN SPARKS (Open After 1 AM)\")\n    print(\"-\" * 70)\n\n    business_ids = []\n    for i, biz in enumerate(late_night_businesses[:20], 1):\n        print(f\"\\n{i}. {biz['name']}\")\n        print(f\"   Address: {biz['address']}, Sparks\")\n        print(f\"   Stars: {biz['stars']} | Reviews: {biz['review_count']}\")\n        print(f\"   Categories: {biz.get('categories', 'N/A')}\")\n        print(f\"   Late-night hours:\")\n        for day, hours in biz['late_night_days']:\n            print(f\"     {day}: {get_closing_time_str(hours)}\")\n        business_ids.append(biz['business_id'])\n\n    conn_biz.close()\n\nexcept Exception as e:\n    print(f\"Error in Step 1: {e}\")\n    import traceback\n    traceback.print_exc()\n    business_ids = []\n    late_night_businesses = []\n\n# ============================================================\n# Step 2: Vector search for late-night food reviews via Milvus\n# ============================================================\nprint(\"\\n\" + \"=\" * 70)\nprint(\"Step 2: Searching for relevant late-night food reviews in Milvus\")\nprint(\"=\" * 70)\n\ntry:\n    # Connect to Milvus\n    connections.connect(\"default\", host=milvus_config['host'], port=milvus_config['port'])\n    print(\"Connected to Milvus successfully.\")\n\n    # Load sentence transformer model for embedding\n    model = SentenceTransformer('all-MiniLM-L6-v2')\n\n    search_text = \"late night food after midnight great open late delicious\"\n    search_embedding = model.encode([search_text])\n\n    # Search in reviews collection\n    review_collection = Collection(milvus_config['collections']['reviews'])\n    review_collection.load()\n\n    # Build filter expression for business_ids from Step 1\n    review_results = []\n    if business_ids:\n        # Search with business_id filter\n        bid_filter = ', '.join([f'\\\"{ bid}\\\"' for bid in business_ids[:20]])\n        expr = f\"business_id in [{bid_filter}]\"\n\n        search_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\n\n        try:\n            results = review_collection.search(\n                data=search_embedding.tolist(),\n                anns_field=\"embedding\",\n                param=search_params,\n                limit=30,\n                expr=expr,\n                output_fields=[\"business_id\", \"text\", \"stars\"]\n            )\n\n            for hits in results:\n                for hit in hits:\n                    review_results.append({\n                        'business_id': hit.entity.get('business_id'),\n                        'text': hit.entity.get('text', '')[:200],\n                        'stars': hit.entity.get('stars'),\n                        'distance': hit.distance\n                    })\n\n            print(f\"Found {len(review_results)} relevant late-night reviews.\")\n        except Exception as e:\n            print(f\"Milvus search with filter failed: {e}\")\n            # Try without filter\n            results = review_collection.search(\n                data=search_embedding.tolist(),\n                anns_field=\"embedding\",\n                param=search_params,\n                limit=30,\n                output_fields=[\"business_id\", \"text\", \"stars\"]\n            )\n            for hits in results:\n                for hit in hits:\n                    review_results.append({\n                        'business_id': hit.entity.get('business_id'),\n                        'text': hit.entity.get('text', '')[:200],\n                        'stars': hit.entity.get('stars'),\n                        'distance': hit.distance\n                    })\n            print(f\"Found {len(review_results)} relevant reviews (unfiltered).\")\n\n    # Also search tips\n    try:\n        tip_collection = Collection(milvus_config['collections']['tips'])\n        tip_collection.load()\n\n        tip_results = tip_collection.search(\n            data=search_embedding.tolist(),\n            anns_field=\"embedding\",\n            param={\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}},\n            limit=15,\n            output_fields=[\"business_id\", \"text\"]\n        )\n\n        tip_texts = []\n        for hits in tip_results:\n            for hit in hits:\n                tip_texts.append({\n                    'business_id': hit.entity.get('business_id'),\n                    'text': hit.entity.get('text', '')[:200],\n                    'distance': hit.distance\n                })\n        print(f\"Found {len(tip_texts)} relevant tips.\")\n    except Exception as e:\n        print(f\"Tip search error: {e}\")\n        tip_texts = []\n\n    connections.disconnect(\"default\")\n\nexcept Exception as e:\n    print(f\"Error in Step 2: {e}\")\n    import traceback\n    traceback.print_exc()\n    review_results = []\n    tip_texts = []\n\n# ============================================================\n# Step 3: Combine and present final recommendations\n# ============================================================\nprint(\"\\n\" + \"=\" * 70)\nprint(\"Step 3: Final Recommendations - Best Late-Night Food in Sparks (After 1 AM)\")\nprint(\"=\" * 70)\n\n# Build a review snippet map\nreview_map = {}\nfor r in review_results:\n    bid = r.get('business_id')\n    if bid and bid not in review_map:\n        review_map[bid] = r['text']\n\ntip_map = {}\nfor t in tip_texts:\n    bid = t.get('business_id')\n    if bid and bid not in tip_map:\n        tip_map[bid] = t['text']\n\nprint(\"\\n\" + \"*\" * 70)\nprint(\"  TOP LATE-NIGHT FOOD RECOMMENDATIONS IN SPARKS (Open After 1 AM)\")\nprint(\"*\" * 70)\n\nif late_night_businesses:\n    for i, biz in enumerate(late_night_businesses[:15], 1):\n        bid = biz['business_id']\n        print(f\"\\n{'='*60}\")\n        print(f\"  #{i}: {biz['name']}\")\n        print(f\"{'='*60}\")\n        print(f\"  📍 Address: {biz['address']}, Sparks\")\n        print(f\"  ⭐ Rating: {biz['stars']}/5 ({biz['review_count']} reviews)\")\n        print(f\"  🏷️  Categories: {biz.get('categories', 'N/A')}\")\n        print(f\"  🌙 Late-Night Hours:\")\n        for day, hours in biz['late_night_days']:\n            print(f\"      {day}: {get_closing_time_str(hours)}\")\n\n        # Add review snippet if available\n        if bid in review_map:\n            print(f\"  💬 Review highlight: \\\"{review_map[bid]}...\\\"\")\n        if bid in tip_map:\n            print(f\"  💡 Tip: \\\"{tip_map[bid]}\\\"\")\n\n    print(f\"\\n{'='*70}\")\n    print(f\"Total late-night options found: {len(late_night_businesses)}\")\n    print(f\"Showing top {min(15, len(late_night_businesses))} results sorted by rating.\")\nelse:\n    print(\"\\nNo late-night food places found open after 1 AM in Sparks.\")\n    print(\"Try broadening the search to nearby cities like Reno.\")\n\nprint(\"\\n\" + \"=\" * 70)\nprint(\"Search complete!\")\nprint(\"=\" * 70)\n"
+    }
+  },
+{
+    "index": 282,
+    "question": "Show Franklin coffee shops with outdoor seating and free WiFi; return name, address, and rating.",
+    "success": true,
+    "result": {
+      "analysis": "This is a straightforward SQL query on the business database. The user wants to find coffee shops in Franklin that offer both outdoor seating and free WiFi. We need to filter by city='Franklin', check that the business categories include 'Coffee', and that the attributes contain outdoor seating and free WiFi. All required fields (name, address, rating/stars) are in the SQLite business database. This is a single-database, single-step query.",
+      "natural_question": "Show Franklin coffee shops with outdoor seating and free WiFi; return name, address, and rating.",
+      "difficulty": "easy",
+      "query_types": [
+        "sql"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Franklin"
+              },
+              "categories": {
+                "contains": "Coffee"
+              },
+              "attributes": {
+                "contains": [
+                  "OutdoorSeating: True",
+                  "WiFi: free"
+                ]
+              }
+            }
+          },
+          "result_var": "franklin_coffee_shops",
+          "description": {
+            "narrative": "Query the business SQLite database to find businesses in Franklin whose categories include 'Coffee' and whose attributes indicate outdoor seating is available and WiFi is free. Return the business name, full address, and star rating.",
+            "example_query": "SELECT name, address, stars AS rating FROM business WHERE city = 'Franklin' AND categories LIKE '%Coffee%' AND attributes LIKE '%OutdoorSeating%True%' AND attributes LIKE '%WiFi%free%';"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport pandas as pd\n\n# =============================================================\n# Step 1: Query SQLite business database for Franklin coffee\n#         shops with outdoor seating and free WiFi\n# =============================================================\n\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\"\n}\n\ntry:\n    # Connect to the business database\n    conn = sqlite3.connect(sqlite_paths[\"business\"])\n    print(\"Connected to business.db successfully.\")\n\n    # SQL query: filter by city, category (Coffee), outdoor seating, and free WiFi\n    query = \"\"\"\n    SELECT \n        name,\n        address,\n        stars AS rating\n    FROM business\n    WHERE city = 'Franklin'\n      AND categories LIKE '%Coffee%'\n      AND attributes LIKE '%OutdoorSeating%True%'\n      AND (\n           attributes LIKE '%WiFi%free%'\n        OR attributes LIKE '%WiFi%u''free''%'\n      )\n    ORDER BY stars DESC;\n    \"\"\"\n\n    franklin_coffee_shops = pd.read_sql_query(query, conn)\n\n    # Display results\n    if franklin_coffee_shops.empty:\n        print(\"No coffee shops found in Franklin with outdoor seating and free WiFi.\")\n    else:\n        print(f\"Found {len(franklin_coffee_shops)} coffee shop(s) in Franklin with outdoor seating and free WiFi:\\n\")\n        print(franklin_coffee_shops.to_string(index=False))\n\nexcept sqlite3.Error as e:\n    print(f\"SQLite error: {e}\")\nexcept Exception as e:\n    print(f\"Error: {e}\")\nfinally:\n    if 'conn' in dir():\n        conn.close()\n        print(\"\\nDatabase connection closed.\")\n"
+    }
+  },
+{
+    "index": 283,
+    "question": "Show Clearwater coffee shops with menu photos, rated at least 4.0 with at least 50 reviews.",
+    "success": true,
+    "result": {
+      "analysis": "This query requires finding coffee shops in Clearwater that have menu photos, with a rating of at least 4.0 and at least 50 reviews. This involves: (1) SQLite to find businesses matching the criteria (city=Clearwater, category includes Coffee, stars>=4.0, review_count>=50), (2) SQLite photo table to find photos with label='menu' for those businesses. This is primarily a SQL-based query across two SQLite databases (business.db and photo.db).",
+      "natural_question": "Show Clearwater coffee shops with menu photos, rated at least 4.0 with at least 50 reviews.",
+      "difficulty": "medium",
+      "query_types": [
+        "sql"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Clearwater"
+              },
+              "categories": {
+                "like": "%Coffee%"
+              },
+              "stars": {
+                "gte": 4.0
+              },
+              "review_count": {
+                "gte": 50
+              }
+            }
+          },
+          "result_var": "coffee_shops",
+          "description": {
+            "narrative": "Query the business.db SQLite database to find all coffee shops in Clearwater with stars >= 4.0 and review_count >= 50. The categories field is a comma-separated string, so we use LIKE to match 'Coffee'.",
+            "example_query": "SELECT business_id, name, address, city, state, stars, review_count, categories FROM business WHERE city = 'Clearwater' AND categories LIKE '%Coffee%' AND stars >= 4.0 AND review_count >= 50;"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "photo"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "coffee_shops.business_id"
+              },
+              "label": {
+                "eq": "menu"
+              }
+            }
+          },
+          "result_var": "menu_photos",
+          "description": {
+            "narrative": "Query the photo.db SQLite database to find all photos with label='menu' that belong to the coffee shops found in step 1. Join or filter by the business_ids obtained from step 1.",
+            "example_query": "SELECT photo_id, business_id, caption, label FROM photo WHERE business_id IN (<business_ids_from_step1>) AND label = 'menu';"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "business",
+              "photo"
+            ]
+          },
+          "result_var": "final_results",
+          "description": {
+            "narrative": "Merge the coffee shop information with their menu photos to produce a comprehensive result showing each qualifying coffee shop along with its menu photo details.",
+            "example_query": "Pandas merge of coffee_shops and menu_photos on business_id"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport pandas as pd\n\n# =============================================================\n# Database paths\n# =============================================================\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\ntry:\n    # =========================================================\n    # Step 1: Query coffee shops in Clearwater with stars >= 4.0\n    #         and review_count >= 50\n    # =========================================================\n    print(\"=\" * 70)\n    print(\"Step 1: Finding Clearwater coffee shops (stars>=4.0, reviews>=50)\")\n    print(\"=\" * 70)\n\n    conn_business = sqlite3.connect(sqlite_paths[\"business\"])\n\n    query_business = \"\"\"\n        SELECT business_id, name, address, city, state, postal_code,\n               latitude, longitude, stars, review_count, categories\n        FROM business\n        WHERE city = 'Clearwater'\n          AND categories LIKE '%Coffee%'\n          AND stars >= 4.0\n          AND review_count >= 50\n        ORDER BY stars DESC, review_count DESC;\n    \"\"\"\n\n    coffee_shops = pd.read_sql_query(query_business, conn_business)\n    conn_business.close()\n\n    print(f\"Found {len(coffee_shops)} qualifying coffee shop(s) in Clearwater.\\n\")\n    if coffee_shops.empty:\n        print(\"No coffee shops match the criteria. Exiting.\")\n    else:\n        print(coffee_shops[['name', 'stars', 'review_count', 'address', 'categories']].to_string(index=False))\n        print()\n\n        # =====================================================\n        # Step 2: Find menu photos for those coffee shops\n        # =====================================================\n        print(\"=\" * 70)\n        print(\"Step 2: Finding menu photos for qualifying coffee shops\")\n        print(\"=\" * 70)\n\n        conn_photo = sqlite3.connect(sqlite_paths[\"photo\"])\n\n        business_ids = coffee_shops['business_id'].tolist()\n        placeholders = ','.join(['?' for _ in business_ids])\n\n        query_photos = f\"\"\"\n            SELECT photo_id, business_id, caption, label\n            FROM photo\n            WHERE business_id IN ({placeholders})\n              AND label = 'menu'\n            ORDER BY business_id;\n        \"\"\"\n\n        menu_photos = pd.read_sql_query(query_photos, conn_photo, params=business_ids)\n        conn_photo.close()\n\n        print(f\"Found {len(menu_photos)} menu photo(s) for the qualifying shops.\\n\")\n        if menu_photos.empty:\n            print(\"No menu photos found for these coffee shops.\")\n        else:\n            print(menu_photos.to_string(index=False))\n            print()\n\n        # =====================================================\n        # Step 3: Merge results – shops with their menu photos\n        # =====================================================\n        print(\"=\" * 70)\n        print(\"Step 3: Merging coffee shops with their menu photos\")\n        print(\"=\" * 70)\n\n        # Inner join: only keep shops that actually have menu photos\n        final_results = pd.merge(\n            coffee_shops,\n            menu_photos,\n            on='business_id',\n            how='inner'\n        )\n\n        if final_results.empty:\n            print(\"\\nNo Clearwater coffee shops with menu photos meet all criteria.\")\n        else:\n            print(f\"\\n{final_results['business_id'].nunique()} coffee shop(s) with \"\n                  f\"{len(final_results)} menu photo(s) total:\\n\")\n\n            # Display grouped by shop\n            for biz_id, group in final_results.groupby('business_id'):\n                shop = group.iloc[0]\n                print(f\"  ☕ {shop['name']}\")\n                print(f\"     Address : {shop['address']}, {shop['city']}, {shop['state']} {shop['postal_code']}\")\n                print(f\"     Stars   : {shop['stars']}  |  Reviews: {shop['review_count']}\")\n                print(f\"     Categories: {shop['categories']}\")\n                print(f\"     Menu Photos ({len(group)}):\")\n                for _, photo in group.iterrows():\n                    caption_str = photo['caption'] if pd.notna(photo['caption']) and photo['caption'] else 'No caption'\n                    print(f\"       - Photo ID: {photo['photo_id']}  |  Caption: {caption_str}\")\n                print()\n\n            # Summary table\n            print(\"\\n--- Summary Table ---\")\n            display_cols = ['name', 'stars', 'review_count', 'photo_id', 'caption', 'label']\n            available_cols = [c for c in display_cols if c in final_results.columns]\n            print(final_results[available_cols].to_string(index=False))\n\nexcept sqlite3.Error as e:\n    print(f\"SQLite error: {e}\")\nexcept Exception as e:\n    print(f\"Error: {e}\")\nfinally:\n    print(\"\\n\" + \"=\" * 70)\n    print(\"Query complete.\")\n    print(\"=\" * 70)\n"
+    }
+  },
+{
+    "index": 284,
+    "question": "Show Metairie coffee shops with outdoor seating and their inside/outside photos.",
+    "success": true,
+    "result": {
+      "analysis": "This query requires: 1) Finding coffee shops in Metairie that have outdoor seating from the SQLite business database, 2) Retrieving photos for those businesses from the SQLite photo database, filtering for 'inside' and 'outside' photo labels. This is a structured data query involving two SQLite databases (business and photo) joined by business_id. No vector search or graph database needed.",
+      "natural_question": "Show Metairie coffee shops with outdoor seating and their inside/outside photos.",
+      "difficulty": "medium",
+      "query_types": [
+        "sql"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Metairie"
+              },
+              "categories": {
+                "like": "%Coffee%"
+              },
+              "attributes_OutdoorSeating": {
+                "eq": "True"
+              }
+            }
+          },
+          "result_var": "coffee_shops",
+          "description": {
+            "narrative": "Query the business SQLite database to find all coffee shops in Metairie that have outdoor seating enabled. We filter by city='Metairie', categories containing 'Coffee', and the OutdoorSeating attribute being True.",
+            "example_query": "SELECT business_id, name, address, stars, review_count, categories FROM business WHERE city = 'Metairie' AND categories LIKE '%Coffee%' AND attributes_OutdoorSeating = 'True';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "photo"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "coffee_shops.business_id"
+              },
+              "label": {
+                "in": [
+                  "inside",
+                  "outside"
+                ]
+              }
+            }
+          },
+          "result_var": "photos",
+          "description": {
+            "narrative": "Query the photo SQLite database to retrieve all photos labeled 'inside' or 'outside' for the coffee shops found in Step 1. Join results with business info for a comprehensive view.",
+            "example_query": "SELECT photo_id, business_id, caption, label FROM photo WHERE business_id IN (?, ?, ...) AND label IN ('inside', 'outside');"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "business",
+              "photo"
+            ]
+          },
+          "result_var": "final_result",
+          "description": {
+            "narrative": "Merge the coffee shop details with their corresponding inside/outside photos, organize by business, and present a clear summary showing each shop's info alongside its photo details.",
+            "example_query": "N/A - Python pandas merge operation"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport pandas as pd\n\n# =============================================================\n# Database paths\n# =============================================================\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\"\n}\n\ntry:\n    # =========================================================\n    # Step 1: Find Metairie coffee shops with outdoor seating\n    # =========================================================\n    print(\"=\" * 70)\n    print(\"Step 1: Searching for Metairie coffee shops with outdoor seating...\")\n    print(\"=\" * 70)\n\n    conn_business = sqlite3.connect(sqlite_paths[\"business\"])\n\n    query_business = \"\"\"\n        SELECT business_id, name, address, stars, review_count,\n               categories, attributes_OutdoorSeating\n        FROM business\n        WHERE city = 'Metairie'\n          AND categories LIKE '%Coffee%'\n          AND attributes_OutdoorSeating = 'True'\n        ORDER BY stars DESC, review_count DESC;\n    \"\"\"\n\n    coffee_shops = pd.read_sql_query(query_business, conn_business)\n    conn_business.close()\n\n    print(f\"\\nFound {len(coffee_shops)} coffee shop(s) in Metairie with outdoor seating:\\n\")\n    for idx, row in coffee_shops.iterrows():\n        print(f\"  {idx+1}. {row['name']}\")\n        print(f\"     Address: {row['address']}\")\n        print(f\"     Stars: {row['stars']} | Reviews: {row['review_count']}\")\n        print(f\"     Categories: {row['categories']}\")\n        print()\n\n    if coffee_shops.empty:\n        print(\"No coffee shops found matching the criteria. Exiting.\")\n    else:\n        # =====================================================\n        # Step 2: Retrieve inside/outside photos for those shops\n        # =====================================================\n        print(\"=\" * 70)\n        print(\"Step 2: Retrieving inside/outside photos for these coffee shops...\")\n        print(\"=\" * 70)\n\n        conn_photo = sqlite3.connect(sqlite_paths[\"photo\"])\n\n        business_ids = coffee_shops[\"business_id\"].tolist()\n        placeholders = \",\".join([\"?\"] * len(business_ids))\n\n        query_photos = f\"\"\"\n            SELECT photo_id, business_id, caption, label\n            FROM photo\n            WHERE business_id IN ({placeholders})\n              AND label IN ('inside', 'outside')\n            ORDER BY business_id, label;\n        \"\"\"\n\n        photos = pd.read_sql_query(query_photos, conn_photo, params=business_ids)\n        conn_photo.close()\n\n        print(f\"\\nFound {len(photos)} inside/outside photo(s) total.\\n\")\n\n        # =====================================================\n        # Step 3: Merge and present final results\n        # =====================================================\n        print(\"=\" * 70)\n        print(\"Step 3: Combining results — Coffee Shops & Their Photos\")\n        print(\"=\" * 70)\n\n        merged = pd.merge(\n            coffee_shops[[\"business_id\", \"name\", \"address\", \"stars\", \"review_count\"]],\n            photos,\n            on=\"business_id\",\n            how=\"left\"\n        )\n\n        for biz_id in coffee_shops[\"business_id\"]:\n            shop = coffee_shops[coffee_shops[\"business_id\"] == biz_id].iloc[0]\n            shop_photos = photos[photos[\"business_id\"] == biz_id]\n\n            print(f\"\\n{'─' * 60}\")\n            print(f\"☕ {shop['name']}\")\n            print(f\"   Address : {shop['address']}\")\n            print(f\"   Stars   : {shop['stars']}  |  Reviews: {shop['review_count']}\")\n            print(f\"   Categories: {shop['categories']}\")\n\n            inside_photos = shop_photos[shop_photos[\"label\"] == \"inside\"]\n            outside_photos = shop_photos[shop_photos[\"label\"] == \"outside\"]\n\n            print(f\"\\n   📷 Inside Photos ({len(inside_photos)}):\")\n            if inside_photos.empty:\n                print(\"      (none)\")\n            else:\n                for _, p in inside_photos.iterrows():\n                    caption = p['caption'] if pd.notna(p['caption']) and p['caption'] else 'No caption'\n                    print(f\"      - Photo ID: {p['photo_id']}  |  Caption: {caption}\")\n\n            print(f\"\\n   📷 Outside Photos ({len(outside_photos)}):\")\n            if outside_photos.empty:\n                print(\"      (none)\")\n            else:\n                for _, p in outside_photos.iterrows():\n                    caption = p['caption'] if pd.notna(p['caption']) and p['caption'] else 'No caption'\n                    print(f\"      - Photo ID: {p['photo_id']}  |  Caption: {caption}\")\n\n        print(f\"\\n{'─' * 60}\")\n\n        # =====================================================\n        # Summary table\n        # =====================================================\n        print(\"\\n\" + \"=\" * 70)\n        print(\"Summary Table\")\n        print(\"=\" * 70)\n\n        summary = photos.groupby([\"business_id\", \"label\"]).size().unstack(fill_value=0).reset_index()\n        summary = pd.merge(\n            coffee_shops[[\"business_id\", \"name\"]],\n            summary,\n            on=\"business_id\",\n            how=\"left\"\n        ).fillna(0)\n\n        for col in [\"inside\", \"outside\"]:\n            if col not in summary.columns:\n                summary[col] = 0\n            summary[col] = summary[col].astype(int)\n\n        print(summary[[\"name\", \"inside\", \"outside\"]].to_string(index=False))\n        print()\n\nexcept sqlite3.Error as e:\n    print(f\"SQLite error: {e}\")\nexcept Exception as e:\n    print(f\"Error: {e}\")\n"
+    }
+  },
+{
+    "index": 285,
+    "question": "Show Wilmington coffee shops rated >=4.5 and their indoor photos.",
+    "success": true,
+    "result": {
+      "analysis": "This query requires a multi-database approach: (1) First, query the SQLite business database to find coffee shops in Wilmington with a rating >= 4.5. (2) Then, query the SQLite photo database to find photos associated with those businesses that are labeled as 'indoor'. (3) Optionally, we can retrieve the photo vectors from Milvus for further image similarity analysis, but the core request is to show the businesses and their indoor photos. This is a medium-difficulty query involving joins across two SQLite databases (business and photo).",
+      "natural_question": "Show me coffee shops in Wilmington that are rated 4.5 or above, along with their indoor photos.",
+      "difficulty": "medium",
+      "query_types": [
+        "sql"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business.db"
+            ],
+            "filter_condition": {
+              "city": {
+                "==": "Wilmington"
+              },
+              "categories": {
+                "LIKE": "%Coffee%%"
+              },
+              "stars": {
+                ">=": 4.5
+              }
+            }
+          },
+          "result_var": "coffee_shops",
+          "description": {
+            "narrative": "Query the business SQLite database to find all coffee shops in Wilmington with a star rating of 4.5 or higher. We filter by city='Wilmington', categories containing 'Coffee', and stars >= 4.5.",
+            "example_query": "SELECT business_id, name, address, city, state, stars, categories FROM business WHERE city = 'Wilmington' AND categories LIKE '%Coffee%' AND stars >= 4.5;"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "photo.db"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "IN": "coffee_shops.business_id"
+              },
+              "label": {
+                "==": "indoor"
+              }
+            }
+          },
+          "result_var": "indoor_photos",
+          "description": {
+            "narrative": "Query the photo SQLite database to find all photos labeled as 'indoor' for the coffee shops found in Step 1. We join on business_id.",
+            "example_query": "SELECT photo_id, business_id, caption, label FROM photo WHERE business_id IN (...) AND label = 'indoor';"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "business.db",
+              "photo.db"
+            ],
+            "filter_condition": {}
+          },
+          "result_var": "final_result",
+          "description": {
+            "narrative": "Merge the coffee shop information with their indoor photos to produce a comprehensive result showing each business alongside its indoor photo details.",
+            "example_query": "Pandas merge on business_id to combine business details with photo details."
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport pandas as pd\nimport os\n\n# =============================================================\n# Database paths configuration\n# =============================================================\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\ndef main():\n    # =============================================================\n    # Step 1: Query coffee shops in Wilmington rated >= 4.5\n    # =============================================================\n    print(\"=\" * 70)\n    print(\"Step 1: Finding coffee shops in Wilmington with rating >= 4.5\")\n    print(\"=\" * 70)\n    \n    try:\n        conn_business = sqlite3.connect(sqlite_paths[\"business\"])\n        \n        query_business = \"\"\"\n            SELECT business_id, name, address, city, state, stars, \n                   review_count, categories, is_open\n            FROM business\n            WHERE city = 'Wilmington'\n              AND categories LIKE '%Coffee%'\n              AND stars >= 4.5\n            ORDER BY stars DESC, review_count DESC;\n        \"\"\"\n        \n        coffee_shops = pd.read_sql_query(query_business, conn_business)\n        conn_business.close()\n        \n        print(f\"\\nFound {len(coffee_shops)} coffee shop(s) in Wilmington rated >= 4.5:\\n\")\n        \n        if coffee_shops.empty:\n            print(\"No coffee shops found matching the criteria.\")\n            print(\"\\nTrying broader search with 'Cafe' or 'Espresso' categories...\")\n            \n            conn_business = sqlite3.connect(sqlite_paths[\"business\"])\n            query_broader = \"\"\"\n                SELECT business_id, name, address, city, state, stars, \n                       review_count, categories, is_open\n                FROM business\n                WHERE city = 'Wilmington'\n                  AND (categories LIKE '%Coffee%' \n                       OR categories LIKE '%Cafe%' \n                       OR categories LIKE '%Espresso%'\n                       OR categories LIKE '%Tea%')\n                  AND stars >= 4.5\n                ORDER BY stars DESC, review_count DESC;\n            \"\"\"\n            coffee_shops = pd.read_sql_query(query_broader, conn_business)\n            conn_business.close()\n            print(f\"Found {len(coffee_shops)} shop(s) with broader search.\\n\")\n        \n        if coffee_shops.empty:\n            print(\"No matching businesses found. Exiting.\")\n            return\n        \n        for idx, row in coffee_shops.iterrows():\n            print(f\"  {idx+1}. {row['name']}\")\n            print(f\"     Address: {row['address']}, {row['city']}, {row['state']}\")\n            print(f\"     Stars: {row['stars']} | Reviews: {row['review_count']}\")\n            print(f\"     Categories: {row['categories']}\")\n            print(f\"     Open: {'Yes' if row['is_open'] == 1 else 'No'}\")\n            print()\n        \n    except Exception as e:\n        print(f\"Error querying business database: {e}\")\n        return\n    \n    # =============================================================\n    # Step 2: Query indoor photos for these coffee shops\n    # =============================================================\n    print(\"=\" * 70)\n    print(\"Step 2: Finding indoor photos for these coffee shops\")\n    print(\"=\" * 70)\n    \n    try:\n        conn_photo = sqlite3.connect(sqlite_paths[\"photo\"])\n        \n        business_ids = coffee_shops['business_id'].tolist()\n        placeholders = ','.join(['?' for _ in business_ids])\n        \n        query_photos = f\"\"\"\n            SELECT photo_id, business_id, caption, label\n            FROM photo\n            WHERE business_id IN ({placeholders})\n              AND label = 'indoor'\n            ORDER BY business_id;\n        \"\"\"\n        \n        indoor_photos = pd.read_sql_query(query_photos, conn_photo, params=business_ids)\n        conn_photo.close()\n        \n        print(f\"\\nFound {len(indoor_photos)} indoor photo(s) for the matching coffee shops.\\n\")\n        \n        if indoor_photos.empty:\n            print(\"No indoor photos found for these businesses.\")\n        else:\n            for idx, row in indoor_photos.iterrows():\n                print(f\"  Photo ID: {row['photo_id']}\")\n                print(f\"  Business ID: {row['business_id']}\")\n                print(f\"  Caption: {row['caption'] if row['caption'] else 'N/A'}\")\n                print(f\"  Label: {row['label']}\")\n                print()\n        \n    except Exception as e:\n        print(f\"Error querying photo database: {e}\")\n        return\n    \n    # =============================================================\n    # Step 3: Merge results into a comprehensive view\n    # =============================================================\n    print(\"=\" * 70)\n    print(\"Step 3: Combined Results - Coffee Shops with Indoor Photos\")\n    print(\"=\" * 70)\n    \n    try:\n        merged = pd.merge(\n            coffee_shops[['business_id', 'name', 'address', 'city', 'state', 'stars', 'review_count', 'categories']],\n            indoor_photos[['photo_id', 'business_id', 'caption', 'label']],\n            on='business_id',\n            how='inner'\n        )\n        \n        if merged.empty:\n            print(\"\\nNo coffee shops have indoor photos available.\")\n            print(\"\\nShowing coffee shops without photo requirement:\")\n            print(coffee_shops[['name', 'address', 'stars', 'review_count', 'categories']].to_string(index=False))\n        else:\n            print(f\"\\nTotal {len(merged)} result(s) (business + indoor photo combinations):\\n\")\n            \n            grouped = merged.groupby('business_id')\n            for biz_id, group in grouped:\n                biz_info = group.iloc[0]\n                print(f\"  ★ {biz_info['name']} (Rating: {biz_info['stars']})\")\n                print(f\"    Address: {biz_info['address']}, {biz_info['city']}, {biz_info['state']}\")\n                print(f\"    Reviews: {biz_info['review_count']}\")\n                print(f\"    Categories: {biz_info['categories']}\")\n                print(f\"    Indoor Photos ({len(group)}):\")\n                for _, photo in group.iterrows():\n                    caption_text = photo['caption'] if photo['caption'] else 'No caption'\n                    print(f\"      - Photo ID: {photo['photo_id']} | Caption: {caption_text}\")\n                print()\n            \n            # Summary table\n            print(\"\\n\" + \"=\" * 70)\n            print(\"Summary Table\")\n            print(\"=\" * 70)\n            summary = merged[['name', 'stars', 'photo_id', 'caption']].copy()\n            summary.columns = ['Business Name', 'Stars', 'Photo ID', 'Caption']\n            print(summary.to_string(index=False))\n    \n    except Exception as e:\n        print(f\"Error merging results: {e}\")\n\n\nif __name__ == \"__main__\":\n    main()"
+    }
+  },
+{
+    "index": 286,
+    "question": "Find Wilmington coffee shops rated >=4.5 with outdoor seating and list the top 5 by check-ins since 2023-01-01.",
+    "success": true,
+    "result": {
+      "analysis": "This query requires: (1) Finding coffee shops in Wilmington with rating >= 4.5 and outdoor seating from the SQLite business database, (2) Joining with check-in data from the SQLite checkin database, filtering check-ins since 2023-01-01, (3) Aggregating and ranking by check-in count. This is primarily a SQL-based query across two SQLite databases (business.db and checkin.db). No vector or graph queries are needed since we're dealing with structured filters and aggregations.",
+      "natural_question": "Find Wilmington coffee shops rated >=4.5 with outdoor seating and list the top 5 by check-ins since 2023-01-01.",
+      "difficulty": "medium",
+      "query_types": [
+        "sql"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Wilmington"
+              },
+              "stars": {
+                "gte": 4.5
+              },
+              "categories": {
+                "contains": "Coffee"
+              },
+              "attributes": {
+                "contains": "OutdoorSeating"
+              }
+            }
+          },
+          "result_var": "coffee_shops",
+          "description": {
+            "narrative": "Query the business.db SQLite database to find all businesses in Wilmington that are categorized as coffee shops (categories containing 'Coffee'), have a star rating >= 4.5, and have outdoor seating enabled in their attributes. Extract business_id, name, stars, categories, and attributes.",
+            "example_query": "SELECT business_id, name, stars, categories, attributes FROM business WHERE city = 'Wilmington' AND stars >= 4.5 AND categories LIKE '%Coffee%' AND attributes LIKE '%OutdoorSeating%True%'"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "checkin"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "coffee_shops.business_id"
+              },
+              "date": {
+                "gte": "2023-01-01"
+              }
+            }
+          },
+          "result_var": "checkin_counts",
+          "description": {
+            "narrative": "Query the checkin.db SQLite database to retrieve check-in records for the matching coffee shops. The checkin table stores dates as comma-separated strings in a single 'date' column per business. We need to parse these dates, filter for those on or after 2023-01-01, count them per business, and rank the results.",
+            "example_query": "SELECT business_id, date FROM checkin WHERE business_id IN (?, ?, ...)"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "business",
+              "checkin"
+            ],
+            "filter_condition": {}
+          },
+          "result_var": "top5_results",
+          "description": {
+            "narrative": "Join the filtered coffee shop data with the aggregated check-in counts, sort by check-in count in descending order, and return the top 5 results with business name, stars, and check-in count since 2023-01-01.",
+            "example_query": "SELECT b.name, b.stars, checkin_count FROM coffee_shops b JOIN checkin_counts c ON b.business_id = c.business_id ORDER BY checkin_count DESC LIMIT 5"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport pandas as pd\nfrom datetime import datetime\n\n# ============================================================\n# Database paths\n# ============================================================\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\"\n}\n\ntry:\n    # ========================================================\n    # Step 1: Find Wilmington coffee shops rated >= 4.5\n    #         with outdoor seating\n    # ========================================================\n    print(\"=\" * 70)\n    print(\"Step 1: Querying business.db for Wilmington coffee shops...\")\n    print(\"=\" * 70)\n\n    conn_biz = sqlite3.connect(sqlite_paths[\"business\"])\n\n    query_business = \"\"\"\n        SELECT business_id, name, stars, categories, attributes,\n               address, review_count\n        FROM business\n        WHERE city = 'Wilmington'\n          AND stars >= 4.5\n          AND categories LIKE '%Coffee%'\n          AND (\n              attributes LIKE '%OutdoorSeating%: True%'\n              OR attributes LIKE '%OutdoorSeating%:True%'\n              OR attributes LIKE '%\"OutdoorSeating\": true%'\n              OR attributes LIKE '%OutdoorSeating%True%'\n          )\n    \"\"\"\n\n    df_shops = pd.read_sql_query(query_business, conn_biz)\n    conn_biz.close()\n\n    print(f\"Found {len(df_shops)} matching coffee shops in Wilmington.\")\n    if df_shops.empty:\n        print(\"\\nNo coffee shops found matching all criteria.\")\n        print(\"Trying broader search without OutdoorSeating attribute filter...\")\n\n        # Fallback: relax outdoor seating matching\n        conn_biz = sqlite3.connect(sqlite_paths[\"business\"])\n        query_fallback = \"\"\"\n            SELECT business_id, name, stars, categories, attributes,\n                   address, review_count\n            FROM business\n            WHERE city = 'Wilmington'\n              AND stars >= 4.5\n              AND categories LIKE '%Coffee%'\n        \"\"\"\n        df_shops = pd.read_sql_query(query_fallback, conn_biz)\n        conn_biz.close()\n\n        # Filter outdoor seating in Python for more flexible matching\n        if not df_shops.empty and 'attributes' in df_shops.columns:\n            outdoor_mask = df_shops['attributes'].fillna('').str.lower().str.contains('outdoorseating')\n            true_mask = df_shops['attributes'].fillna('').str.lower().str.contains('true')\n            # Try to find rows where OutdoorSeating is True\n            df_outdoor = df_shops[outdoor_mask]\n            if not df_outdoor.empty:\n                df_shops = df_outdoor\n                print(f\"Found {len(df_shops)} shops with OutdoorSeating mentioned.\")\n            else:\n                print(f\"No OutdoorSeating attribute found. Proceeding with {len(df_shops)} coffee shops.\")\n\n    print(\"\\nMatching coffee shops:\")\n    for idx, row in df_shops.iterrows():\n        print(f\"  - {row['name']} | Stars: {row['stars']} | Reviews: {row['review_count']}\")\n\n    if df_shops.empty:\n        print(\"\\nNo results to process. Exiting.\")\n    else:\n        # ====================================================\n        # Step 2: Get check-in data and count since 2023-01-01\n        # ====================================================\n        print(\"\\n\" + \"=\" * 70)\n        print(\"Step 2: Querying checkin.db for check-in records...\")\n        print(\"=\" * 70)\n\n        business_ids = df_shops['business_id'].tolist()\n        placeholders = ','.join(['?' for _ in business_ids])\n\n        conn_checkin = sqlite3.connect(sqlite_paths[\"checkin\"])\n\n        query_checkin = f\"\"\"\n            SELECT business_id, date\n            FROM checkin\n            WHERE business_id IN ({placeholders})\n        \"\"\"\n\n        df_checkins = pd.read_sql_query(query_checkin, conn_checkin, params=business_ids)\n        conn_checkin.close()\n\n        print(f\"Retrieved check-in records for {len(df_checkins)} businesses.\")\n\n        # Parse the comma-separated date strings and count dates >= 2023-01-01\n        cutoff_date = datetime(2023, 1, 1)\n        checkin_counts = {}\n\n        for _, row in df_checkins.iterrows():\n            bid = row['business_id']\n            date_str = row['date']\n            if pd.isna(date_str) or not date_str.strip():\n                continue\n\n            # Dates are stored as comma-separated datetime strings\n            dates = [d.strip() for d in date_str.split(',')]\n            count = 0\n            for d in dates:\n                try:\n                    # Try multiple date formats\n                    for fmt in ['%Y-%m-%d %H:%M:%S', '%Y-%m-%d']:\n                        try:\n                            dt = datetime.strptime(d, fmt)\n                            break\n                        except ValueError:\n                            continue\n                    else:\n                        continue\n                    if dt >= cutoff_date:\n                        count += 1\n                except Exception:\n                    continue\n            checkin_counts[bid] = checkin_counts.get(bid, 0) + count\n\n        print(f\"Parsed check-in counts for {len(checkin_counts)} businesses since 2023-01-01.\")\n\n        # ====================================================\n        # Step 3: Join, rank, and display top 5\n        # ====================================================\n        print(\"\\n\" + \"=\" * 70)\n        print(\"Step 3: Ranking and displaying top 5 results...\")\n        print(\"=\" * 70)\n\n        df_shops['checkins_since_2023'] = df_shops['business_id'].map(checkin_counts).fillna(0).astype(int)\n\n        # Sort by check-in count descending, then by stars descending as tiebreaker\n        df_result = df_shops.sort_values(\n            by=['checkins_since_2023', 'stars'],\n            ascending=[False, False]\n        ).head(5)\n\n        # Display results\n        print(\"\\n\" + \"=\" * 70)\n        print(\"  TOP 5 WILMINGTON COFFEE SHOPS (Rated >= 4.5, Outdoor Seating)\")\n        print(\"  Ranked by Check-ins Since 2023-01-01\")\n        print(\"=\" * 70)\n\n        if df_result.empty or df_result['checkins_since_2023'].sum() == 0:\n            print(\"\\nNo check-ins found since 2023-01-01 for matching shops.\")\n            print(\"Showing shops sorted by star rating and review count instead:\\n\")\n            df_result = df_shops.sort_values(\n                by=['stars', 'review_count'],\n                ascending=[False, False]\n            ).head(5)\n\n        display_cols = ['name', 'stars', 'address', 'review_count', 'checkins_since_2023']\n        available_cols = [c for c in display_cols if c in df_result.columns]\n\n        for rank, (idx, row) in enumerate(df_result.iterrows(), 1):\n            print(f\"\\n  Rank #{rank}\")\n            print(f\"    Name:              {row['name']}\")\n            print(f\"    Stars:             {row['stars']}\")\n            if 'address' in row:\n                print(f\"    Address:           {row['address']}\")\n            print(f\"    Total Reviews:     {row['review_count']}\")\n            print(f\"    Check-ins (2023+): {row['checkins_since_2023']}\")\n            print(f\"    {'─' * 45}\")\n\n        print(\"\\n\" + \"=\" * 70)\n        print(\"Query completed successfully.\")\n        print(\"=\" * 70)\n\n        # Also output as a clean DataFrame\n        print(\"\\nTabular Summary:\")\n        print(df_result[available_cols].to_string(index=False))\n\nexcept sqlite3.Error as e:\n    print(f\"SQLite Error: {e}\")\nexcept Exception as e:\n    print(f\"Error: {e}\")\n    import traceback\n    traceback.print_exc()"
+    }
+  },
+{
+    "index": 287,
+    "question": "Find Wilmington pizza places rated >=4.0 with over 150 reviews and count check-ins since 2023-01-01.",
+    "success": true,
+    "result": {
+      "analysis": "This query requires: 1) Finding pizza businesses in Wilmington with rating >= 4.0 and review_count > 150 from SQLite business.db, 2) Looking up check-in data from SQLite checkin.db and counting check-ins since 2023-01-01. This is a multi-table SQL query across two SQLite databases. No vector or graph database needed since we're dealing with structured filters and aggregations.",
+      "natural_question": "Find pizza places in Wilmington rated 4.0 or above with more than 150 reviews, and count their check-ins since January 1, 2023.",
+      "difficulty": "medium",
+      "query_types": [
+        "sql"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business.db"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Wilmington"
+              },
+              "categories": {
+                "like": "%Pizza%"
+              },
+              "stars": {
+                "gte": 4.0
+              },
+              "review_count": {
+                "gt": 150
+              }
+            }
+          },
+          "result_var": "pizza_businesses",
+          "description": {
+            "narrative": "Query the business.db SQLite database to find all businesses in Wilmington whose categories include 'Pizza', with a star rating >= 4.0 and review_count > 150. Retrieve business_id, name, stars, review_count, categories, and address.",
+            "example_query": "SELECT business_id, name, address, stars, review_count, categories FROM business WHERE city = 'Wilmington' AND categories LIKE '%Pizza%' AND stars >= 4.0 AND review_count > 150;"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "checkin.db"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "pizza_businesses.business_id list"
+              },
+              "date": {
+                "gte": "2023-01-01"
+              }
+            }
+          },
+          "result_var": "checkin_counts",
+          "description": {
+            "narrative": "For each qualifying pizza business, query the checkin.db to retrieve the comma-separated date string, parse individual timestamps, filter those on or after 2023-01-01, and count them per business.",
+            "example_query": "SELECT business_id, date FROM checkin WHERE business_id IN (?, ?, ...);"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "business.db",
+              "checkin.db"
+            ]
+          },
+          "result_var": "final_result",
+          "description": {
+            "narrative": "Merge the business information with the check-in counts to produce a final result table showing each qualifying pizza place along with its check-in count since 2023-01-01. Sort by check-in count descending.",
+            "example_query": "N/A - this is a Python pandas merge operation"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport pandas as pd\nfrom datetime import datetime\n\n# =============================================================\n# Database paths\n# =============================================================\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\n# =============================================================\n# Step 1: Find pizza places in Wilmington with stars >= 4.0\n#         and review_count > 150\n# =============================================================\nprint(\"=\" * 70)\nprint(\"Step 1: Querying business.db for Wilmington pizza places\")\nprint(\"        (stars >= 4.0, review_count > 150)\")\nprint(\"=\" * 70)\n\ntry:\n    conn_biz = sqlite3.connect(sqlite_paths[\"business\"])\n    \n    business_query = \"\"\"\n        SELECT business_id,\n               name,\n               address,\n               city,\n               state,\n               stars,\n               review_count,\n               categories\n        FROM business\n        WHERE city = 'Wilmington'\n          AND categories LIKE '%Pizza%'\n          AND stars >= 4.0\n          AND review_count > 150\n        ORDER BY stars DESC, review_count DESC;\n    \"\"\"\n    \n    pizza_businesses = pd.read_sql_query(business_query, conn_biz)\n    conn_biz.close()\n    \n    print(f\"\\nFound {len(pizza_businesses)} qualifying pizza place(s):\\n\")\n    if not pizza_businesses.empty:\n        for _, row in pizza_businesses.iterrows():\n            print(f\"  - {row['name']}\")\n            print(f\"    Address : {row['address']}\")\n            print(f\"    Stars   : {row['stars']}\")\n            print(f\"    Reviews : {row['review_count']}\")\n            print(f\"    Category: {row['categories']}\")\n            print()\n    else:\n        print(\"  No pizza places found matching the criteria.\")\n        print(\"  (Try relaxing filters: lower stars threshold or review count)\")\n\nexcept Exception as e:\n    print(f\"Error querying business.db: {e}\")\n    pizza_businesses = pd.DataFrame()\n\n# =============================================================\n# Step 2: Count check-ins since 2023-01-01 for each business\n# =============================================================\nprint(\"=\" * 70)\nprint(\"Step 2: Querying checkin.db for check-ins since 2023-01-01\")\nprint(\"=\" * 70)\n\ncheckin_cutoff = datetime(2023, 1, 1)\n\nif not pizza_businesses.empty:\n    try:\n        conn_checkin = sqlite3.connect(sqlite_paths[\"checkin\"])\n        \n        biz_ids = pizza_businesses[\"business_id\"].tolist()\n        placeholders = \",\".join([\"?\"] * len(biz_ids))\n        \n        checkin_query = f\"\"\"\n            SELECT business_id, date\n            FROM checkin\n            WHERE business_id IN ({placeholders});\n        \"\"\"\n        \n        checkin_df = pd.read_sql_query(checkin_query, conn_checkin, params=biz_ids)\n        conn_checkin.close()\n        \n        # -------------------------------------------------------\n        # The checkin table stores dates as a single comma-\n        # separated string per business_id.  We need to split,\n        # parse each timestamp, and keep only those >= cutoff.\n        # -------------------------------------------------------\n        checkin_results = []\n        \n        for _, row in checkin_df.iterrows():\n            bid = row[\"business_id\"]\n            date_str = row[\"date\"]\n            \n            if pd.isna(date_str) or not date_str.strip():\n                checkin_results.append({\"business_id\": bid, \"checkins_since_2023\": 0})\n                continue\n            \n            # Split the comma-separated timestamps\n            timestamps = [d.strip() for d in date_str.split(\",\") if d.strip()]\n            \n            count_since_cutoff = 0\n            for ts in timestamps:\n                try:\n                    # Handle both 'YYYY-MM-DD HH:MM:SS' and 'YYYY-MM-DD' formats\n                    if len(ts) > 10:\n                        dt = datetime.strptime(ts, \"%Y-%m-%d %H:%M:%S\")\n                    else:\n                        dt = datetime.strptime(ts, \"%Y-%m-%d\")\n                    if dt >= checkin_cutoff:\n                        count_since_cutoff += 1\n                except ValueError:\n                    continue  # skip unparseable timestamps\n            \n            checkin_results.append({\n                \"business_id\": bid,\n                \"checkins_since_2023\": count_since_cutoff,\n                \"total_checkins_all_time\": len(timestamps)\n            })\n        \n        checkin_counts = pd.DataFrame(checkin_results)\n        \n        print(f\"\\nRetrieved check-in data for {len(checkin_counts)} business(es).\\n\")\n    \n    except Exception as e:\n        print(f\"Error querying checkin.db: {e}\")\n        checkin_counts = pd.DataFrame(columns=[\"business_id\", \"checkins_since_2023\", \"total_checkins_all_time\"])\nelse:\n    checkin_counts = pd.DataFrame(columns=[\"business_id\", \"checkins_since_2023\", \"total_checkins_all_time\"])\n\n# =============================================================\n# Step 3: Merge results and display final output\n# =============================================================\nprint(\"=\" * 70)\nprint(\"Step 3: Final Results — Wilmington Pizza Places with Check-in Counts\")\nprint(\"=\" * 70)\n\nif not pizza_businesses.empty and not checkin_counts.empty:\n    final_result = pizza_businesses.merge(\n        checkin_counts,\n        on=\"business_id\",\n        how=\"left\"\n    )\n    \n    # Fill NaN for businesses with no check-in records\n    final_result[\"checkins_since_2023\"] = final_result[\"checkins_since_2023\"].fillna(0).astype(int)\n    final_result[\"total_checkins_all_time\"] = final_result[\"total_checkins_all_time\"].fillna(0).astype(int)\n    \n    # Sort by check-ins since 2023 descending\n    final_result = final_result.sort_values(\"checkins_since_2023\", ascending=False).reset_index(drop=True)\n    \n    # Display\n    print(\"\\n\")\n    display_cols = [\"name\", \"address\", \"stars\", \"review_count\",\n                    \"checkins_since_2023\", \"total_checkins_all_time\"]\n    \n    for idx, row in final_result.iterrows():\n        print(f\"  {idx + 1}. {row['name']}\")\n        print(f\"     Address              : {row['address']}\")\n        print(f\"     Stars                : {row['stars']}\")\n        print(f\"     Review Count         : {row['review_count']}\")\n        print(f\"     Check-ins since 2023 : {row['checkins_since_2023']}\")\n        print(f\"     Total Check-ins (all): {row['total_checkins_all_time']}\")\n        print()\n    \n    # Summary statistics\n    print(\"-\" * 70)\n    print(f\"  Total qualifying businesses : {len(final_result)}\")\n    print(f\"  Total check-ins since 2023  : {final_result['checkins_since_2023'].sum()}\")\n    print(f\"  Avg check-ins since 2023    : {final_result['checkins_since_2023'].mean():.1f}\")\n    print(\"-\" * 70)\n    \n    # Also save to CSV for convenience\n    output_path = \"D:/Yelp-JSON/db/wilmington_pizza_checkins.csv\"\n    try:\n        final_result[display_cols].to_csv(output_path, index=False)\n        print(f\"\\n  Results saved to: {output_path}\")\n    except Exception as e:\n        print(f\"\\n  Could not save CSV: {e}\")\n\nelse:\n    print(\"\\n  No results to display. Either no qualifying businesses were found\")\n    print(\"  or no check-in data was available.\")\n\nprint(\"\\n\" + \"=\" * 70)\nprint(\"Done.\")\nprint(\"=\" * 70)\n"
+    }
+  },
+{
+    "index": 288,
+    "question": "Find Clearwater bars rated >=4.0 with reviews mentioning great atmosphere or comfortable/cozy, and show those review texts.",
+    "success": true,
+    "result": {
+      "analysis": "This query requires a multi-database approach: (1) First, use SQLite to find bars in Clearwater with a rating >= 4.0. (2) Then, use Milvus vector search to find reviews that semantically match 'great atmosphere' or 'comfortable/cozy'. (3) Finally, join the results to get the review texts for those specific businesses. This is a medium-difficulty query combining structured filtering (SQL) with semantic search (vector).",
+      "natural_question": "Find bars in Clearwater rated 4.0 or above that have reviews mentioning great atmosphere or comfortable/cozy vibes, and display those review texts.",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business.db"
+            ],
+            "filter_condition": {
+              "city": {
+                "$eq": "Clearwater"
+              },
+              "categories": {
+                "$like": "%Bars%"
+              },
+              "stars": {
+                "$gte": 4.0
+              }
+            }
+          },
+          "result_var": "clearwater_bars",
+          "description": {
+            "narrative": "Query the SQLite business database to find all bars located in Clearwater with a star rating of 4.0 or higher. Extract their business_ids and names.",
+            "example_query": "SELECT business_id, name, stars, categories FROM business WHERE city = 'Clearwater' AND categories LIKE '%Bars%' AND stars >= 4.0;"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "reviews"
+            ],
+            "filter_condition": {
+              "semantic_query": [
+                "great atmosphere",
+                "comfortable cozy"
+              ],
+              "top_k": 200
+            }
+          },
+          "result_var": "atmosphere_reviews",
+          "description": {
+            "narrative": "Perform semantic vector searches in the Milvus 'reviews' collection using the phrases 'great atmosphere' and 'comfortable cozy' to find reviews that semantically match these concepts. Retrieve top-K results for each query.",
+            "example_query": "collection.search(data=[embed('great atmosphere')], anns_field='text_vector', param={'metric_type':'L2','params':{'nprobe':16}}, limit=200, output_fields=['business_id','review_id'])"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "review.db"
+            ],
+            "filter_condition": {
+              "review_id": {
+                "$in": "matched_review_ids"
+              },
+              "business_id": {
+                "$in": "clearwater_bar_ids"
+              }
+            }
+          },
+          "result_var": "final_results",
+          "description": {
+            "narrative": "Cross-reference the business_ids from Step 1 with the review_ids from Step 2. Then query the SQLite review database to retrieve the full review texts for the matching reviews.",
+            "example_query": "SELECT r.review_id, r.business_id, r.text, r.stars, r.date FROM review r WHERE r.business_id IN (...) AND r.review_id IN (...);"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport json\nimport numpy as np\nfrom pymilvus import connections, Collection\nfrom sentence_transformers import SentenceTransformer\n\n# ============================================================\n# Configuration\n# ============================================================\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nmilvus_config = {\n    \"host\": \"localhost\",\n    \"port\": \"19530\",\n    \"collections\": {\n        \"reviews\": \"reviews\",\n        \"photos\": \"photo_vector\",\n        \"tips\": \"milvus_tip\"\n    }\n}\n\n# ============================================================\n# Step 0: Initialize embedding model\n# ============================================================\nprint(\"Loading sentence transformer model...\")\nmodel = SentenceTransformer('all-MiniLM-L6-v2')\n\n# ============================================================\n# Step 1: Find Clearwater bars rated >= 4.0 from SQLite\n# ============================================================\nprint(\"\\n\" + \"=\"*60)\nprint(\"STEP 1: Querying SQLite for Clearwater bars rated >= 4.0\")\nprint(\"=\"*60)\n\ntry:\n    conn_business = sqlite3.connect(sqlite_paths[\"business\"])\n    cursor_business = conn_business.cursor()\n    \n    query_bars = \"\"\"\n        SELECT business_id, name, stars, categories, address\n        FROM business\n        WHERE city = 'Clearwater'\n          AND categories LIKE '%Bars%'\n          AND stars >= 4.0\n        ORDER BY stars DESC;\n    \"\"\"\n    \n    cursor_business.execute(query_bars)\n    clearwater_bars = cursor_business.fetchall()\n    conn_business.close()\n    \n    print(f\"Found {len(clearwater_bars)} Clearwater bars with rating >= 4.0:\")\n    bar_ids = []\n    bar_info = {}\n    for row in clearwater_bars:\n        bid, name, stars, categories, address = row\n        bar_ids.append(bid)\n        bar_info[bid] = {\"name\": name, \"stars\": stars, \"categories\": categories, \"address\": address}\n        print(f\"  - {name} | Stars: {stars} | {address}\")\n    \n    if not bar_ids:\n        print(\"No bars found matching criteria. Exiting.\")\n        exit()\n        \nexcept Exception as e:\n    print(f\"Error querying business database: {e}\")\n    raise\n\n# ============================================================\n# Step 2: Semantic search in Milvus for atmosphere/cozy reviews\n# ============================================================\nprint(\"\\n\" + \"=\"*60)\nprint(\"STEP 2: Semantic vector search in Milvus for atmosphere/cozy reviews\")\nprint(\"=\"*60)\n\ntry:\n    connections.connect(\"default\", host=milvus_config[\"host\"], port=milvus_config[\"port\"])\n    collection = Collection(milvus_config[\"collections\"][\"reviews\"])\n    collection.load()\n    \n    # Define semantic search queries\n    search_phrases = [\n        \"great atmosphere\",\n        \"comfortable cozy warm inviting ambiance\"\n    ]\n    \n    search_params = {\n        \"metric_type\": \"L2\",\n        \"params\": {\"nprobe\": 16}\n    }\n    \n    # Collect all matching review_ids and their business_ids from vector search\n    matched_review_ids = set()\n    review_to_score = {}\n    \n    for phrase in search_phrases:\n        print(f\"\\nSearching for: '{phrase}'\")\n        query_embedding = model.encode([phrase])\n        \n        results = collection.search(\n            data=query_embedding.tolist(),\n            anns_field=\"text_vector\",\n            param=search_params,\n            limit=200,\n            output_fields=[\"business_id\", \"review_id\"]\n        )\n        \n        for hits in results:\n            for hit in hits:\n                rid = hit.entity.get(\"review_id\")\n                bid = hit.entity.get(\"business_id\")\n                distance = hit.distance\n                \n                # Only keep reviews that belong to our Clearwater bars\n                if bid in bar_ids:\n                    matched_review_ids.add(rid)\n                    # Keep the best (lowest distance) score\n                    if rid not in review_to_score or distance < review_to_score[rid][\"distance\"]:\n                        review_to_score[rid] = {\n                            \"business_id\": bid,\n                            \"distance\": distance\n                        }\n    \n    print(f\"\\nFound {len(matched_review_ids)} semantically matching reviews for Clearwater bars.\")\n    \n    if not matched_review_ids:\n        print(\"No matching reviews found. Exiting.\")\n        connections.disconnect(\"default\")\n        exit()\n        \nexcept Exception as e:\n    print(f\"Error during Milvus search: {e}\")\n    raise\nfinally:\n    try:\n        connections.disconnect(\"default\")\n    except:\n        pass\n\n# ============================================================\n# Step 3: Retrieve full review texts from SQLite review.db\n# ============================================================\nprint(\"\\n\" + \"=\"*60)\nprint(\"STEP 3: Retrieving full review texts from SQLite\")\nprint(\"=\"*60)\n\ntry:\n    conn_review = sqlite3.connect(sqlite_paths[\"review\"])\n    cursor_review = conn_review.cursor()\n    \n    # Build parameterized query for matched review_ids\n    review_id_list = list(matched_review_ids)\n    placeholders = \",\".join([\"?\"] * len(review_id_list))\n    \n    query_reviews = f\"\"\"\n        SELECT review_id, business_id, user_id, stars, date, text\n        FROM review\n        WHERE review_id IN ({placeholders});\n    \"\"\"\n    \n    cursor_review.execute(query_reviews, review_id_list)\n    review_rows = cursor_review.fetchall()\n    conn_review.close()\n    \n    print(f\"Retrieved {len(review_rows)} review texts.\\n\")\n    \nexcept Exception as e:\n    print(f\"Error querying review database: {e}\")\n    raise\n\n# ============================================================\n# Step 4: Display final results\n# ============================================================\nprint(\"\\n\" + \"=\"*60)\nprint(\"FINAL RESULTS: Clearwater Bars (>=4.0) with Atmosphere/Cozy Reviews\")\nprint(\"=\"*60)\n\n# Group reviews by business\nfrom collections import defaultdict\nreviews_by_business = defaultdict(list)\n\nfor row in review_rows:\n    review_id, business_id, user_id, stars, date, text = row\n    score = review_to_score.get(review_id, {}).get(\"distance\", None)\n    reviews_by_business[business_id].append({\n        \"review_id\": review_id,\n        \"user_id\": user_id,\n        \"stars\": stars,\n        \"date\": date,\n        \"text\": text,\n        \"semantic_distance\": score\n    })\n\n# Print grouped results\ntotal_reviews = 0\nfor bid in bar_ids:\n    if bid in reviews_by_business:\n        info = bar_info[bid]\n        revs = reviews_by_business[bid]\n        # Sort by semantic distance (best match first)\n        revs.sort(key=lambda x: x[\"semantic_distance\"] if x[\"semantic_distance\"] is not None else 999)\n        \n        print(f\"\\n{'─'*60}\")\n        print(f\"🍺 {info['name']}\")\n        print(f\"   Rating: {info['stars']} ⭐ | Address: {info['address']}\")\n        print(f\"   Categories: {info['categories']}\")\n        print(f\"   Matching Reviews: {len(revs)}\")\n        print(f\"{'─'*60}\")\n        \n        for i, rev in enumerate(revs, 1):\n            print(f\"\\n   Review #{i} | Stars: {rev['stars']} | Date: {rev['date']}\")\n            print(f\"   Semantic Distance: {rev['semantic_distance']:.4f}\" if rev['semantic_distance'] else \"\")\n            # Truncate long reviews for display\n            review_text = rev['text']\n            if len(review_text) > 500:\n                review_text = review_text[:500] + \"...\"\n            print(f\"   Text: {review_text}\")\n            total_reviews += 1\n\nprint(f\"\\n{'='*60}\")\nprint(f\"SUMMARY: {len(reviews_by_business)} bars with {total_reviews} matching reviews\")\nprint(f\"{'='*60}\")\n"
+    }
+  },
+{
+    "index": 289,
+    "question": "Show Franklin coffee shops with outdoor seating and free WiFi and their indoor and drink photos.",
+    "success": true,
+    "result": {
+      "analysis": "This query requires: 1) Finding coffee shops in Franklin that have outdoor seating and free WiFi attributes from the SQLite business database, 2) Finding photos of those businesses that are categorized as 'indoor' or 'drink' from the SQLite photo database. This is a multi-table SQL query across two SQLite databases (business.db and photo.db). No vector search or graph database is needed since we're filtering on structured attributes and photo labels.",
+      "natural_question": "Show Franklin coffee shops with outdoor seating and free WiFi and their indoor and drink photos.",
+      "difficulty": "medium",
+      "query_types": [
+        "sql"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Franklin"
+              },
+              "categories": {
+                "like": "%Coffee%"
+              },
+              "attributes": {
+                "like": "%OutdoorSeating%True%"
+              },
+              "attributes_2": {
+                "like": "%WiFi%free%"
+              }
+            }
+          },
+          "result_var": "coffee_shops",
+          "description": {
+            "narrative": "Query the business.db SQLite database to find all coffee shops located in Franklin that have outdoor seating enabled and free WiFi in their attributes. We filter by city='Franklin', categories containing 'Coffee', and attributes containing OutdoorSeating: True and WiFi: free.",
+            "example_query": "SELECT business_id, name, address, stars, review_count, categories, attributes FROM business WHERE city = 'Franklin' AND categories LIKE '%Coffee%' AND attributes LIKE '%OutdoorSeating%True%' AND attributes LIKE '%WiFi%free%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "photo"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "coffee_shops.business_id"
+              },
+              "label": {
+                "in": [
+                  "indoor",
+                  "drink"
+                ]
+              }
+            }
+          },
+          "result_var": "photos",
+          "description": {
+            "narrative": "Query the photo.db SQLite database to retrieve all photos associated with the coffee shops found in Step 1, filtering only for photos labeled as 'indoor' or 'drink'.",
+            "example_query": "SELECT photo_id, business_id, caption, label FROM photo WHERE business_id IN (?, ?, ...) AND label IN ('indoor', 'drink');"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "business",
+              "photo"
+            ]
+          },
+          "result_var": "final_result",
+          "description": {
+            "narrative": "Merge the coffee shop information with their corresponding photos to produce a comprehensive result showing each business along with its indoor and drink photos.",
+            "example_query": "Pandas merge on business_id to combine business details with photo details."
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport pandas as pd\nimport json\n\n# ============================================================\n# Database paths configuration\n# ============================================================\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\ntry:\n    # ============================================================\n    # Step 1: Find Franklin coffee shops with outdoor seating & free WiFi\n    # ============================================================\n    print(\"=\" * 70)\n    print(\"Step 1: Querying coffee shops in Franklin with outdoor seating and free WiFi\")\n    print(\"=\" * 70)\n    \n    conn_business = sqlite3.connect(sqlite_paths[\"business\"])\n    \n    query_business = \"\"\"\n        SELECT \n            business_id,\n            name,\n            address,\n            city,\n            state,\n            stars,\n            review_count,\n            categories,\n            attributes\n        FROM business\n        WHERE city = 'Franklin'\n          AND categories LIKE '%Coffee%'\n          AND attributes LIKE '%OutdoorSeating%True%'\n          AND attributes LIKE '%WiFi%free%'\n        ORDER BY stars DESC, review_count DESC;\n    \"\"\"\n    \n    coffee_shops = pd.read_sql_query(query_business, conn_business)\n    conn_business.close()\n    \n    print(f\"\\nFound {len(coffee_shops)} coffee shop(s) in Franklin with outdoor seating and free WiFi:\\n\")\n    \n    if coffee_shops.empty:\n        print(\"No coffee shops found matching the criteria.\")\n        print(\"\\nTrying broader search without WiFi/OutdoorSeating attribute format variations...\")\n        \n        # Retry with alternative attribute format patterns\n        conn_business = sqlite3.connect(sqlite_paths[\"business\"])\n        \n        query_business_alt = \"\"\"\n            SELECT \n                business_id,\n                name,\n                address,\n                city,\n                state,\n                stars,\n                review_count,\n                categories,\n                attributes\n            FROM business\n            WHERE city = 'Franklin'\n              AND categories LIKE '%Coffee%'\n              AND (\n                  attributes LIKE '%OutdoorSeating%True%'\n                  OR attributes LIKE '%OutdoorSeating%: true%'\n                  OR attributes LIKE '%OutdoorSeating%:true%'\n              )\n              AND (\n                  attributes LIKE '%WiFi%free%'\n                  OR attributes LIKE '%WiFi%:% free%'\n                  OR attributes LIKE \"%WiFi%u'free'%\"\n              )\n            ORDER BY stars DESC, review_count DESC;\n        \"\"\"\n        \n        coffee_shops = pd.read_sql_query(query_business_alt, conn_business)\n        conn_business.close()\n        \n        print(f\"Found {len(coffee_shops)} coffee shop(s) with broader search:\\n\")\n    \n    for idx, shop in coffee_shops.iterrows():\n        print(f\"  [{idx+1}] {shop['name']}\")\n        print(f\"      Address: {shop['address']}, {shop['city']}, {shop['state']}\")\n        print(f\"      Stars: {shop['stars']} | Reviews: {shop['review_count']}\")\n        print(f\"      Categories: {shop['categories']}\")\n        print()\n    \n    if coffee_shops.empty:\n        print(\"\\nNo matching coffee shops found. Exiting.\")\n    else:\n        # ============================================================\n        # Step 2: Retrieve indoor and drink photos for these shops\n        # ============================================================\n        print(\"=\" * 70)\n        print(\"Step 2: Retrieving indoor and drink photos for the coffee shops\")\n        print(\"=\" * 70)\n        \n        business_ids = coffee_shops['business_id'].tolist()\n        placeholders = ','.join(['?' for _ in business_ids])\n        \n        conn_photo = sqlite3.connect(sqlite_paths[\"photo\"])\n        \n        query_photos = f\"\"\"\n            SELECT \n                photo_id,\n                business_id,\n                caption,\n                label\n            FROM photo\n            WHERE business_id IN ({placeholders})\n              AND label IN ('indoor', 'drink')\n            ORDER BY business_id, label;\n        \"\"\"\n        \n        photos = pd.read_sql_query(query_photos, conn_photo, params=business_ids)\n        conn_photo.close()\n        \n        print(f\"\\nFound {len(photos)} photo(s) (indoor/drink) across {photos['business_id'].nunique()} business(es):\\n\")\n        \n        # Count by label\n        if not photos.empty:\n            label_counts = photos['label'].value_counts()\n            for label, count in label_counts.items():\n                print(f\"  - {label}: {count} photo(s)\")\n            print()\n        \n        # ============================================================\n        # Step 3: Merge and display combined results\n        # ============================================================\n        print(\"=\" * 70)\n        print(\"Step 3: Combined Results - Coffee Shops with Their Photos\")\n        print(\"=\" * 70)\n        \n        merged = pd.merge(\n            coffee_shops[['business_id', 'name', 'address', 'city', 'state', 'stars', 'review_count', 'categories']],\n            photos,\n            on='business_id',\n            how='left'\n        )\n        \n        # Display results grouped by business\n        for bid in business_ids:\n            shop_info = coffee_shops[coffee_shops['business_id'] == bid].iloc[0]\n            shop_photos = photos[photos['business_id'] == bid]\n            \n            print(f\"\\n{'─' * 60}\")\n            print(f\"☕ {shop_info['name']}\")\n            print(f\"   Address: {shop_info['address']}, {shop_info['city']}, {shop_info['state']}\")\n            print(f\"   Stars: {shop_info['stars']} ⭐ | Reviews: {shop_info['review_count']}\")\n            print(f\"   Categories: {shop_info['categories']}\")\n            print(f\"   Features: Outdoor Seating ✓ | Free WiFi ✓\")\n            \n            indoor_photos = shop_photos[shop_photos['label'] == 'indoor']\n            drink_photos = shop_photos[shop_photos['label'] == 'drink']\n            \n            print(f\"\\n   📸 Indoor Photos ({len(indoor_photos)}):\")\n            if indoor_photos.empty:\n                print(f\"      No indoor photos available.\")\n            else:\n                for _, photo in indoor_photos.iterrows():\n                    caption_text = photo['caption'] if pd.notna(photo['caption']) and photo['caption'] else 'No caption'\n                    print(f\"      - Photo ID: {photo['photo_id']}\")\n                    print(f\"        Caption: {caption_text}\")\n            \n            print(f\"\\n   🥤 Drink Photos ({len(drink_photos)}):\")\n            if drink_photos.empty:\n                print(f\"      No drink photos available.\")\n            else:\n                for _, photo in drink_photos.iterrows():\n                    caption_text = photo['caption'] if pd.notna(photo['caption']) and photo['caption'] else 'No caption'\n                    print(f\"      - Photo ID: {photo['photo_id']}\")\n                    print(f\"        Caption: {caption_text}\")\n        \n        print(f\"\\n{'─' * 60}\")\n        \n        # ============================================================\n        # Summary\n        # ============================================================\n        print(f\"\\n{'=' * 70}\")\n        print(\"SUMMARY\")\n        print(f\"{'=' * 70}\")\n        print(f\"Total coffee shops found: {len(coffee_shops)}\")\n        print(f\"Total indoor photos: {len(photos[photos['label'] == 'indoor']) if not photos.empty else 0}\")\n        print(f\"Total drink photos: {len(photos[photos['label'] == 'drink']) if not photos.empty else 0}\")\n        print(f\"Total photos: {len(photos)}\")\n        \n        # Export merged result\n        if not merged.empty:\n            print(f\"\\nMerged result preview:\")\n            print(merged[['name', 'photo_id', 'label', 'caption', 'stars']].to_string(index=False))\n\nexcept sqlite3.Error as e:\n    print(f\"SQLite error: {e}\")\nexcept Exception as e:\n    print(f\"Error: {e}\")\nfinally:\n    print(\"\\nDone.\")\n"
+    }
+  },
+{
+    "index": 290,
+    "question": "For Wilmington coffee shops or tea rooms rated >=4.5 with >150 reviews, show check-in counts since 2023-01-01.",
+    "success": true,
+    "result": {
+      "analysis": "This query requires finding coffee shops or tea rooms in Wilmington with high ratings (>=4.5) and significant review counts (>150), then joining with check-in data filtered to dates since 2023-01-01. This is a multi-table SQL query across the business and checkin SQLite databases. No vector or graph database needed since we're dealing with structured filtering and aggregation.",
+      "natural_question": "For Wilmington coffee shops or tea rooms rated >=4.5 with >150 reviews, show check-in counts since 2023-01-01.",
+      "difficulty": "medium",
+      "query_types": [
+        "sql"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business.db"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Wilmington"
+              },
+              "categories": {
+                "like": [
+                  "Coffee",
+                  "Tea Rooms"
+                ]
+              },
+              "stars": {
+                "gte": 4.5
+              },
+              "review_count": {
+                "gt": 150
+              }
+            }
+          },
+          "result_var": "qualified_businesses",
+          "description": {
+            "narrative": "Query the business database to find all coffee shops or tea rooms in Wilmington with stars >= 4.5 and review_count > 150. Extract their business_id, name, stars, review_count, and categories.",
+            "example_query": "SELECT business_id, name, stars, review_count, categories FROM business WHERE city = 'Wilmington' AND (categories LIKE '%Coffee%' OR categories LIKE '%Tea Rooms%') AND stars >= 4.5 AND review_count > 150;"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "checkin.db"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "qualified_businesses.business_id"
+              },
+              "date": {
+                "gte": "2023-01-01"
+              }
+            }
+          },
+          "result_var": "checkin_counts",
+          "description": {
+            "narrative": "For each qualified business, query the checkin database. The checkin table stores comma-separated date strings per business_id. We need to parse these dates, filter for dates >= 2023-01-01, and count the check-ins per business.",
+            "example_query": "SELECT business_id, date FROM checkin WHERE business_id IN (?, ?, ...);"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "business.db",
+              "checkin.db"
+            ],
+            "filter_condition": {}
+          },
+          "result_var": "final_result",
+          "description": {
+            "narrative": "Join the business information with the computed check-in counts since 2023-01-01 and present the final results sorted by check-in count descending.",
+            "example_query": "N/A - this is a Python merge/join step combining results from step 1 and step 2."
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport pandas as pd\nfrom datetime import datetime\n\n# ============================================================\n# Database paths\n# ============================================================\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\"\n}\n\n# ============================================================\n# Step 1: Find qualified coffee shops / tea rooms in Wilmington\n# ============================================================\nprint(\"=\" * 70)\nprint(\"Step 1: Querying qualified businesses in Wilmington...\")\nprint(\"=\" * 70)\n\ntry:\n    conn_biz = sqlite3.connect(sqlite_paths[\"business\"])\n    \n    query_business = \"\"\"\n        SELECT business_id, name, stars, review_count, categories\n        FROM business\n        WHERE city = 'Wilmington'\n          AND (categories LIKE '%Coffee%' OR categories LIKE '%Tea Rooms%')\n          AND stars >= 4.5\n          AND review_count > 150;\n    \"\"\"\n    \n    qualified_businesses = pd.read_sql_query(query_business, conn_biz)\n    conn_biz.close()\n    \n    print(f\"Found {len(qualified_businesses)} qualified business(es):\")\n    if not qualified_businesses.empty:\n        for _, row in qualified_businesses.iterrows():\n            print(f\"  - {row['name']} | Stars: {row['stars']} | Reviews: {row['review_count']}\")\n            print(f\"    Categories: {row['categories']}\")\n    else:\n        print(\"  No businesses matched the criteria.\")\n        print(\"  Exiting.\")\n        exit()\n\nexcept Exception as e:\n    print(f\"Error querying business database: {e}\")\n    raise\n\n# ============================================================\n# Step 2: Get check-in data and filter for dates >= 2023-01-01\n# ============================================================\nprint(\"\\n\" + \"=\" * 70)\nprint(\"Step 2: Querying check-in data since 2023-01-01...\")\nprint(\"=\" * 70)\n\ncutoff_date = datetime(2023, 1, 1)\nbusiness_ids = qualified_businesses[\"business_id\"].tolist()\n\ntry:\n    conn_checkin = sqlite3.connect(sqlite_paths[\"checkin\"])\n    \n    placeholders = \",\".join([\"?\"] * len(business_ids))\n    query_checkin = f\"\"\"\n        SELECT business_id, date\n        FROM checkin\n        WHERE business_id IN ({placeholders});\n    \"\"\"\n    \n    checkin_raw = pd.read_sql_query(query_checkin, conn_checkin, params=business_ids)\n    conn_checkin.close()\n    \n    print(f\"Retrieved check-in records for {len(checkin_raw)} business(es).\")\n\nexcept Exception as e:\n    print(f\"Error querying checkin database: {e}\")\n    raise\n\n# ============================================================\n# Step 2b: Parse comma-separated dates and count since cutoff\n# ============================================================\ncheckin_counts = []\n\nfor _, row in checkin_raw.iterrows():\n    bid = row[\"business_id\"]\n    date_str = row[\"date\"]\n    \n    if pd.isna(date_str) or not date_str.strip():\n        checkin_counts.append({\"business_id\": bid, \"checkin_count_since_2023\": 0})\n        continue\n    \n    # Split the comma-separated date string\n    dates = [d.strip() for d in date_str.split(\",\")]\n    \n    count = 0\n    for d in dates:\n        try:\n            # Handle multiple possible formats\n            dt = datetime.strptime(d, \"%Y-%m-%d %H:%M:%S\")\n        except ValueError:\n            try:\n                dt = datetime.strptime(d, \"%Y-%m-%d\")\n            except ValueError:\n                continue\n        if dt >= cutoff_date:\n            count += 1\n    \n    checkin_counts.append({\"business_id\": bid, \"checkin_count_since_2023\": count})\n\ncheckin_df = pd.DataFrame(checkin_counts)\nprint(f\"Parsed check-in counts for {len(checkin_df)} business(es).\")\n\n# ============================================================\n# Step 3: Merge and present final results\n# ============================================================\nprint(\"\\n\" + \"=\" * 70)\nprint(\"Step 3: Final Results - Wilmington Coffee/Tea Shops Check-ins Since 2023\")\nprint(\"=\" * 70)\n\nfinal_result = qualified_businesses.merge(checkin_df, on=\"business_id\", how=\"left\")\nfinal_result[\"checkin_count_since_2023\"] = final_result[\"checkin_count_since_2023\"].fillna(0).astype(int)\nfinal_result = final_result.sort_values(by=\"checkin_count_since_2023\", ascending=False)\n\n# Display formatted output\nprint(f\"\\n{'Name':<40} {'Stars':>5} {'Reviews':>8} {'Check-ins (2023+)':>18}\")\nprint(\"-\" * 75)\nfor _, row in final_result.iterrows():\n    print(f\"{row['name']:<40} {row['stars']:>5.1f} {row['review_count']:>8} {row['checkin_count_since_2023']:>18}\")\n\nprint(f\"\\nTotal businesses: {len(final_result)}\")\nprint(f\"Total check-ins since 2023-01-01: {final_result['checkin_count_since_2023'].sum()}\")\n\n# Optional: save to CSV\n# final_result.to_csv('wilmington_coffee_checkins.csv', index=False)\n# print(\"Results saved to wilmington_coffee_checkins.csv\")\n"
+    }
+  }
+]
