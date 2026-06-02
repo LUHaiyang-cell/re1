@@ -1,0 +1,879 @@
+[
+{
+    "index": 51,
+    "question": "Which hotels in Tampa are family-friendly and have good facilities for kids?",
+    "success": true,
+    "result": {
+      "analysis": "The user is asking for family-friendly hotels in Tampa with good facilities for kids. This requires identifying businesses categorized as hotels in Tampa, then filtering or ranking them based on mentions of 'family-friendly' or 'kids' in reviews, tips, or business attributes. Since such semantic information may not be directly available in structured fields, we need to use vector similarity search on review/tip text to find relevant mentions, and possibly combine with graph-based relationships (e.g., users who reviewed family-friendly places). The query involves multiple data sources: SQLite for basic business info, Milvus for semantic search in reviews/tips, and potentially Neo4j for user-business interactions. Difficulty is medium due to the need for cross-database coordination.",
+      "natural_question": "Which hotels in Tampa are family-friendly and have good facilities for kids?",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Tampa"
+              },
+              "categories": {
+                "contains": "Hotels"
+              }
+            }
+          },
+          "result_var": "tampa_hotels",
+          "description": {
+            "narrative": "Retrieve all businesses in Tampa that are categorized as hotels from the SQLite business table.",
+            "example_query": "SELECT business_id, name, address, stars, review_count FROM business WHERE city = 'Tampa' AND categories LIKE '%Hotels%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "reviews",
+              "tips"
+            ],
+            "filter_condition": {
+              "semantic_query": "family-friendly hotel with good facilities for kids"
+            }
+          },
+          "result_var": "relevant_review_tip_ids",
+          "description": {
+            "narrative": "Perform a vector similarity search in Milvus collections 'reviews' and 'tips' using the query 'family-friendly hotel with good facilities for kids' to find relevant review and tip IDs that mention kid-friendly amenities.",
+            "example_query": "In Milvus, perform a hybrid search on collections 'reviews' and 'milvus_tip' with the embedding of the query text, returning top-k matches with their source business_id."
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "tampa_hotels",
+              "relevant_review_tip_ids"
+            ],
+            "filter_condition": {
+              "join_key": "business_id"
+            }
+          },
+          "result_var": "family_friendly_hotels",
+          "description": {
+            "narrative": "Join the list of Tampa hotels with the business IDs from relevant reviews/tips to identify which hotels are mentioned as family-friendly. Rank them by relevance score or review count.",
+            "example_query": "SELECT h.*, COUNT(r.business_id) as family_mentions FROM tampa_hotels h INNER JOIN relevant_review_tip_ids r ON h.business_id = r.business_id GROUP BY h.business_id ORDER BY family_mentions DESC, h.stars DESC;"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport numpy as np\nfrom pymilvus import connections, Collection\nfrom sentence_transformers import SentenceTransformer\nimport json\n\n# Step 0: Configuration\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\"\n}\n\nmilvus_config = {\n    'collections': {\n        'reviews': 'reviews',\n        'tips': 'milvus_tip'\n    },\n    'host': 'localhost',\n    'port': '19530'\n}\n\n# Load embedding model\nmodel = SentenceTransformer('all-MiniLM-L6-v2')\n\n# Step 1: Get Tampa hotels from SQLite\nconn_business = sqlite3.connect(sqlite_paths['business'])\ncursor = conn_business.cursor()\ncursor.execute(\"\"\"\n    SELECT business_id, name, address, stars, review_count \n    FROM business \n    WHERE city = ? AND categories LIKE ?\n\"\"\", ('Tampa', '%Hotels%'))\ntampa_hotels = cursor.fetchall()\nconn_business.close()\n\nif not tampa_hotels:\n    print('No hotels found in Tampa.')\n    exit()\n\nhotel_ids = [row[0] for row in tampa_hotels]\nprint(f'Found {len(hotel_ids)} hotels in Tampa.')\n\n# Step 2: Vector search in Milvus\nconnections.connect(host=milvus_config['host'], port=milvus_config['port'])\n\nquery_text = \"family-friendly hotel with good facilities for kids\"\nquery_embedding = model.encode([query_text])[0].tolist()\n\nrelevant_business_ids = set()\n\n# Search in reviews collection\ncollection_reviews = Collection(milvus_config['collections']['reviews'])\ncollection_reviews.load()\nsearch_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\nresults_reviews = collection_reviews.search(\n    data=[query_embedding],\n    anns_field=\"embedding\",\n    param=search_params,\n    limit=50,\n    output_fields=[\"business_id\"]\n)\n\nfor hit in results_reviews[0]:\n    if hit.entity.get('business_id') in hotel_ids:\n        relevant_business_ids.add(hit.entity.get('business_id'))\n\ncollection_reviews.release()\n\n# Search in tips collection\ncollection_tips = Collection(milvus_config['collections']['tips'])\ncollection_tips.load()\nresults_tips = collection_tips.search(\n    data=[query_embedding],\n    anns_field=\"embedding\",\n    param=search_params,\n    limit=50,\n    output_fields=[\"business_id\"]\n)\n\nfor hit in results_tips[0]:\n    if hit.entity.get('business_id') in hotel_ids:\n        relevant_business_ids.add(hit.entity.get('business_id'))\n\ncollection_tips.release()\n\nif not relevant_business_ids:\n    print('No family-friendly mentions found for Tampa hotels.')\n    exit()\n\nprint(f'Found {len(relevant_business_ids)} hotels with family-friendly mentions.')\n\n# Step 3: Filter and rank results\nhotel_dict = {row[0]: row for row in tampa_hotels}\nfinal_hotels = []\nfor bid in relevant_business_ids:\n    if bid in hotel_dict:\n        final_hotels.append(hotel_dict[bid])\n\n# Sort by stars and review_count as proxy for quality\nfinal_hotels.sort(key=lambda x: (-x[3], -x[4]))  # stars desc, review_count desc\n\n# Output results\nprint('\\nFamily-friendly hotels in Tampa with good facilities for kids:')\nfor hotel in final_hotels[:10]:\n    print(f\"- {hotel[1]} ({hotel[2]}) | ⭐{hotel[3]} ({hotel[4]} reviews)\")\n"
+    }
+  },
+{
+    "index": 52,
+    "question": "Which gyms in Clearwater have good personal trainers and modern equipment?",
+    "success": true,
+    "result": {
+      "analysis": "This is a medium-difficulty query that requires multiple steps: first identifying gyms in Clearwater from the business database, then evaluating their reviews and tips for mentions of 'personal trainers' and 'modern equipment'. Since the evaluation of review/tip content involves semantic similarity, vector search in Milvus is needed. Finally, results should be aggregated to identify gyms meeting both criteria.",
+      "natural_question": "Which gyms in Clearwater have good personal trainers and modern equipment?",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Clearwater"
+              },
+              "categories": {
+                "like": "%Gym%"
+              }
+            }
+          },
+          "result_var": "clearwater_gyms",
+          "description": {
+            "narrative": "Retrieve all businesses in Clearwater that are categorized as gyms or fitness centers.",
+            "example_query": "SELECT business_id, name, address FROM business WHERE city = 'Clearwater' AND categories LIKE '%Gym%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "review",
+              "tip"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "clearwater_gyms.business_id"
+              }
+            }
+          },
+          "result_var": "gym_reviews_tips",
+          "description": {
+            "narrative": "Fetch all reviews and tips associated with the identified gyms.",
+            "example_query": "SELECT business_id, text FROM review WHERE business_id IN (SELECT business_id FROM clearwater_gyms); SELECT business_id, text FROM tip WHERE business_id IN (SELECT business_id FROM clearwater_gyms);"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "reviews",
+              "tips"
+            ],
+            "filter_condition": {
+              "query_vector": {
+                "from_text": [
+                  "good personal trainers",
+                  "modern equipment"
+                ]
+              }
+            }
+          },
+          "result_var": "relevant_review_tip_ids",
+          "description": {
+            "narrative": "Perform vector similarity search in Milvus collections 'reviews' and 'tips' using the query phrases 'good personal trainers' and 'modern equipment' to find semantically relevant reviews and tips.",
+            "example_query": "Search in Milvus collection 'reviews' with vector of 'good personal trainers' and 'modern equipment'; similarly search in 'tips' collection."
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "relevant_review_tip_ids.business_id"
+              }
+            }
+          },
+          "result_var": "final_gyms",
+          "description": {
+            "narrative": "Join the results to get gym details that have relevant reviews or tips about personal trainers and modern equipment.",
+            "example_query": "SELECT DISTINCT b.* FROM business b JOIN relevant_review_tip_ids r ON b.business_id = r.business_id;"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport numpy as np\nfrom sentence_transformers import SentenceTransformer\nfrom pymilvus import connections, Collection\n\n# Initialize sentence transformer model for embedding\nmodel = SentenceTransformer('all-MiniLM-L6-v2')\n\n# Database paths\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\"\n}\n\nmilvus_config = {\n    'collections': {\n        'reviews': 'reviews',\n        'tips': 'milvus_tip'\n    },\n    'host': 'localhost',\n    'port': '19530'\n}\n\n# Connect to SQLite databases\ndef get_sqlite_connection(db_name):\n    return sqlite3.connect(sqlite_paths[db_name])\n\n# Connect to Milvus\nconnections.connect(host=milvus_config['host'], port=milvus_config['port'])\n\ntry:\n    # Step 1: Get gyms in Clearwater\n    conn_business = get_sqlite_connection(\"business\")\n    cursor = conn_business.cursor()\n    cursor.execute(\"\"\"\n        SELECT business_id, name, address \n        FROM business \n        WHERE city = ? AND categories LIKE ?\n    \"\"\", (\"Clearwater\", \"%Gym%\"))\n    clearwater_gyms = cursor.fetchall()\n    gym_ids = [gym[0] for gym in clearwater_gyms]\n    \n    if not gym_ids:\n        print(\"No gyms found in Clearwater.\")\n    else:\n        # Step 2: Get reviews and tips for these gyms\n        conn_review = get_sqlite_connection(\"review\")\n        conn_tip = get_sqlite_connection(\"tip\")\n        \n        # Reviews\n        cursor_review = conn_review.cursor()\n        placeholders = ','.join(['?' for _ in gym_ids])\n        cursor_review.execute(f\"SELECT business_id, text FROM review WHERE business_id IN ({placeholders})\", gym_ids)\n        reviews = cursor_review.fetchall()\n        \n        # Tips\n        cursor_tip = conn_tip.cursor()\n        cursor_tip.execute(f\"SELECT business_id, text FROM tip WHERE business_id IN ({placeholders})\", gym_ids)\n        tips = cursor_tip.fetchall()\n        \n        # Step 3: Vector search for relevant content\n        queries = [\"good personal trainers\", \"modern equipment\"]\n        query_embeddings = model.encode(queries)\n        \n        relevant_business_ids = set()\n        \n        # Search in reviews collection\n        reviews_collection = Collection(milvus_config['collections']['reviews'])\n        reviews_collection.load()\n        for emb in query_embeddings:\n            search_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\n            results = reviews_collection.search(\n                data=[emb.tolist()],\n                anns_field=\"embedding\",\n                param=search_params,\n                limit=50,\n                expr=f\"business_id in {str(gym_ids).replace('[', '').replace(']', '')}\"\n            )\n            for hits in results:\n                for hit in hits:\n                    relevant_business_ids.add(hit.entity.get('business_id'))\n        \n        # Search in tips collection\n        tips_collection = Collection(milvus_config['collections']['tips'])\n        tips_collection.load()\n        for emb in query_embeddings:\n            search_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\n            results = tips_collection.search(\n                data=[emb.tolist()],\n                anns_field=\"embedding\",\n                param=search_params,\n                limit=50,\n                expr=f\"business_id in {str(gym_ids).replace('[', '').replace(']', '')}\"\n            )\n            for hits in results:\n                for hit in hits:\n                    relevant_business_ids.add(hit.entity.get('business_id'))\n        \n        # Step 4: Get final gym details\n        relevant_gym_ids = list(relevant_business_ids)\n        if relevant_gym_ids:\n            placeholders_final = ','.join(['?' for _ in relevant_gym_ids])\n            cursor.execute(f\"SELECT business_id, name, address FROM business WHERE business_id IN ({placeholders_final})\", relevant_gym_ids)\n            final_gyms = cursor.fetchall()\n            \n            print(\"Gyms in Clearwater with good personal trainers and modern equipment:\")\n            for gym in final_gyms:\n                print(f\"- {gym[1]} at {gym[2]}\")\n        else:\n            print(\"No gyms found matching the criteria.\")\n\nexcept Exception as e:\n    print(f\"An error occurred: {e}\")\n\nfinally:\n    # Close connections\n    if 'conn_business' in locals():\n        conn_business.close()\n    if 'conn_review' in locals():\n        conn_review.close()\n    if 'conn_tip' in locals():\n        conn_tip.close()\n    connections.disconnect('default')"
+    }
+  },
+{
+    "index": 53,
+    "question": "Which dental clinics in Metairie have patient, caring dentists and good patient care?",
+    "success": true,
+    "result": {
+      "analysis": "This is a medium-difficulty query that requires combining structured business data with semantic review analysis. We need to: (1) find dental clinics in Metairie from the business table, (2) search reviews for semantic matches about 'patient', 'caring dentists', and 'good patient care' using vector similarity, and (3) correlate the results to return relevant businesses.",
+      "natural_question": "Which dental clinics in Metairie have patient, caring dentists and good patient care?",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Metairie"
+              },
+              "categories": {
+                "contains": "Dentist"
+              }
+            }
+          },
+          "result_var": "metairie_dentists",
+          "description": {
+            "narrative": "Query the SQLite business database to find all dental clinics located in Metairie, Louisiana.",
+            "example_query": "SELECT business_id, name, address, city, categories FROM business WHERE city = 'Metairie' AND categories LIKE '%Dentist%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "reviews"
+            ],
+            "filter_condition": {
+              "semantic_query": {
+                "text": "patient, caring dentists and good patient care"
+              }
+            }
+          },
+          "result_var": "relevant_reviews",
+          "description": {
+            "narrative": "Perform a vector similarity search in the Milvus reviews collection to find reviews that semantically match the concepts of 'patient, caring dentists and good patient care'.",
+            "example_query": "Search in Milvus collection 'reviews' using embedding of text 'patient, caring dentists and good patient care' with top_k=50."
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "business",
+              "reviews"
+            ],
+            "filter_condition": {
+              "join_condition": {
+                "business_id": "review_business_id"
+              }
+            }
+          },
+          "result_var": "final_results",
+          "description": {
+            "narrative": "Join the Metairie dental clinics with the relevant reviews to identify which clinics have reviews matching the desired qualities.",
+            "example_query": "SELECT DISTINCT b.business_id, b.name, b.address FROM metairie_dentists b INNER JOIN relevant_reviews r ON b.business_id = r.business_id;"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport json\nfrom pymilvus import connections, Collection\nimport numpy as np\nfrom sentence_transformers import SentenceTransformer\n\n# Configuration\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nmilvus_config = {\n    'collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    },\n    'host': 'localhost',\n    'port': '19530'\n}\n\n# Connect to databases\ndef connect_to_sqlite(db_name):\n    return sqlite3.connect(sqlite_paths[db_name])\n\ndef connect_to_milvus():\n    connections.connect(host=milvus_config['host'], port=milvus_config['port'])\n\n# Step 1: Get dental clinics in Metairie\ndef get_metairie_dentists():\n    conn = connect_to_sqlite('business')\n    cursor = conn.cursor()\n    query = \"\"\"\n    SELECT business_id, name, address, city, categories \n    FROM business \n    WHERE city = ? AND categories LIKE ?\n    \"\"\"\n    cursor.execute(query, ('Metairie', '%Dentist%'))\n    results = cursor.fetchall()\n    conn.close()\n    \n    # Convert to list of dictionaries\n    columns = ['business_id', 'name', 'address', 'city', 'categories']\n    return [dict(zip(columns, row)) for row in results]\n\n# Step 2: Search for relevant reviews using vector similarity\ndef search_relevant_reviews(query_text, top_k=50):\n    # Load pre-trained model for embeddings\n    model = SentenceTransformer('all-MiniLM-L6-v2')\n    \n    # Generate embedding for query\n    query_embedding = model.encode([query_text])[0].tolist()\n    \n    # Connect to Milvus\n    connect_to_milvus()\n    collection = Collection(milvus_config['collections']['reviews'])\n    collection.load()\n    \n    # Perform search\n    search_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\n    results = collection.search(\n        data=[query_embedding],\n        anns_field=\"embedding\",\n        param=search_params,\n        limit=top_k,\n        output_fields=[\"review_id\", \"business_id\", \"text\"]\n    )\n    \n    # Extract business_ids from results\n    relevant_business_ids = set()\n    for hits in results:\n        for hit in hits:\n            relevant_business_ids.add(hit.entity.get('business_id'))\n    \n    return list(relevant_business_ids)\n\n# Step 3: Combine results\ndef main():\n    try:\n        print(\"Step 1: Finding dental clinics in Metairie...\")\n        metairie_dentists = get_metairie_dentists()\n        print(f\"Found {len(metairie_dentists)} dental clinics in Metairie.\")\n        \n        if not metairie_dentists:\n            print(\"No dental clinics found in Metairie.\")\n            return []\n        \n        print(\"Step 2: Searching for relevant reviews...\")\n        query_text = \"patient, caring dentists and good patient care\"\n        relevant_business_ids = search_relevant_reviews(query_text)\n        print(f\"Found {len(relevant_business_ids)} businesses with relevant reviews.\")\n        \n        print(\"Step 3: Matching clinics with relevant reviews...\")\n        metairie_business_ids = {clinic['business_id'] for clinic in metairie_dentists}\n        matching_business_ids = metairie_business_ids.intersection(set(relevant_business_ids))\n        \n        final_results = [\n            clinic for clinic in metairie_dentists \n            if clinic['business_id'] in matching_business_ids\n        ]\n        \n        print(f\"\\nFound {len(final_results)} dental clinics matching your criteria:\\n\")\n        for clinic in final_results:\n            print(f\"Name: {clinic['name']}\")\n            print(f\"Address: {clinic['address']}\")\n            print(f\"Categories: {clinic['categories']}\")\n            print(\"-\" * 50)\n        \n        return final_results\n        \n    except Exception as e:\n        print(f\"An error occurred: {str(e)}\")\n        return []\n\nif __name__ == \"__main__\":\n    results = main()\n"
+    }
+  },
+{
+    "index": 54,
+    "question": "Which pet groomers in Boise are gentle with pets and have experienced groomers?",
+    "success": true,
+    "result": {
+      "analysis": "This question asks for pet groomers in Boise that are both gentle with pets and employ experienced groomers. This requires: (1) identifying businesses in the 'Pet Groomers' category located in Boise; (2) finding reviews or tips that mention 'gentle' (or synonyms) to assess gentleness; (3) checking for mentions of 'experienced' groomers in reviews or tips. Since sentiment and keyword matching on unstructured text is involved, vector similarity search in Milvus is appropriate for capturing semantic meaning beyond exact keyword matches. The query spans SQLite (for business metadata), Milvus (for semantic review/tip analysis), and potentially Neo4j (for user-business interactions, though not strictly needed here). Difficulty is medium due to multi-step filtering and semantic search.",
+      "natural_question": "Which pet groomers in Boise are gentle with pets and have experienced groomers?",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Boise"
+              },
+              "categories": {
+                "contains": "Pet Groomers"
+              }
+            }
+          },
+          "result_var": "boise_groomers",
+          "description": {
+            "narrative": "Retrieve all businesses in Boise that belong to the 'Pet Groomers' category from the SQLite business database.",
+            "example_query": "SELECT business_id, name, address FROM business WHERE city = 'Boise' AND categories LIKE '%Pet Groomers%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "reviews",
+              "tips"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "boise_groomers.business_id"
+              },
+              "semantic_query": {
+                "text": "gentle with pets"
+              }
+            }
+          },
+          "result_var": "gentle_mentions",
+          "description": {
+            "narrative": "Perform a vector similarity search in Milvus on reviews and tips associated with the Boise pet groomers to find those mentioning gentleness with pets. Use an embedding of the phrase 'gentle with pets' to retrieve semantically relevant texts.",
+            "example_query": "Search Milvus collection 'reviews' and 'tips' using vector of 'gentle with pets', filtering by business_id in boise_groomers."
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "reviews",
+              "tips"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "boise_groomers.business_id"
+              },
+              "semantic_query": {
+                "text": "experienced groomers"
+              }
+            }
+          },
+          "result_var": "experienced_mentions",
+          "description": {
+            "narrative": "Similarly, perform a vector similarity search for mentions of 'experienced groomers' in reviews and tips for the same set of businesses.",
+            "example_query": "Search Milvus collection 'reviews' and 'tips' using vector of 'experienced groomers', filtering by business_id in boise_groomers."
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "boise_groomers",
+              "gentle_mentions",
+              "experienced_mentions"
+            ],
+            "filter_condition": {
+              "intersection": {
+                "business_id": [
+                  "gentle_mentions",
+                  "experienced_mentions"
+                ]
+              }
+            }
+          },
+          "result_var": "final_groomers",
+          "description": {
+            "narrative": "Intersect the business IDs from the gentle and experienced results to find groomers satisfying both conditions, then join with business details for final output.",
+            "example_query": "SELECT b.name, b.address FROM boise_groomers b WHERE b.business_id IN (gentle_business_ids ∩ experienced_business_ids);"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport numpy as np\nfrom sentence_transformers import SentenceTransformer\nfrom pymilvus import connections, Collection\n\n# Initialize sentence transformer for embedding queries\nmodel = SentenceTransformer('all-MiniLM-L6-v2')\n\n# Milvus connection\nconnections.connect(host='localhost', port='19530')\n\n# Step 1: Get pet groomers in Boise from SQLite\nsqlite_path = \"D:/Yelp-JSON/db/sqlite3/business.db\"\nconn = sqlite3.connect(sqlite_path)\nconn.row_factory = sqlite3.Row\ncursor = conn.cursor()\n\ncursor.execute(\"\"\"\n    SELECT business_id, name, address \n    FROM business \n    WHERE city = ? AND categories LIKE ?\n\"\"\", ('Boise', '%Pet Groomers%'))\n\nboise_groomers = cursor.fetchall()\nboise_groomer_ids = [row['business_id'] for row in boise_groomers]\nconn.close()\n\nif not boise_groomer_ids:\n    print(\"No pet groomers found in Boise.\")\nelse:\n    # Helper function to search Milvus collections\n    def search_milvus(collection_name, query_text, business_ids):\n        collection = Collection(collection_name)\n        query_vector = model.encode([query_text])[0].tolist()\n        \n        # Build expression to filter by business_id\n        id_expr = \" || \".join([f'business_id == \\\"{bid}\\\"' for bid in business_ids])\n        if not id_expr:\n            return set()\n        \n        search_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\n        results = collection.search(\n            data=[query_vector],\n            anns_field=\"vector\",\n            param=search_params,\n            limit=100,\n            expr=id_expr,\n            output_fields=[\"business_id\"]\n        )\n        \n        matched_ids = set()\n        for hits in results:\n            for hit in hits:\n                matched_ids.add(hit.entity.get('business_id'))\n        return matched_ids\n    \n    # Step 2: Search for 'gentle with pets'\n    gentle_review_ids = search_milvus('reviews', 'gentle with pets', boise_groomer_ids)\n    gentle_tip_ids = search_milvus('milvus_tip', 'gentle with pets', boise_groomer_ids)\n    gentle_business_ids = gentle_review_ids | gentle_tip_ids\n    \n    # Step 3: Search for 'experienced groomers'\n    experienced_review_ids = search_milvus('reviews', 'experienced groomers', boise_groomer_ids)\n    experienced_tip_ids = search_milvus('milvus_tip', 'experienced groomers', boise_groomer_ids)\n    experienced_business_ids = experienced_review_ids | experienced_tip_ids\n    \n    # Step 4: Intersect results\n    qualified_ids = gentle_business_ids & experienced_business_ids\n    \n    # Output final results\n    if qualified_ids:\n        qualified_dict = {row['business_id']: dict(row) for row in boise_groomers}\n        print(\"Pet groomers in Boise that are gentle and have experienced groomers:\")\n        for bid in qualified_ids:\n            if bid in qualified_dict:\n                info = qualified_dict[bid]\n                print(f\"- {info['name']} at {info['address']}\")\n    else:\n        print(\"No pet groomers in Boise meet both criteria based on available reviews and tips.\")"
+    }
+  },
+{
+    "index": 55,
+    "question": "Which auto repair shops in Philadelphia are honest and reasonably priced?",
+    "success": true,
+    "result": {
+      "analysis": "This question seeks auto repair shops in Philadelphia that are both honest and reasonably priced. These qualities are subjective and typically reflected in user reviews, tips, or ratings. The query requires: (1) filtering businesses in the 'Auto Repair' category located in Philadelphia using SQLite; (2) retrieving associated reviews and tips to assess sentiment around honesty and pricing via vector similarity search in Milvus; and (3) possibly leveraging user-business interaction patterns from Neo4j for reputation context. This is a multi-step, cross-database query involving SQL filtering, vector semantic search, and potentially graph-based trust analysis.",
+      "natural_question": "Which auto repair shops in Philadelphia are honest and reasonably priced?",
+      "difficulty": "hard",
+      "query_types": [
+        "sql",
+        "vector",
+        "graph"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Philadelphia"
+              },
+              "categories": {
+                "contains": "Auto Repair"
+              }
+            }
+          },
+          "result_var": "philly_auto_repair_businesses",
+          "description": {
+            "narrative": "Query the SQLite business table to find all businesses in Philadelphia whose categories include 'Auto Repair'.",
+            "example_query": "SELECT business_id, name, address, stars, review_count FROM business WHERE city = 'Philadelphia' AND categories LIKE '%Auto Repair%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "reviews",
+              "tips"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "philly_auto_repair_businesses.business_id"
+              },
+              "semantic_concepts": [
+                "honest",
+                "reasonably priced",
+                "fair price",
+                "trustworthy"
+              ]
+            }
+          },
+          "result_var": "relevant_review_tip_vectors",
+          "description": {
+            "narrative": "Use Milvus to perform vector similarity searches on review and tip texts associated with the identified businesses, using embeddings of phrases like 'honest' and 'reasonably priced' to find semantically relevant content.",
+            "example_query": "In Milvus, search in 'reviews' and 'milvus_tip' collections for vectors similar to embedding('honest and reasonably priced auto repair') where business_id matches those from step 1."
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "user",
+              "business"
+            ],
+            "filter_condition": {
+              "relationship_type": "WROTE_REVIEW_OR_TIP",
+              "min_user_review_count": 10,
+              "user_elite_status": true
+            }
+          },
+          "result_var": "trusted_user_interactions",
+          "description": {
+            "narrative": "Optionally, use Neo4j to identify reviews or tips authored by trusted users (e.g., elite users with many reviews) to weight the relevance of the feedback, enhancing credibility assessment.",
+            "example_query": "MATCH (u:User)-[r:WROTE]->(b:Business) WHERE b.business_id IN $business_ids AND u.elite IS NOT NULL AND u.review_count > 10 RETURN u.user_id, b.business_id, r.text;"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "aggregation"
+            ],
+            "filter_condition": {}
+          },
+          "result_var": "final_ranked_shops",
+          "description": {
+            "narrative": "Aggregate results from steps 1–3: rank businesses by frequency and sentiment strength of relevant reviews/tips, optionally boosted by trusted user contributions. Return top candidates.",
+            "example_query": "Combine scores from vector similarity and user trust to produce a ranked list of auto repair shops."
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport numpy as np\nfrom pymilvus import connections, Collection\nfrom sentence_transformers import SentenceTransformer\nfrom neo4j import GraphDatabase\nimport json\n\n# Configuration\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nmilvus_config = {\n    'collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    },\n    'host': 'localhost',\n    'port': '19530'\n}\n\nneo4j_config = {\n    'uri': 'bolt://localhost:7687',\n    'auth': ('neo4j', 'password')\n}\n\n# Step 1: Get auto repair shops in Philadelphia\nconn_business = sqlite3.connect(sqlite_paths['business'])\ncursor = conn_business.cursor()\ncursor.execute(\"\"\"\n    SELECT business_id, name, address, stars, review_count \n    FROM business \n    WHERE city = ? AND categories LIKE ?\n\"\"\", ('Philadelphia', '%Auto Repair%'))\nphilly_auto_repair_businesses = cursor.fetchall()\nconn_business.close()\n\nif not philly_auto_repair_businesses:\n    print('No auto repair shops found in Philadelphia.')\n    exit()\n\nbusiness_ids = [row[0] for row in philly_auto_repair_businesses]\nbusiness_dict = {row[0]: {'name': row[1], 'address': row[2], 'stars': row[3], 'review_count': row[4]} for row in philly_auto_repair_businesses}\n\n# Step 2: Vector search in Milvus for relevant reviews and tips\nconnections.connect(host=milvus_config['host'], port=milvus_config['port'])\nmodel = SentenceTransformer('all-MiniLM-L6-v2')\n\nquery_phrases = [\n    \"honest auto repair\",\n    \"reasonably priced mechanic\",\n    \"fair price car repair\",\n    \"trustworthy auto shop\"\n]\nquery_embedding = np.mean([model.encode(p) for p in query_phrases], axis=0).tolist()\n\n# Search reviews\ncollection_reviews = Collection(milvus_config['collections']['reviews'])\ncollection_reviews.load()\nsearch_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\nresults_reviews = collection_reviews.search(\n    data=[query_embedding],\n    anns_field=\"embedding\",\n    param=search_params,\n    limit=100,\n    expr=f\"business_id in [{','.join([f'\\\"{bid}\\\"' for bid in business_ids])}]\"\n)\n\n# Search tips\ncollection_tips = Collection(milvus_config['collections']['tips'])\ncollection_tips.load()\nresults_tips = collection_tips.search(\n    data=[query_embedding],\n    anns_field=\"embedding\",\n    param=search_params,\n    limit=50,\n    expr=f\"business_id in [{','.join([f'\\\"{bid}\\\"' for bid in business_ids])}]\"\n)\n\n# Aggregate scores by business_id\nscore_dict = {bid: 0.0 for bid in business_ids}\n\nfor hits in results_reviews[0]:\n    score_dict[hits.entity.get('business_id')] += (1.0 / (hits.distance + 1e-5))\n\nfor hits in results_tips[0]:\n    score_dict[hits.entity.get('business_id')] += (1.0 / (hits.distance + 1e-5))\n\n# Step 3 (Optional): Boost by trusted users from Neo4j\ndriver = GraphDatabase.driver(neo4j_config['uri'], auth=neo4j_config['auth'])\nwith driver.session() as session:\n    result = session.run(\n        \"\"\"\n        MATCH (u:User)-[r:WROTE_REVIEW | WROTE_TIP]->(b:Business)\n        WHERE b.business_id IN $business_ids\n          AND u.review_count > 10\n          AND (u.elite IS NOT NULL AND size(u.elite) > 0)\n        RETURN b.business_id AS bid\n        \"\"\",\n        business_ids=business_ids\n    )\n    trusted_businesses = [record['bid'] for record in result]\n\n# Boost scores for trusted-user-reviewed shops\nfor bid in trusted_businesses:\n    if bid in score_dict:\n        score_dict[bid] *= 1.2  # 20% boost\n\ndriver.close()\n\n# Step 4: Rank and output\nranked = sorted(score_dict.items(), key=lambda x: x[1], reverse=True)\ntop_results = []\nfor bid, score in ranked[:10]:\n    if score > 0:\n        info = business_dict.get(bid, {})\n        top_results.append({\n            'business_id': bid,\n            'name': info.get('name', 'N/A'),\n            'address': info.get('address', 'N/A'),\n            'stars': info.get('stars', 'N/A'),\n            'review_count': info.get('review_count', 'N/A'),\n            'relevance_score': round(score, 2)\n        })\n\nprint(json.dumps(top_results, indent=2))"
+    }
+  },
+{
+    "index": 56,
+    "question": "I'm a yoga beginner in Saint Petersburg. Which studios are beginner-friendly?",
+    "success": true,
+    "result": {
+      "analysis": "The user is asking for beginner-friendly yoga studios in Saint Petersburg. This requires identifying businesses categorized as yoga studios, located in Saint Petersburg, and having reviews or tips that indicate they are suitable for beginners. The query involves filtering by location and category (from SQLite), then using semantic search on reviews/tips (via Milvus vector search) to detect 'beginner-friendly' sentiment or explicit mentions. Finally, results may be enriched with relationships like user check-ins or friend recommendations from Neo4j if needed. This is a medium-difficulty multi-step cross-database query.",
+      "natural_question": "Which yoga studios in Saint Petersburg are beginner-friendly?",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Saint Petersburg"
+              },
+              "categories": {
+                "contains": "Yoga"
+              }
+            }
+          },
+          "result_var": "yoga_studios",
+          "description": {
+            "narrative": "First, retrieve all businesses in the city of Saint Petersburg that have 'Yoga' in their categories.",
+            "example_query": "SELECT business_id, name, address FROM business WHERE city = 'Saint Petersburg' AND categories LIKE '%Yoga%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "review",
+              "tip"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "yoga_studios.business_id"
+              }
+            }
+          },
+          "result_var": "studio_texts",
+          "description": {
+            "narrative": "Collect review and tip texts associated with these yoga studios to assess beginner-friendliness.",
+            "example_query": "SELECT text, business_id FROM review WHERE business_id IN (SELECT business_id FROM yoga_studios);"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "reviews",
+              "tips"
+            ],
+            "filter_condition": {
+              "embedding_query": "beginner-friendly yoga studio"
+            }
+          },
+          "result_var": "beginner_friendly_ids",
+          "description": {
+            "narrative": "Perform a vector similarity search in Milvus collections 'reviews' and 'tips' using the query 'beginner-friendly yoga studio' to find relevant business IDs.",
+            "example_query": "Search in Milvus collection 'reviews' and 'tips' with query embedding of 'beginner-friendly yoga studio', return top-k business_id matches."
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "beginner_friendly_ids"
+              }
+            }
+          },
+          "result_var": "final_studios",
+          "description": {
+            "narrative": "Retrieve full details of the yoga studios identified as beginner-friendly based on vector search results.",
+            "example_query": "SELECT business_id, name, address, stars, review_count FROM business WHERE business_id IN (beginner_friendly_ids);"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport numpy as np\nfrom pymilvus import connections, Collection\nimport json\n\n# Step 0: Connect to databases\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\"\n}\n\nmilvus_config = {\n    'milvus_collections': {\n        'reviews': 'reviews',\n        'tips': 'milvus_tip'\n    },\n    'milvus_host': 'localhost',\n    'milvus_port': '19530'\n}\n\n# Connect to Milvus\nconnections.connect(host=milvus_config['milvus_host'], port=milvus_config['milvus_port'])\n\n# Helper: get embedding (mocked; in real use, use same encoder as used during ingestion)\ndef get_query_embedding(text):\n    # Placeholder: In practice, use SentenceTransformer or similar\n    # For demo, assume we have a function that returns a 768-dim vector\n    np.random.seed(hash(text) % (2**32))\n    return np.random.rand(768).astype(np.float32)\n\n# Step 1: Get yoga studios in Saint Petersburg\nconn_business = sqlite3.connect(sqlite_paths['business'])\ncursor = conn_business.cursor()\ncursor.execute(\"\"\"\n    SELECT business_id, name, address, stars, review_count \n    FROM business \n    WHERE city = ? AND categories LIKE ?\n\"\"\", ('Saint Petersburg', '%Yoga%'))\nyoga_studios = cursor.fetchall()\nconn_business.close()\n\nif not yoga_studios:\n    print('No yoga studios found in Saint Petersburg.')\nelse:\n    studio_ids = [row[0] for row in yoga_studios]\n\n    # Step 2 & 3: Vector search in Milvus for beginner-friendly mentions\n    query_text = \"beginner-friendly yoga studio\"\n    query_emb = get_query_embedding(query_text)\n\n    candidate_ids = set()\n\n    # Search in reviews\n    try:\n        reviews_col = Collection(milvus_config['milvus_collections']['reviews'])\n        reviews_col.load()\n        search_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\n        results = reviews_col.search(\n            data=[query_emb],\n            anns_field=\"embedding\",\n            param=search_params,\n            limit=50,\n            output_fields=[\"business_id\"]\n        )\n        for hits in results:\n            for hit in hits:\n                bid = hit.entity.get('business_id')\n                if bid in studio_ids:\n                    candidate_ids.add(bid)\n    except Exception as e:\n        print(f\"Warning: Review vector search failed: {e}\")\n\n    # Search in tips\n    try:\n        tips_col = Collection(milvus_config['milvus_collections']['tips'])\n        tips_col.load()\n        results = tips_col.search(\n            data=[query_emb],\n            anns_field=\"embedding\",\n            param=search_params,\n            limit=50,\n            output_fields=[\"business_id\"]\n        )\n        for hits in results:\n            for hit in hits:\n                bid = hit.entity.get('business_id')\n                if bid in studio_ids:\n                    candidate_ids.add(bid)\n    except Exception as e:\n        print(f\"Warning: Tip vector search failed: {e}\")\n\n    # Step 4: Fetch final studio details\n    if candidate_ids:\n        placeholders = ','.join(['?' for _ in candidate_ids])\n        conn = sqlite3.connect(sqlite_paths['business'])\n        cursor = conn.cursor()\n        cursor.execute(f\"\"\"\n            SELECT business_id, name, address, stars, review_count \n            FROM business \n            WHERE business_id IN ({placeholders})\n        \"\"\", list(candidate_ids))\n        final_studios = cursor.fetchall()\n        conn.close()\n\n        print(\"Beginner-friendly yoga studios in Saint Petersburg:\")\n        for bid, name, addr, stars, count in final_studios:\n            print(f\"- {name} (⭐{stars}, {count} reviews) - {addr}\")\n    else:\n        print(\"No beginner-friendly yoga studios found based on reviews/tips.\")\n"
+    }
+  },
+{
+    "index": 57,
+    "question": "Which dry cleaners in Sparks offer high-quality service and fast turnaround?",
+    "success": true,
+    "result": {
+      "analysis": "The user is asking for dry cleaners in Sparks that are both high-quality and fast. This requires: (1) identifying businesses in the 'Dry Cleaning & Laundry Services' category located in Sparks; (2) assessing service quality via positive reviews or high ratings; and (3) evaluating speed of service, which is typically mentioned in review or tip text. This involves SQL filtering, vector semantic search for quality/speed mentions, and possibly graph-based business metadata. Difficulty is medium due to need for cross-database coordination.",
+      "natural_question": "Which dry cleaners in Sparks offer high-quality service and fast turnaround?",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Sparks"
+              },
+              "categories": {
+                "contains": "Dry Cleaning"
+              }
+            }
+          },
+          "result_var": "dry_cleaners_sparks",
+          "description": {
+            "narrative": "Query the SQLite business table to find all dry cleaning businesses located in Sparks, Nevada.",
+            "example_query": "SELECT business_id, name, address, city, stars FROM business WHERE city = 'Sparks' AND categories LIKE '%Dry Cleaning%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "reviews"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "dry_cleaners_sparks.business_id"
+              },
+              "semantic_keywords": [
+                "high quality",
+                "excellent service",
+                "fast",
+                "quick turnaround"
+              ]
+            }
+          },
+          "result_var": "relevant_reviews",
+          "description": {
+            "narrative": "Use Milvus to perform a semantic vector search on reviews associated with the dry cleaners found in Step 1, using embeddings of phrases like 'high quality' and 'fast turnaround' to retrieve relevant reviews.",
+            "example_query": "Search in Milvus collection 'reviews' using vector embedding of 'high-quality service and fast turnaround' filtered by business_id in [list from step 1]."
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "tips"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "dry_cleaners_sparks.business_id"
+              },
+              "semantic_keywords": [
+                "fast",
+                "quick",
+                "quality"
+              ]
+            }
+          },
+          "result_var": "relevant_tips",
+          "description": {
+            "narrative": "Optionally, also search Milvus 'milvus_tip' collection for short tips mentioning speed or quality to supplement review findings.",
+            "example_query": "Search in Milvus collection 'milvus_tip' using vector embedding of 'fast and quality dry cleaning' filtered by business_id in [list from step 1]."
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "aggregation"
+            ],
+            "filter_condition": {
+              "sources": [
+                "relevant_reviews",
+                "relevant_tips"
+              ]
+            }
+          },
+          "result_var": "final_recommendations",
+          "description": {
+            "narrative": "Aggregate results: rank dry cleaners by number of relevant positive mentions about quality and speed, and return top candidates with supporting quotes.",
+            "example_query": "Group by business_id, count matches, sort descending, and join back with business names."
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport numpy as np\nfrom pymilvus import connections, Collection\nimport json\n\n# ----------------------------\n# Configuration\n# ----------------------------\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\"\n}\n\nmilvus_config = {\n    'collections': {\n        'reviews': 'reviews',\n        'tips': 'milvus_tip'\n    },\n    'host': 'localhost',\n    'port': '19530'\n}\n\n# Connect to Milvus\nconnections.connect(host=milvus_config['host'], port=milvus_config['port'])\n\n# Placeholder: In real use, you'd use an embedding model (e.g., SentenceTransformer)\n# Here we simulate with a dummy function since actual model loading is heavy\n# Assume we have precomputed embeddings and Milvus is set up with them\n\ndef get_embedding(text):\n    # Dummy: replace with real embedding model in practice\n    np.random.seed(hash(text) % (2**32))\n    return np.random.rand(384).astype(np.float32)  # assuming 384-dim vectors\n\n# Step 1: Find dry cleaners in Sparks\nconn_business = sqlite3.connect(sqlite_paths[\"business\"])\ncursor = conn_business.cursor()\ncursor.execute(\"\"\"\n    SELECT business_id, name, address, city, stars \n    FROM business \n    WHERE city = ? AND categories LIKE ?\n\"\"\", (\"Sparks\", \"%Dry Cleaning%\"))\ndry_cleaners = cursor.fetchall()\nconn_business.close()\n\nif not dry_cleaners:\n    print(\"No dry cleaners found in Sparks.\")\n    exit()\n\nbusiness_ids = [row[0] for row in dry_cleaners]\nbusiness_info = {row[0]: row for row in dry_cleaners}\n\nprint(f\"Found {len(business_ids)} dry cleaners in Sparks.\")\n\n# Step 2: Semantic search in reviews\nreview_collection = Collection(milvus_config['collections']['reviews'])\nreview_collection.load()\n\nquery_text = \"high-quality service and fast turnaround\"\nquery_vec = get_embedding(query_text)\n\n# Milvus search parameters\nsearch_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\n\nresults = review_collection.search(\n    data=[query_vec],\n    anns_field=\"embedding\",\n    param=search_params,\n    limit=50,\n    expr=f\"business_id in [{','.join([f'\\\"{bid}\\\"' for bid in business_ids])}]\"\n)\n\nrelevant_businesses = {}\nfor hit in results[0]:\n    bid = hit.entity.get(\"business_id\")\n    score = hit.distance\n    if bid not in relevant_businesses:\n        relevant_businesses[bid] = []\n    relevant_businesses[bid].append({\"score\": score})\n\n# Step 3: Optional - Search in tips\ntip_collection = Collection(milvus_config['collections']['tips'])\ntip_collection.load()\n\nresults_tips = tip_collection.search(\n    data=[query_vec],\n    anns_field=\"embedding\",\n    param=search_params,\n    limit=20,\n    expr=f\"business_id in [{','.join([f'\\\"{bid}\\\"' for bid in business_ids])}]\"\n)\n\nfor hit in results_tips[0]:\n    bid = hit.entity.get(\"business_id\")\n    if bid not in relevant_businesses:\n        relevant_businesses[bid] = []\n    relevant_businesses[bid].append({\"score\": hit.distance, \"source\": \"tip\"})\n\n# Step 4: Aggregate and rank\nranked = []\nfor bid, matches in relevant_businesses.items():\n    if bid in business_info:\n        total_mentions = len(matches)\n        avg_score = sum(m[\"score\"] for m in matches) / total_mentions\n        ranked.append({\n            \"business_id\": bid,\n            \"name\": business_info[bid][1],\n            \"address\": business_info[bid][2],\n            \"stars\": business_info[bid][4],\n            \"relevance_score\": avg_score,\n            \"mention_count\": total_mentions\n        })\n\n# Sort by mention count (proxy for evidence strength) and star rating\nranked.sort(key=lambda x: (-x[\"mention_count\"], -x[\"stars\"]))\n\n# Output\nprint(\"\\nRecommended Dry Cleaners in Sparks (High Quality + Fast):\\n\")\nif ranked:\n    for i, r in enumerate(ranked[:5]):\n        print(f\"{i+1}. {r['name']} ({r['stars']}★)\")\n        print(f\"   Address: {r['address']}\")\n        print(f\"   Supporting Mentions: {r['mention_count']}\")\n        print()\nelse:\n    print(\"No strong evidence found for high-quality and fast dry cleaners in Sparks.\")\n\n# Cleanup\nreview_collection.release()\ntip_collection.release()\n"
+    }
+  },
+{
+    "index": 58,
+    "question": "Which law firms in Saint Petersburg have experienced lawyers and good communication?",
+    "success": true,
+    "result": {
+      "analysis": "The user is asking for law firms in Saint Petersburg that have experienced lawyers and good communication. However, the Yelp dataset primarily contains reviews and metadata about businesses such as restaurants, salons, and local services—not specialized professional services like law firms. Additionally, 'Saint Petersburg' could refer to the one in Florida (USA) or Russia; Yelp data is mostly US-centric. Even if some legal services exist in the dataset, identifying 'experienced lawyers' and 'good communication' requires semantic analysis of review text. This involves querying business categories, filtering by location, then using vector search on reviews/tips for relevant sentiment or keywords. The query spans SQL (to find law-related businesses in Saint Petersburg), vector search (to assess experience and communication quality from text), and possibly graph (to find highly connected/rated entities). Thus, it's a hard multi-step cross-database query with ambiguity in domain coverage.",
+      "natural_question": "Which law firms in Saint Petersburg have experienced lawyers and good communication?",
+      "difficulty": "hard",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Saint Petersburg"
+              },
+              "categories": {
+                "contains": "Law"
+              }
+            }
+          },
+          "result_var": "law_firms_df",
+          "description": {
+            "narrative": "Query the SQLite business table to find businesses in Saint Petersburg whose categories include 'Law'. This gives candidate law firms.",
+            "example_query": "SELECT business_id, name, address, city, categories FROM business WHERE city = 'Saint Petersburg' AND categories LIKE '%Law%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "reviews",
+              "tips"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "law_firms_df['business_id']"
+              },
+              "semantic_keywords": [
+                "experienced lawyer",
+                "good communication",
+                "responsive",
+                "knowledgeable"
+              ]
+            }
+          },
+          "result_var": "relevant_reviews_tips",
+          "description": {
+            "narrative": "Use Milvus vector database to perform semantic similarity search on review and tip texts associated with the identified law firms, looking for embeddings similar to phrases like 'experienced lawyer' and 'good communication'.",
+            "example_query": "In Milvus, search in 'reviews' and 'milvus_tip' collections using vector embeddings of query phrases, filtering by business_id from step 1."
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "business",
+              "review"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "relevant_reviews_tips business_ids"
+              },
+              "aggregate": "average rating and count"
+            }
+          },
+          "result_var": "ranked_law_firms",
+          "description": {
+            "narrative": "Aggregate results to rank law firms by relevance (number of matching semantic reviews/tips) and average star rating to prioritize reputable and communicative firms.",
+            "example_query": "SELECT b.name, b.business_id, AVG(r.stars) as avg_rating, COUNT(rt.text_match) as relevance_score FROM business b JOIN review r ON b.business_id = r.business_id WHERE b.business_id IN (...) GROUP BY b.business_id ORDER BY relevance_score DESC, avg_rating DESC;"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport pandas as pd\nfrom pymilvus import connections, Collection\nimport numpy as np\nfrom sentence_transformers import SentenceTransformer\n\n# Configuration\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\"\n}\n\nmilvus_config = {\n    'collections': {\n        'reviews': 'reviews',\n        'tips': 'milvus_tip'\n    },\n    'host': 'localhost',\n    'port': '19530'\n}\n\n# Load embedding model\nmodel = SentenceTransformer('all-MiniLM-L6-v2')\n\n# Step 1: Find law-related businesses in Saint Petersburg\nconn_business = sqlite3.connect(sqlite_paths['business'])\nquery_law_firms = \"\"\"\nSELECT business_id, name, address, city, categories \nFROM business \nWHERE city = 'Saint Petersburg' \n  AND (categories LIKE '%Lawyer%' OR categories LIKE '%Legal%' OR categories LIKE '%Law%');\n\"\"\"\nlaw_firms_df = pd.read_sql_query(query_law_firms, conn_business)\nconn_business.close()\n\nif law_firms_df.empty:\n    print(\"No law-related businesses found in Saint Petersburg.\")\n    result = []\nelse:\n    business_ids = law_firms_df['business_id'].tolist()\n\n    # Connect to Milvus\n    connections.connect(host=milvus_config['host'], port=milvus_config['port'])\n\n    # Define semantic queries\n    semantic_phrases = [\n        \"experienced lawyer\",\n        \"good communication\",\n        \"responsive attorney\",\n        \"knowledgeable legal advice\",\n        \"clear explanation\"\n    ]\n    phrase_embeddings = model.encode(semantic_phrases)\n\n    # Search in reviews collection\n    review_hits = set()\n    try:\n        reviews_col = Collection(milvus_config['collections']['reviews'])\n        reviews_col.load()\n        for emb in phrase_embeddings:\n            search_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\n            results = reviews_col.search(\n                data=[emb],\n                anns_field=\"embedding\",\n                param=search_params,\n                limit=20,\n                expr=f\"business_id in {business_ids}\"\n            )\n            for res in results[0]:\n                review_hits.add(res.entity.get('business_id'))\n    except Exception as e:\n        print(f\"Warning: Review vector search failed: {e}\")\n\n    # Search in tips collection\n    tip_hits = set()\n    try:\n        tips_col = Collection(milvus_config['collections']['tips'])\n        tips_col.load()\n        for emb in phrase_embeddings:\n            search_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\n            results = tips_col.search(\n                data=[emb],\n                anns_field=\"embedding\",\n                param=search_params,\n                limit=10,\n                expr=f\"business_id in {business_ids}\"\n            )\n            for res in results[0]:\n                tip_hits.add(res.entity.get('business_id'))\n    except Exception as e:\n        print(f\"Warning: Tip vector search failed: {e}\")\n\n    # Combine hits\n    relevant_business_ids = list(review_hits.union(tip_hits))\n\n    if not relevant_business_ids:\n        print(\"No reviews or tips matched semantic criteria.\")\n        result = law_firms_df.to_dict(orient='records')\n    else:\n        # Step 3: Get average ratings for relevant businesses\n        conn_review = sqlite3.connect(sqlite_paths['review'])\n        placeholders = ','.join(['?' for _ in relevant_business_ids])\n        rating_query = f\"\"\"\n        SELECT business_id, AVG(stars) as avg_rating, COUNT(*) as review_count\n        FROM review\n        WHERE business_id IN ({placeholders})\n        GROUP BY business_id\n        ORDER BY avg_rating DESC, review_count DESC;\n        \"\"\"\n        ratings_df = pd.read_sql_query(rating_query, conn_review, params=relevant_business_ids)\n        conn_review.close()\n\n        # Merge with business info\n        final_df = pd.merge(law_firms_df, ratings_df, on='business_id', how='inner')\n        final_df = final_df.sort_values(by=['avg_rating', 'review_count'], ascending=False)\n        result = final_df.to_dict(orient='records')\n\n# Output\nfor idx, firm in enumerate(result, 1):\n    print(f\"{idx}. {firm.get('name', 'N/A')} - Avg Rating: {firm.get('avg_rating', 'N/A'):.2f}, Address: {firm.get('address', 'N/A')}\")\n\nif not result:\n    print(\"No matching law firms found based on your criteria.\")"
+    }
+  },
+{
+    "index": 59,
+    "question": "I need a massage therapist in Tampa for back pain. Who specializes in pain relief?",
+    "success": true,
+    "result": {
+      "analysis": "The user is looking for a massage therapist in Tampa who specializes in pain relief, particularly for back pain. This requires identifying businesses in the 'massage' or related categories located in Tampa, then filtering or ranking them based on their relevance to 'pain relief'. Since business categories and descriptions are in SQLite, and reviews/tips may contain semantic information about pain relief, we need to: (1) find relevant businesses via SQL using location and category; (2) use vector search on reviews or tips to assess specialization in pain relief; (3) possibly enrich with graph relationships (e.g., users who reviewed such services). The query involves SQL + vector search, making it medium difficulty.",
+      "natural_question": "Find massage therapists in Tampa who specialize in pain relief for back pain.",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Tampa"
+              },
+              "categories": {
+                "contains": "Massage"
+              }
+            }
+          },
+          "result_var": "tampa_massage_businesses",
+          "description": {
+            "narrative": "Query the SQLite business table to find all businesses in Tampa whose categories include 'Massage'.",
+            "example_query": "SELECT business_id, name, address, categories FROM business WHERE city = 'Tampa' AND categories LIKE '%Massage%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "reviews"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "tampa_massage_businesses.business_id"
+              },
+              "semantic_query": "specializes in pain relief or back pain treatment"
+            }
+          },
+          "result_var": "relevant_reviews",
+          "description": {
+            "narrative": "Use Milvus to perform a vector similarity search on review texts associated with the businesses from step 1, using the query 'specializes in pain relief or back pain treatment' to find the most relevant ones.",
+            "example_query": "Perform hybrid search in Milvus 'reviews' collection: filter by business_id in [list] and semantic match to 'pain relief back pain'"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "business",
+              "reviews"
+            ],
+            "filter_condition": {
+              "join_on": "business_id",
+              "rank_by": "vector_similarity_score"
+            }
+          },
+          "result_var": "ranked_therapists",
+          "description": {
+            "narrative": "Join the business data with the top matching reviews, rank by similarity score, and return the top candidates who are most associated with pain relief.",
+            "example_query": "SELECT b.name, b.address, r.similarity_score FROM business b JOIN relevant_reviews r ON b.business_id = r.business_id ORDER BY r.similarity_score DESC LIMIT 5;"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport numpy as np\nfrom pymilvus import connections, Collection\nimport json\n\n# Step 0: Connect to databases\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\"\n}\n\nmilvus_config = {\n    'collections': {\n        'reviews': 'reviews'\n    },\n    'host': 'localhost',\n    'port': '19530'\n}\n\n# Connect to Milvus\nconnections.connect(host=milvus_config['host'], port=milvus_config['port'])\nreview_collection = Collection(milvus_config['collections']['reviews'])\nreview_collection.load()\n\n# Helper: get embedding for query (assuming pre-defined encoder)\n# In practice, you'd use the same model used to generate review embeddings\nfrom sentence_transformers import SentenceTransformer\nencoder = SentenceTransformer('all-MiniLM-L6-v2')\n\ndef get_sqlite_connection(db_name):\n    return sqlite3.connect(sqlite_paths[db_name])\n\ntry:\n    # Step 1: Find massage businesses in Tampa\n    conn_biz = get_sqlite_connection('business')\n    cursor = conn_biz.cursor()\n    cursor.execute(\"\"\"\n        SELECT business_id, name, address, categories \n        FROM business \n        WHERE city = ? AND categories LIKE ?\n    \"\"\", ('Tampa', '%Massage%'))\n    tampa_massage_businesses = cursor.fetchall()\n    conn_biz.close()\n    \n    if not tampa_massage_businesses:\n        print('No massage businesses found in Tampa.')\n        exit()\n    \n    business_ids = [row[0] for row in tampa_massage_businesses]\n    business_dict = {row[0]: {'name': row[1], 'address': row[2]} for row in tampa_massage_businesses}\n\n    # Step 2: Vector search in Milvus for pain relief relevance\n    query_text = \"specializes in pain relief or back pain treatment\"\n    query_embedding = encoder.encode(query_text).tolist()\n\n    # Build expr for filtering by business_id\n    id_expr = \" || \".join([f'business_id == \\\"{bid}\\\"' for bid in business_ids])\n    if len(business_ids) > 1:\n        id_expr = f\"({id_expr})\"\n    elif len(business_ids) == 1:\n        id_expr = f\"business_id == \\\"{business_ids[0]}\\\"\"\n    else:\n        id_expr = \"\"\n\n    search_params = {\n        \"metric_type\": \"L2\",\n        \"params\": {\"nprobe\": 10}\n    }\n\n    results = review_collection.search(\n        data=[query_embedding],\n        anns_field=\"embedding\",\n        param=search_params,\n        limit=10,\n        expr=id_expr if id_expr else None,\n        output_fields=[\"business_id\", \"review_id\"]\n    )\n\n    # Extract matched business_ids and scores\n    scored_businesses = {}\n    for hit in results[0]:\n        bid = hit.entity.get('business_id')\n        score = hit.distance  # lower = more similar for L2\n        if bid not in scored_businesses or score < scored_businesses[bid]['score']:\n            scored_businesses[bid] = {'score': score}\n\n    # Step 3: Rank and output\n    ranked = []\n    for bid in scored_businesses:\n        if bid in business_dict:\n            ranked.append({\n                'name': business_dict[bid]['name'],\n                'address': business_dict[bid]['address'],\n                'relevance_score': scored_businesses[bid]['score']\n            })\n    \n    # Sort by relevance (lower L2 distance = higher relevance)\n    ranked.sort(key=lambda x: x['relevance_score'])\n\n    print(\"Top massage therapists in Tampa specializing in pain relief:\")\n    for i, therapist in enumerate(ranked[:5]):\n        print(f\"{i+1}. {therapist['name']} - {therapist['address']} (Relevance: {therapist['relevance_score']:.2f})\")\n\nexcept Exception as e:\n    print(f\"Error: {e}\")\nfinally:\n    connections.disconnect('default')"
+    }
+  },
+{
+    "index": 60,
+    "question": "I really want fresh seafood in Clearwater. Where can I get the best quality fish?",
+    "success": true,
+    "result": {
+      "analysis": "The user is asking for restaurants in Clearwater that serve fresh, high-quality seafood, particularly fish. This requires identifying businesses in the 'Clearwater' location with categories related to seafood or fish, and then assessing their quality—likely via review sentiment or average rating. The query involves filtering businesses by location and category (SQL), then possibly using vector search on reviews to assess quality mentions (vector), making it a medium-difficulty multi-step query.",
+      "natural_question": "Find the best places in Clearwater that serve high-quality fresh seafood, especially fish.",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Clearwater"
+              },
+              "categories": {
+                "contains": [
+                  "Seafood",
+                  "Fish"
+                ]
+              }
+            }
+          },
+          "result_var": "seafood_businesses",
+          "description": {
+            "narrative": "Retrieve all businesses in Clearwater whose categories include 'Seafood' or 'Fish'.",
+            "example_query": "SELECT business_id, name, address, stars, review_count FROM business WHERE city = 'Clearwater' AND (categories LIKE '%Seafood%' OR categories LIKE '%Fish%');"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "reviews"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "seafood_businesses.business_id"
+              },
+              "semantic_query": "fresh high-quality fish seafood"
+            }
+          },
+          "result_var": "relevant_reviews",
+          "description": {
+            "narrative": "Perform a vector similarity search on reviews of the identified seafood businesses using the query 'fresh high-quality fish seafood' to find reviews that emphasize freshness and quality.",
+            "example_query": "Search in Milvus collection 'reviews' using embedding of 'fresh high-quality fish seafood' and filter by business_id in [list from step 1]."
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "business",
+              "reviews"
+            ],
+            "filter_condition": {
+              "aggregate": "count relevant reviews per business"
+            }
+          },
+          "result_var": "ranked_businesses",
+          "description": {
+            "narrative": "Rank the seafood businesses by the number of relevant positive reviews about fresh, high-quality fish, and return the top results.",
+            "example_query": "Aggregate review counts per business from step 2, join with business info from step 1, and sort by relevance score or count."
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport numpy as np\nfrom sentence_transformers import SentenceTransformer\nfrom pymilvus import connections, Collection\n\n# Configuration\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\"\n}\nmilvus_config = {\n    'collections': {\n        'reviews': 'reviews'\n    },\n    'host': 'localhost',\n    'port': '19530'\n}\n\n# Step 1: Get seafood businesses in Clearwater\nconn_business = sqlite3.connect(sqlite_paths['business'])\ncursor_business = conn_business.cursor()\n\nquery_step1 = \"\"\"\nSELECT business_id, name, address, stars, review_count\nFROM business\nWHERE city = ? AND (categories LIKE ? OR categories LIKE ?)\n\"\"\"\ncursor_business.execute(query_step1, ('Clearwater', '%Seafood%', '%Fish%'))\nseafood_businesses = cursor_business.fetchall()\nconn_business.close()\n\nif not seafood_businesses:\n    print('No seafood businesses found in Clearwater.')\nelse:\n    business_ids = [row[0] for row in seafood_businesses]\n\n    # Step 2: Vector search in Milvus for relevant reviews\n    connections.connect(host=milvus_config['host'], port=milvus_config['port'])\n    review_collection = Collection(milvus_config['collections']['reviews'])\n    review_collection.load()\n\n    model = SentenceTransformer('all-MiniLM-L6-v2')\n    query_text = \"fresh high-quality fish seafood\"\n    query_embedding = model.encode(query_text).tolist()\n\n    search_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\n    results = review_collection.search(\n        data=[query_embedding],\n        anns_field=\"embedding\",\n        param=search_params,\n        limit=100,\n        expr=f\"business_id in [{','.join([f'\\\"{bid}\\\"' for bid in business_ids])}]\"\n    )\n\n    # Extract business_id hits\n    relevant_business_counts = {}\n    for hits in results:\n        for hit in hits:\n            bid = hit.entity.get('business_id')\n            if bid in business_ids:\n                relevant_business_counts[bid] = relevant_business_counts.get(bid, 0) + 1\n\n    # Step 3: Rank and output\n    business_dict = {row[0]: row for row in seafood_businesses}\n    ranked = sorted(relevant_business_counts.items(), key=lambda x: x[1], reverse=True)\n\n    print(\"Top places in Clearwater for fresh, high-quality seafood:\")\n    for bid, count in ranked[:5]:\n        name, address, stars, review_count = business_dict[bid][1:]\n        print(f\"- {name} ({stars} stars, {review_count} reviews) - {address} [Relevant mentions: {count}]\")\n\n    # Clean up\n    review_collection.release()\n    connections.disconnect('default')"
+    }
+  }
+]

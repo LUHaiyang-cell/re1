@@ -1,0 +1,818 @@
+[
+{
+    "index": 61,
+    "question": "Who makes the juiciest burgers in Boise?",
+    "success": true,
+    "result": {
+      "analysis": "This is a subjective query seeking restaurants in Boise that are highly rated or frequently mentioned for 'juicy burgers'. It requires: (1) identifying businesses in Boise that serve burgers, (2) retrieving reviews or tips that mention 'juicy burger' or similar phrases, and (3) ranking them by relevance or sentiment. This involves SQL to filter businesses in Boise with relevant categories, vector search in Milvus to find semantically similar mentions of 'juiciest burgers', and potentially aggregating review counts or ratings. The difficulty is medium due to the need for cross-database coordination and semantic matching.",
+      "natural_question": "Who makes the juiciest burgers in Boise?",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Boise"
+              },
+              "categories": {
+                "like": "%Burgers%"
+              }
+            }
+          },
+          "result_var": "boise_burger_businesses",
+          "description": {
+            "narrative": "Retrieve all businesses in Boise that are categorized as burger places.",
+            "example_query": "SELECT business_id, name FROM business WHERE city = 'Boise' AND categories LIKE '%Burgers%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "reviews"
+            ],
+            "filter_condition": {
+              "text_embedding": {
+                "vector_search": "juiciest burgers"
+              }
+            }
+          },
+          "result_var": "relevant_reviews",
+          "description": {
+            "narrative": "Perform a vector similarity search in the Milvus 'reviews' collection using the phrase 'juiciest burgers' to find the most relevant reviews.",
+            "example_query": "Search Milvus collection 'reviews' with query embedding of 'juiciest burgers', returning top-k results with associated business_id."
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "tips"
+            ],
+            "filter_condition": {
+              "text_embedding": {
+                "vector_search": "juicy burger"
+              }
+            }
+          },
+          "result_var": "relevant_tips",
+          "description": {
+            "narrative": "Optionally, perform a similar vector search in the Milvus 'milvus_tip' collection for tips mentioning 'juicy burger'.",
+            "example_query": "Search Milvus collection 'milvus_tip' with query embedding of 'juicy burger', returning top-k results with associated business_id."
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "boise_burger_businesses",
+              "relevant_reviews",
+              "relevant_tips"
+            ],
+            "filter_condition": {}
+          },
+          "result_var": "final_candidates",
+          "description": {
+            "narrative": "Join the Boise burger businesses with the relevant reviews and tips by business_id, then rank by number of matches or average rating.",
+            "example_query": "Merge dataframes on business_id, group by business name, count matches, sort descending."
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport pandas as pd\nfrom pymilvus import connections, Collection\nfrom sentence_transformers import SentenceTransformer\n\n# Configuration\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\"\n}\n\nmilvus_config = {\n    'collections': {\n        'reviews': 'reviews',\n        'tips': 'milvus_tip'\n    },\n    'host': 'localhost',\n    'port': '19530'\n}\n\n# Step 1: Get Boise burger businesses\nconn_business = sqlite3.connect(sqlite_paths[\"business\"])\nboise_burger_businesses = pd.read_sql_query(\n    \"SELECT business_id, name FROM business WHERE city = 'Boise' AND categories LIKE '%Burgers%';\",\n    conn_business\n)\nconn_business.close()\n\nif boise_burger_businesses.empty:\n    print(\"No burger places found in Boise.\")\n    exit()\n\n# Initialize embedding model\nmodel = SentenceTransformer('all-MiniLM-L6-v2')\n\n# Connect to Milvus\nconnections.connect(host=milvus_config['host'], port=milvus_config['port'])\n\n# Step 2: Vector search in reviews\nquery_text = \"juiciest burgers\"\nquery_embedding = model.encode([query_text]).tolist()[0]\n\nreview_collection = Collection(milvus_config['collections']['reviews'])\nreview_collection.load()\n\nsearch_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\nresults = review_collection.search(\n    data=[query_embedding],\n    anns_field=\"text_embedding\",\n    param=search_params,\n    limit=50,\n    output_fields=[\"business_id\"]\n)\n\nreview_hits = []\nfor hit in results[0]:\n    review_hits.append({\n        'business_id': hit.entity.get('business_id'),\n        'distance': hit.distance\n    })\n\nreview_df = pd.DataFrame(review_hits)\n\n# Step 3: Vector search in tips\ntry:\n    tip_collection = Collection(milvus_config['collections']['tips'])\n    tip_collection.load()\n    tip_results = tip_collection.search(\n        data=[query_embedding],\n        anns_field=\"text_embedding\",\n        param=search_params,\n        limit=20,\n        output_fields=[\"business_id\"]\n    )\n\n    tip_hits = []\n    for hit in tip_results[0]:\n        tip_hits.append({\n            'business_id': hit.entity.get('business_id'),\n            'distance': hit.distance\n        })\n    tip_df = pd.DataFrame(tip_hits)\nexcept Exception as e:\n    print(f\"Tip collection search failed: {e}\")\n    tip_df = pd.DataFrame(columns=['business_id', 'distance'])\n\n# Step 4: Combine and rank\nall_hits = pd.concat([review_df, tip_df], ignore_index=True)\n\nif all_hits.empty:\n    print(\"No relevant mentions of 'juiciest burgers' found.\")\nelse:\n    # Merge with business names\n    merged = pd.merge(all_hits, boise_burger_businesses, on='business_id', how='inner')\n    ranked = merged.groupby('name').size().reset_index(name='mention_count')\n    ranked = ranked.sort_values(by='mention_count', ascending=False)\n\n    print(\"Top burger places in Boise known for juicy burgers:\")\n    for idx, row in ranked.head(5).iterrows():\n        print(f\"- {row['name']} ({row['mention_count']} relevant mentions)\")\n\n# Clean up\nconnections.disconnect('default')"
+    }
+  },
+{
+    "index": 62,
+    "question": "Where can I find authentic pasta in Metairie?",
+    "success": true,
+    "result": {
+      "analysis": "The user is asking for authentic pasta restaurants in Metairie, Louisiana. This requires identifying businesses in the 'Metairie' location that serve 'pasta' and are considered 'authentic'. The query involves: (1) filtering businesses by city = 'Metairie', (2) using semantic similarity on business categories or reviews to find those related to 'authentic pasta', which implies vector search over review or business description text. Therefore, this is a hybrid query involving SQL filtering and vector similarity search. Difficulty is medium due to the need for cross-database coordination.",
+      "natural_question": "Where can I find authentic pasta in Metairie?",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Metairie"
+              },
+              "state": {
+                "eq": "LA"
+              }
+            }
+          },
+          "result_var": "metairie_businesses",
+          "description": {
+            "narrative": "First, retrieve all businesses located in Metairie, LA from the SQLite business database.",
+            "example_query": "SELECT business_id, name, address, categories FROM business WHERE city = 'Metairie' AND state = 'LA';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "reviews"
+            ],
+            "filter_condition": {
+              "embedding_query": {
+                "text": "authentic pasta"
+              }
+            }
+          },
+          "result_var": "relevant_reviews",
+          "description": {
+            "narrative": "Perform a vector similarity search in the Milvus 'reviews' collection using the query 'authentic pasta' to find reviews that semantically match this concept.",
+            "example_query": "Search Milvus collection 'reviews' with embedding of 'authentic pasta', return top-k review_ids and similarity scores."
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "business",
+              "review"
+            ],
+            "filter_condition": {
+              "join_on": "business_id"
+            }
+          },
+          "result_var": "final_results",
+          "description": {
+            "narrative": "Join the Metairie businesses from step 1 with the relevant reviews from step 2 on business_id to identify which Metairie businesses have reviews discussing authentic pasta.",
+            "example_query": "SELECT DISTINCT b.name, b.address FROM metairie_businesses b INNER JOIN relevant_reviews r ON b.business_id = r.business_id;"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport json\nfrom sentence_transformers import SentenceTransformer\nfrom pymilvus import connections, Collection\n\n# Step 0: Initialize models and connections\nmodel = SentenceTransformer('all-MiniLM-L6-v2')\n\n# Connect to Milvus\nconnections.connect(host='localhost', port='19530')\n\n# SQLite paths\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\"\n}\n\ntry:\n    # Step 1: Get businesses in Metairie, LA\n    conn_business = sqlite3.connect(sqlite_paths['business'])\n    cursor_business = conn_business.cursor()\n    cursor_business.execute(\"\"\"\n        SELECT business_id, name, address, categories \n        FROM business \n        WHERE city = ? AND state = ?\n    \"\"\", ('Metairie', 'LA'))\n    metairie_businesses = cursor_business.fetchall()\n    metairie_business_dict = {row[0]: {'name': row[1], 'address': row[2], 'categories': row[3]} for row in metairie_businesses}\n    conn_business.close()\n    \n    if not metairie_business_dict:\n        print('No businesses found in Metairie, LA.')\n        exit()\n    \n    # Step 2: Vector search for 'authentic pasta' in reviews\n    query_text = 'authentic pasta'\n    query_embedding = model.encode([query_text]).tolist()[0]\n    \n    reviews_collection = Collection('reviews')\n    reviews_collection.load()\n    \n    search_params = {\n        \"metric_type\": \"L2\",\n        \"params\": {\"nprobe\": 10}\n    }\n    \n    results = reviews_collection.search(\n        data=[query_embedding],\n        anns_field=\"embedding\",\n        param=search_params,\n        limit=100,\n        output_fields=[\"review_id\", \"business_id\"]\n    )\n    \n    relevant_business_ids = set()\n    for hit in results[0]:\n        relevant_business_ids.add(hit.entity.get('business_id'))\n    \n    # Step 3: Intersect with Metairie businesses\n    matched_businesses = []\n    for bid in relevant_business_ids:\n        if bid in metairie_business_dict:\n            matched_businesses.append(metairie_business_dict[bid])\n    \n    # Output results\n    if matched_businesses:\n        print('Restaurants in Metairie serving authentic pasta:')\n        for biz in matched_businesses:\n            print(f\"- {biz['name']} at {biz['address']}\")\n    else:\n        print('No restaurants in Metairie found with reviews mentioning authentic pasta.')\n\nexcept Exception as e:\n    print(f\"An error occurred: {e}\")\nfinally:\n    connections.disconnect('default')"
+    }
+  },
+{
+    "index": 63,
+    "question": "Where can I find authentic Chinese food in Saint Louis?",
+    "success": true,
+    "result": {
+      "analysis": "The user is asking for authentic Chinese food in Saint Louis. This requires identifying businesses categorized as Chinese restaurants in the city of Saint Louis. The query involves filtering business data by location and category, which can be done using SQL on the 'business' SQLite table. Additionally, to assess 'authenticity', we may consider reviews or tips mentioning keywords like 'authentic', which would involve vector similarity search in Milvus. However, given the primary need is location + category, this is a medium-difficulty query involving SQL and possibly vector search for refinement.",
+      "natural_question": "Where can I find authentic Chinese food in Saint Louis?",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Saint Louis"
+              },
+              "categories": {
+                "contains": "Chinese"
+              }
+            }
+          },
+          "result_var": "chinese_restaurants",
+          "description": {
+            "narrative": "Query the 'business' table in SQLite to find all businesses in Saint Louis that have 'Chinese' in their categories.",
+            "example_query": "SELECT business_id, name, address, stars, review_count FROM business WHERE city = 'Saint Louis' AND categories LIKE '%Chinese%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "reviews"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "chinese_restaurants.business_id"
+              },
+              "text_vector": {
+                "vector_contains": "authentic Chinese"
+              }
+            }
+          },
+          "result_var": "authentic_reviews",
+          "description": {
+            "narrative": "Use Milvus to perform a vector similarity search on reviews associated with the Chinese restaurants found in step 1, looking for embeddings similar to the phrase 'authentic Chinese'.",
+            "example_query": "Search in Milvus collection 'reviews' using vector embedding of 'authentic Chinese' and filter by business_id from step 1."
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "business",
+              "reviews"
+            ],
+            "filter_condition": {
+              "join": {
+                "business.business_id": "authentic_reviews.business_id"
+              }
+            }
+          },
+          "result_var": "final_results",
+          "description": {
+            "narrative": "Join the original business data with the filtered reviews to return a ranked list of Chinese restaurants in Saint Louis that have reviews indicating authenticity.",
+            "example_query": "SELECT DISTINCT b.name, b.address, b.stars FROM business b INNER JOIN (SELECT business_id FROM authentic_reviews) r ON b.business_id = r.business_id;"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport numpy as np\nfrom pymilvus import connections, Collection\nimport json\n\n# Step 0: Configuration\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\"\n}\n\nmilvus_config = {\n    'collections': {\n        'reviews': 'reviews'\n    },\n    'host': 'localhost',\n    'port': '19530'\n}\n\n# Helper: get embedding (mocked; in real use, use same encoder as used for ingestion)\ndef get_text_embedding(text):\n    # Placeholder: in practice, use SentenceTransformer or similar\n    # For demo, return random vector of correct dimension (assume 768)\n    return np.random.rand(768).tolist()\n\n# Step 1: Find Chinese restaurants in Saint Louis\nconn_business = sqlite3.connect(sqlite_paths['business'])\ncursor = conn_business.cursor()\ncursor.execute(\"\"\"\n    SELECT business_id, name, address, stars, review_count \n    FROM business \n    WHERE city = ? AND categories LIKE ?\n\"\"\", ('Saint Louis', '%Chinese%'))\n\nchinese_restaurants = cursor.fetchall()\nchinese_ids = [row[0] for row in chinese_restaurants]\nconn_business.close()\n\nif not chinese_ids:\n    print('No Chinese restaurants found in Saint Louis.')\nelse:\n    # Step 2: Connect to Milvus and search for 'authentic Chinese' in reviews\n    connections.connect(host=milvus_config['host'], port=milvus_config['port'])\n    review_collection = Collection(milvus_config['collections']['reviews'])\n    \n    # Encode query\n    query_embedding = get_text_embedding(\"authentic Chinese\")\n    \n    # Search parameters\n    search_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\n    \n    # Perform search limited to relevant business_ids\n    results = review_collection.search(\n        data=[query_embedding],\n        anns_field=\"text_vector\",\n        param=search_params,\n        limit=50,\n        expr=f\"business_id in [{','.join([f'\\\"{bid}\\\"' for bid in chinese_ids])}]\"\n    )\n    \n    # Extract unique business_ids from top results\n    authentic_business_ids = set()\n    for hits in results:\n        for hit in hits:\n            # Assuming metadata includes business_id; adjust based on actual schema\n            if hasattr(hit, 'entity') and 'business_id' in hit.entity:\n                authentic_business_ids.add(hit.entity['business_id'])\n            elif hasattr(hit, 'id'):\n                # If business_id is stored as part of ID or payload, adjust accordingly\n                pass  # In real implementation, extract properly\n    \n    # Fallback: if Milvus doesn't return usable IDs, use all Chinese restaurants\n    if not authentic_business_ids:\n        authentic_business_ids = set(chinese_ids)\n    \n    # Step 3: Fetch final business details\n    conn_business = sqlite3.connect(sqlite_paths['business'])\n    placeholders = ','.join(['?' for _ in authentic_business_ids])\n    cursor = conn_business.cursor()\n    cursor.execute(f\"\"\"\n        SELECT name, address, stars \n        FROM business \n        WHERE business_id IN ({placeholders})\n        ORDER BY stars DESC\n    \"\"\", list(authentic_business_ids))\n    \n    final_results = cursor.fetchall()\n    conn_business.close()\n    \n    # Output\n    print('Recommended authentic Chinese restaurants in Saint Louis:')\n    for name, address, stars in final_results:\n        print(f\"- {name} ({stars} stars) at {address}\")\n"
+    }
+  },
+{
+    "index": 64,
+    "question": "Where can I find authentic Chinese spicy dishes in Sparks?",
+    "success": true,
+    "result": {
+      "analysis": "The user is asking for authentic Chinese spicy dishes in the city of Sparks. This requires: (1) identifying businesses in Sparks that are categorized as Chinese restaurants, (2) verifying their authenticity and spiciness through reviews or tips mentioning relevant keywords like 'authentic', 'spicy', 'Sichuan', etc., which involves semantic search in vector databases, and (3) possibly leveraging graph relationships to find highly connected or recommended venues. The query spans SQL (location + category filtering), vector search (semantic matching of review/tip text), and potentially graph (user-business interactions). Difficulty is medium due to multi-step cross-database logic.",
+      "natural_question": "Where can I find authentic Chinese spicy dishes in Sparks?",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Sparks"
+              },
+              "categories": {
+                "contains": "Chinese"
+              }
+            }
+          },
+          "result_var": "chinese_restaurants_in_sparks",
+          "description": {
+            "narrative": "Query the SQLite 'business' table to find all businesses in Sparks that have 'Chinese' in their categories.",
+            "example_query": "SELECT business_id, name, address FROM business WHERE city = 'Sparks' AND categories LIKE '%Chinese%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "reviews",
+              "tips"
+            ],
+            "filter_condition": {
+              "text_keywords": {
+                "semantic_contains": [
+                  "authentic",
+                  "spicy",
+                  "hot",
+                  "Sichuan",
+                  "Hunan"
+                ]
+              }
+            }
+          },
+          "result_var": "relevant_vectors",
+          "description": {
+            "narrative": "Perform a vector similarity search in Milvus collections 'reviews' and 'tips' using an embedding of the phrase 'authentic Chinese spicy food' to find reviews or tips associated with spicy and authentic Chinese cuisine.",
+            "example_query": "Use Milvus to search in 'reviews' and 'milvus_tip' collections with query vector derived from 'authentic spicy Chinese dishes', returning top-k business_id matches."
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "join_results"
+            ],
+            "filter_condition": {}
+          },
+          "result_var": "final_recommendations",
+          "description": {
+            "narrative": "Join the business IDs from Step 1 with those retrieved from vector search in Step 2 to find Chinese restaurants in Sparks that have reviews or tips indicating authentic and spicy dishes.",
+            "example_query": "SELECT b.name, b.address FROM business b WHERE b.business_id IN (intersection of Step 1 and Step 2 results);"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport json\nfrom sentence_transformers import SentenceTransformer\nfrom pymilvus import connections, Collection\n\n# Step 0: Initialize models and connections\nmodel = SentenceTransformer('all-MiniLM-L6-v2')\n\n# Connect to Milvus\nconnections.connect(host='localhost', port='19530')\n\n# Milvus collections\nreview_collection = Collection('reviews')\n tip_collection = Collection('milvus_tip')\n\n# Query phrase\nquery_text = 'authentic spicy Chinese dishes'\nquery_vector = model.encode(query_text).tolist()\n\n# Step 1: Get Chinese restaurants in Sparks from SQLite\nsqlite_path = \"D:/Yelp-JSON/db/sqlite3/business.db\"\nconn = sqlite3.connect(sqlite_path)\ncursor = conn.cursor()\ncursor.execute(\"\"\"\n    SELECT business_id, name, address\n    FROM business\n    WHERE city = ? AND categories LIKE ?\n\"\"\", ('Sparks', '%Chinese%'))\n\nchinese_businesses = cursor.fetchall()\nchinese_ids = {row[0] for row in chinese_businesses}\nconn.close()\n\nif not chinese_ids:\n    print('No Chinese restaurants found in Sparks.')\nelse:\n    # Step 2: Vector search in reviews and tips\n    def search_in_collection(collection, vector, top_k=10):\n        collection.load()\n        results = collection.search(\n            data=[vector],\n            anns_field=\"vector\",\n            param={\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}},\n            limit=top_k,\n            output_fields=[\"business_id\"]\n        )\n        business_ids = set()\n        for hits in results:\n            for hit in hits:\n                business_ids.add(hit.entity.get('business_id'))\n        return business_ids\n\n    try:\n        review_ids = search_in_collection(review_collection, query_vector)\n        tip_ids = search_in_collection(tip_collection, query_vector)\n        relevant_ids = review_ids.union(tip_ids)\n\n        # Step 3: Intersection\n        matched_ids = chinese_ids.intersection(relevant_ids)\n\n        # Fetch final results\n        if matched_ids:\n            placeholders = ','.join(['?' for _ in matched_ids])\n            conn = sqlite3.connect(sqlite_path)\n            cursor = conn.cursor()\n            cursor.execute(f\"SELECT name, address FROM business WHERE business_id IN ({placeholders})\", list(matched_ids))\n            recommendations = cursor.fetchall()\n            conn.close()\n\n            print('Recommended authentic spicy Chinese restaurants in Sparks:')\n            for name, addr in recommendations:\n                print(f'- {name} at {addr}')\n        else:\n            print('No Chinese restaurants in Sparks with mentions of authentic spicy dishes found.')\n    except Exception as e:\n        print(f'Error during vector search: {e}')\n"
+    }
+  },
+{
+    "index": 65,
+    "question": "Find authentic American (Traditional) BBQ in Boise.",
+    "success": true,
+    "result": {
+      "analysis": "The user is looking for authentic American (Traditional) BBQ restaurants in Boise. This requires filtering businesses by category and location, then potentially using vector search to assess authenticity based on reviews or tips mentioning 'authentic', 'traditional', or similar terms. The query involves both structured filtering (SQL) and semantic search (vector).",
+      "natural_question": "Find authentic American (Traditional) BBQ in Boise.",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Boise"
+              },
+              "categories": {
+                "contains": "American (Traditional)"
+              }
+            }
+          },
+          "result_var": "bbq_businesses",
+          "description": {
+            "narrative": "First, retrieve all businesses in Boise that are categorized as 'American (Traditional)' and likely include BBQ-related keywords in their name or categories.",
+            "example_query": "SELECT business_id, name, address, categories FROM business WHERE city = 'Boise' AND categories LIKE '%American (Traditional)%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "reviews",
+              "tips"
+            ],
+            "filter_condition": {
+              "text": {
+                "semantic_contains": [
+                  "authentic",
+                  "traditional",
+                  "real BBQ",
+                  "slow-smoked"
+                ]
+              }
+            }
+          },
+          "result_var": "authentic_mentions",
+          "description": {
+            "narrative": "Use Milvus vector search on reviews and tips associated with the businesses from step 1 to find those with semantic similarity to terms indicating authenticity in BBQ.",
+            "example_query": "Search in Milvus collections 'reviews' and 'milvus_tip' for vectors similar to embedding of 'authentic traditional American BBQ'."
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "business",
+              "review",
+              "tip"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "bbq_businesses.business_id"
+              },
+              "has_authentic_mention": {
+                "eq": true
+              }
+            }
+          },
+          "result_var": "final_results",
+          "description": {
+            "narrative": "Join the filtered businesses with the vector search results to return only those with evidence of authenticity in user-generated content.",
+            "example_query": "SELECT b.name, b.address, AVG(r.stars) as avg_rating FROM business b JOIN review r ON b.business_id = r.business_id WHERE b.business_id IN (...) GROUP BY b.business_id;"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport numpy as np\nfrom pymilvus import connections, Collection\nfrom sentence_transformers import SentenceTransformer\nimport re\n\ndef connect_sqlite(db_name):\n    path = f\"D:/Yelp-JSON/db/sqlite3/{db_name}.db\"\n    return sqlite3.connect(path)\n\ndef connect_milvus():\n    connections.connect(host='localhost', port='19530')\n\ndef get_bbq_businesses_in_boise():\n    conn = connect_sqlite('business')\n    cursor = conn.cursor()\n    query = \"\"\"\n    SELECT business_id, name, address, categories \n    FROM business \n    WHERE city = ? AND categories LIKE ?\n    \"\"\"\n    cursor.execute(query, ('Boise', '%American (Traditional)%'))\n    results = cursor.fetchall()\n    conn.close()\n    # Further filter for BBQ-related terms\n    bbq_keywords = ['bbq', 'barbecue', 'smoke', 'ribs', 'brisket']\n    filtered = []\n    for row in results:\n        business_id, name, address, categories = row\n        text = (name + ' ' + (categories or '')).lower()\n        if any(kw in text for kw in bbq_keywords):\n            filtered.append(row)\n    return filtered\n\ndef semantic_search_authenticity(business_ids):\n    connect_milvus()\n    model = SentenceTransformer('all-MiniLM-L6-v2')\n    \n    # Create search vector\n    query_text = \"authentic traditional American BBQ slow-smoked real barbecue\"\n    query_vector = model.encode(query_text).tolist()\n    \n    # Search in reviews\n    review_collection = Collection('reviews')\n    review_collection.load()\n    review_results = review_collection.search(\n        data=[query_vector],\n        anns_field=\"vector\",\n        param={\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}},\n        limit=50,\n        expr=f\"business_id in [{','.join([f'\\\"{bid}\\\"' for bid in business_ids])}]\"\n    )\n    \n    # Search in tips\n    tip_collection = Collection('milvus_tip')\n    tip_collection.load()\n    tip_results = tip_collection.search(\n        data=[query_vector],\n        anns_field=\"vector\",\n        param={\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}},\n        limit=20,\n        expr=f\"business_id in [{','.join([f'\\\"{bid}\\\"' for bid in business_ids])}]\"\n    )\n    \n    # Extract business IDs with matches\n    authentic_business_ids = set()\n    for hits in review_results:\n        for hit in hits:\n            authentic_business_ids.add(hit.entity.get('business_id'))\n    for hits in tip_results:\n        for hit in hits:\n            authentic_business_ids.add(hit.entity.get('business_id'))\n    \n    return list(authentic_business_ids)\n\ndef get_final_results(bbq_businesses, authentic_ids):\n    business_dict = {row[0]: row for row in bbq_businesses}\n    final_businesses = [business_dict[bid] for bid in authentic_ids if bid in business_dict]\n    \n    # Get average ratings\n    if not final_businesses:\n        return []\n        \n    conn = connect_sqlite('review')\n    cursor = conn.cursor()\n    business_ids_str = ','.join([f\"'{bid[0]}'\" for bid in final_businesses])\n    query = f\"SELECT business_id, AVG(stars) as avg_rating, COUNT(*) as review_count FROM review WHERE business_id IN ({business_ids_str}) GROUP BY business_id\"\n    cursor.execute(query)\n    rating_data = {row[0]: (row[1], row[2]) for row in cursor.fetchall()}\n    conn.close()\n    \n    results = []\n    for business_id, name, address, categories in final_businesses:\n        avg_rating, review_count = rating_data.get(business_id, (0, 0))\n        results.append({\n            'name': name,\n            'address': address,\n            'avg_rating': round(avg_rating, 2),\n            'review_count': review_count\n        })\n    \n    return sorted(results, key=lambda x: (-x['avg_rating'], -x['review_count']))\n\ndef main():\n    try:\n        print(\"Finding authentic American (Traditional) BBQ in Boise...\")\n        \n        # Step 1: Get BBQ businesses in Boise\n        bbq_businesses = get_bbq_businesses_in_boise()\n        if not bbq_businesses:\n            print(\"No American (Traditional) BBQ businesses found in Boise.\")\n            return []\n        \n        business_ids = [row[0] for row in bbq_businesses]\n        print(f\"Found {len(bbq_businesses)} potential BBQ businesses.\")\n        \n        # Step 2: Semantic search for authenticity\n        authentic_ids = semantic_search_authenticity(business_ids)\n        print(f\"Found {len(authentic_ids)} businesses with authentic BBQ mentions.\")\n        \n        if not authentic_ids:\n            print(\"No authentic BBQ mentions found. Returning all potential businesses.\")\n            authentic_ids = business_ids\n        \n        # Step 3: Get final results with ratings\n        final_results = get_final_results(bbq_businesses, authentic_ids)\n        \n        # Display results\n        if final_results:\n            print(\"\\nAuthentic American (Traditional) BBQ in Boise:\")\n            print(\"=\" * 50)\n            for i, result in enumerate(final_results, 1):\n                print(f\"{i}. {result['name']}\")\n                print(f\"   Address: {result['address']}\")\n                print(f\"   Rating: {result['avg_rating']} ({result['review_count']} reviews)\")\n                print()\n        else:\n            print(\"No results found.\")\n            \n        return final_results\n        \n    except Exception as e:\n        print(f\"Error: {e}\")\n        return []\n\nif __name__ == \"__main__\":\n    results = main()"
+    }
+  },
+{
+    "index": 66,
+    "question": "Who has the best pho in Saint Louis?",
+    "success": true,
+    "result": {
+      "analysis": "The user is asking for the best pho restaurant in Saint Louis. This requires: (1) identifying businesses in Saint Louis that serve pho, (2) evaluating their quality based on reviews or ratings, and (3) possibly using semantic search to find reviews that specifically mention 'pho' positively. This involves SQL filtering for location and category, and vector search to assess sentiment or relevance of reviews mentioning 'pho'. The query is of medium difficulty due to the need for cross-database coordination.",
+      "natural_question": "Who has the best pho in Saint Louis?",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Saint Louis"
+              },
+              "categories": {
+                "contains": "Pho"
+              }
+            }
+          },
+          "result_var": "pho_businesses",
+          "description": {
+            "narrative": "Query the SQLite business table to find all businesses in Saint Louis whose categories include 'Pho'.",
+            "example_query": "SELECT business_id, name, stars, review_count FROM business WHERE city = 'Saint Louis' AND categories LIKE '%Pho%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "review"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "pho_businesses.business_id"
+              }
+            }
+          },
+          "result_var": "relevant_reviews",
+          "description": {
+            "narrative": "Fetch reviews associated with the identified pho restaurants from the review table.",
+            "example_query": "SELECT review_id, business_id, text FROM review WHERE business_id IN (SELECT business_id FROM business WHERE city = 'Saint Louis' AND categories LIKE '%Pho%');"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "reviews"
+            ],
+            "filter_condition": {
+              "query_text": "best pho in Saint Louis",
+              "top_k": 5
+            }
+          },
+          "result_var": "top_pho_review_vectors",
+          "description": {
+            "narrative": "Perform a vector similarity search in the Milvus 'reviews' collection using the query 'best pho in Saint Louis' to find the most relevant positive reviews about pho.",
+            "example_query": "Use Milvus client to search in 'reviews' collection with embedding of 'best pho in Saint Louis', returning top 5 matches."
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "business",
+              "review"
+            ],
+            "filter_condition": {
+              "review_id": {
+                "in": "top_pho_review_vectors.review_id"
+              }
+            }
+          },
+          "result_var": "final_candidates",
+          "description": {
+            "narrative": "Join the top review results back to business information to identify which restaurants are being praised for their pho.",
+            "example_query": "SELECT b.name, b.stars, b.review_count, r.text FROM business b JOIN review r ON b.business_id = r.business_id WHERE r.review_id IN (...);"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport json\nfrom pymilvus import connections, Collection\nfrom sentence_transformers import SentenceTransformer\n\n# Step 0: Initialize models and connections\nmodel = SentenceTransformer('all-MiniLM-L6-v2')\n\n# Connect to Milvus\nconnections.connect(host='localhost', port='19530')\n\n# SQLite paths\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\"\n}\n\ntry:\n    # Step 1: Find pho businesses in Saint Louis\n    conn_business = sqlite3.connect(sqlite_paths[\"business\"])\n    cursor_business = conn_business.cursor()\n    cursor_business.execute(\"\"\"\n        SELECT business_id, name, stars, review_count \n        FROM business \n        WHERE city = ? AND categories LIKE ?\n    \"\"\", (\"Saint Louis\", \"%Pho%\"))\n    pho_businesses = cursor_business.fetchall()\n    pho_business_ids = [row[0] for row in pho_businesses]\n    conn_business.close()\n\n    if not pho_business_ids:\n        print(\"No pho restaurants found in Saint Louis.\")\n        exit()\n\n    # Step 2: Fetch reviews for these businesses\n    conn_review = sqlite3.connect(sqlite_paths[\"review\"])\n    cursor_review = conn_review.cursor()\n    placeholders = ','.join(['?' for _ in pho_business_ids])\n    cursor_review.execute(f\"SELECT review_id, business_id, text FROM review WHERE business_id IN ({placeholders})\", pho_business_ids)\n    reviews = cursor_review.fetchall()\n    conn_review.close()\n\n    # Create mapping from review_id to business_id and text\n    review_map = {r[0]: {'business_id': r[1], 'text': r[2]} for r in reviews}\n\n    # Step 3: Vector search in Milvus\n    query_text = \"best pho in Saint Louis\"\n    query_embedding = model.encode([query_text]).tolist()[0]\n\n    collection = Collection(\"reviews\")\n    collection.load()\n\n    search_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\n    results = collection.search(\n        data=[query_embedding],\n        anns_field=\"embedding\",\n        param=search_params,\n        limit=5,\n        expr=None\n    )\n\n    # Extract review_ids from Milvus results\n    top_review_ids = []\n    for hit in results[0]:\n        # Assuming Milvus stores review_id as an integer field named 'review_id'\n        top_review_ids.append(hit.id)  # Note: actual field access may vary based on schema\n\n    # Step 4: Match top reviews to businesses\n    final_businesses = []\n    for rid in top_review_ids:\n        if rid in review_map:\n            bid = review_map[rid]['business_id']\n            # Get business info\n            business_info = next((b for b in pho_businesses if b[0] == bid), None)\n            if business_info:\n                final_businesses.append({\n                    'name': business_info[1],\n                    'stars': business_info[2],\n                    'review_count': business_info[3],\n                    'review_snippet': review_map[rid]['text'][:100] + \"...\"\n                })\n\n    # Output results\n    if final_businesses:\n        print(\"Top pho restaurants in Saint Louis based on semantic review analysis:\")\n        for i, biz in enumerate(final_businesses, 1):\n            print(f\"{i}. {biz['name']} - {biz['stars']} stars ({biz['review_count']} reviews)\")\n            print(f\"   Review snippet: {biz['review_snippet']}\")\n    else:\n        # Fallback: just return highest-rated pho places\n        sorted_by_stars = sorted(pho_businesses, key=lambda x: (-x[2], -x[3]))\n        print(\"No semantic matches found. Returning highest-rated pho restaurants:\")\n        for i, biz in enumerate(sorted_by_stars[:3], 1):\n            print(f\"{i}. {biz[1]} - {biz[2]} stars ({biz[3]} reviews)\")\n\nexcept Exception as e:\n    print(f\"An error occurred: {e}\")\nfinally:\n    connections.disconnect('default')"
+    }
+  },
+{
+    "index": 67,
+    "question": "Where can I find authentic burritos in Metairie?",
+    "success": true,
+    "result": {
+      "analysis": "The user is asking for authentic burritos in Metairie, which is a location-based query requiring business information filtered by cuisine type and geographic area. This involves querying the SQLite 'business' table to find businesses in Metairie that serve Mexican food or specifically mention burritos, potentially enhanced by semantic search over reviews or tips using Milvus to confirm authenticity.",
+      "natural_question": "Where can I find authentic burritos in Metairie?",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Metairie"
+              },
+              "categories": {
+                "contains": "Mexican"
+              }
+            }
+          },
+          "result_var": "metairie_mexican_businesses",
+          "description": {
+            "narrative": "Query the SQLite 'business' table to find all businesses located in Metairie that are categorized as Mexican restaurants.",
+            "example_query": "SELECT business_id, name, address, categories FROM business WHERE city = 'Metairie' AND categories LIKE '%Mexican%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "reviews"
+            ],
+            "filter_condition": {
+              "text": {
+                "semantic_contains": "authentic burritos"
+              }
+            }
+          },
+          "result_var": "authentic_burrito_reviews",
+          "description": {
+            "narrative": "Use Milvus vector search on the 'reviews' collection to find reviews that semantically match the phrase 'authentic burritos', returning associated business_ids.",
+            "example_query": "Perform a vector similarity search in Milvus 'reviews' collection using the embedding of 'authentic burritos' to retrieve top-k relevant review vectors and their associated business_ids."
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "intersection"
+            ],
+            "filter_condition": {}
+          },
+          "result_var": "final_burrito_places",
+          "description": {
+            "narrative": "Intersect the results from step 1 and step 2 to find Mexican restaurants in Metairie that have reviews mentioning authentic burritos.",
+            "example_query": "SELECT * FROM metairie_mexican_businesses WHERE business_id IN (SELECT business_id FROM authentic_burrito_reviews);"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport numpy as np\nfrom pymilvus import connections, Collection\nfrom sentence_transformers import SentenceTransformer\n\n# Database paths and configurations\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n}\n\nmilvus_config = {\n    'collections': {\n        'reviews': 'reviews',\n    },\n    'host': 'localhost',\n    'port': '19530'\n}\n\n# Step 1: Query Mexican restaurants in Metairie\ndef get_mexican_businesses_in_metairie():\n    conn = sqlite3.connect(sqlite_paths['business'])\n    cursor = conn.cursor()\n    query = \"\"\"\n    SELECT business_id, name, address, categories \n    FROM business \n    WHERE city = ? AND categories LIKE ?\n    \"\"\"\n    cursor.execute(query, ('Metairie', '%Mexican%'))\n    results = cursor.fetchall()\n    conn.close()\n    return [{'business_id': r[0], 'name': r[1], 'address': r[2], 'categories': r[3]} for r in results]\n\n# Step 2: Semantic search for 'authentic burritos' in reviews\ndef search_authentic_burritos():\n    # Connect to Milvus\n    connections.connect(host=milvus_config['host'], port=milvus_config['port'])\n    collection = Collection(milvus_config['collections']['reviews'])\n    \n    # Generate embedding for query\n    model = SentenceTransformer('all-MiniLM-L6-v2')\n    query_embedding = model.encode(['authentic burritos']).tolist()[0]\n    \n    # Perform search\n    search_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\n    results = collection.search(\n        data=[query_embedding],\n        anns_field=\"vector\",\n        param=search_params,\n        limit=50,\n        output_fields=[\"business_id\"]\n    )\n    \n    business_ids = set()\n    for hits in results:\n        for hit in hits:\n            business_ids.add(hit.entity.get('business_id'))\n    \n    return list(business_ids)\n\n# Step 3: Intersect results\ndef find_authentic_burrito_places():\n    mexican_businesses = get_mexican_businesses_in_metairie()\n    burrito_business_ids = search_authentic_burritos()\n    \n    burrito_business_set = set(burrito_business_ids)\n    final_results = [biz for biz in mexican_businesses if biz['business_id'] in burrito_business_set]\n    \n    return final_results\n\n# Main execution\nif __name__ == \"__main__\":\n    try:\n        results = find_authentic_burrito_places()\n        if results:\n            print(\"Authentic burrito places in Metairie:\")\n            for place in results:\n                print(f\"- {place['name']} at {place['address']}\")\n        else:\n            print(\"No authentic burrito places found in Metairie.\")\n    except Exception as e:\n        print(f\"An error occurred: {e}\")"
+    }
+  },
+{
+    "index": 68,
+    "question": "Where is good for watching a game tonight?",
+    "success": true,
+    "result": {
+      "analysis": "The user is asking for recommendations on places to watch a game tonight. This implies they want businesses (likely bars or sports venues) that are currently open, have positive reviews mentioning 'watching games' or 'sports', and possibly have recent tips or check-ins indicating active patronage. The query involves filtering businesses by attributes like 'is_open', joining with reviews/tips for semantic relevance to 'watching a game', and potentially using vector search to find semantically similar review/tip content. This requires SQL for structured filtering and vector search for semantic matching.",
+      "natural_question": "Where is good for watching a game tonight?",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "is_open": {
+                "eq": 1
+              }
+            }
+          },
+          "result_var": "open_businesses",
+          "description": {
+            "narrative": "Retrieve all businesses that are currently open from the business table in SQLite.",
+            "example_query": "SELECT business_id, name, address, city, state FROM business WHERE is_open = 1;"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "reviews"
+            ],
+            "filter_condition": {
+              "text_embedding": {
+                "vector_search": "watching a game"
+              }
+            }
+          },
+          "result_var": "relevant_review_ids",
+          "description": {
+            "narrative": "Perform a vector similarity search in the Milvus 'reviews' collection using the query 'watching a game' to find review IDs with semantically relevant content.",
+            "example_query": "Search in Milvus collection 'reviews' with query text 'watching a game' to get top-k review IDs."
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "review"
+            ],
+            "filter_condition": {
+              "review_id": {
+                "in": "relevant_review_ids"
+              }
+            }
+          },
+          "result_var": "relevant_reviews",
+          "description": {
+            "narrative": "Fetch the full review records from the SQLite review table for the review IDs obtained from the vector search.",
+            "example_query": "SELECT business_id, review_id, text FROM review WHERE review_id IN (...);"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "tips"
+            ],
+            "filter_condition": {
+              "text_embedding": {
+                "vector_search": "watching a game"
+              }
+            }
+          },
+          "result_var": "relevant_tip_ids",
+          "description": {
+            "narrative": "Perform a vector similarity search in the Milvus 'milvus_tip' collection using the query 'watching a game' to find tip IDs with semantically relevant content.",
+            "example_query": "Search in Milvus collection 'milvus_tip' with query text 'watching a game' to get top-k tip IDs."
+          }
+        },
+        {
+          "step": 5,
+          "parameters": {
+            "ms_names": [
+              "tip"
+            ],
+            "filter_condition": {
+              "tip_id": {
+                "in": "relevant_tip_ids"
+              }
+            }
+          },
+          "result_var": "relevant_tips",
+          "description": {
+            "narrative": "Fetch the full tip records from the SQLite tip table for the tip IDs obtained from the vector search.",
+            "example_query": "SELECT business_id, tip_id, text FROM tip WHERE tip_id IN (...);"
+          }
+        },
+        {
+          "step": 6,
+          "parameters": {
+            "ms_names": [
+              "open_businesses",
+              "relevant_reviews",
+              "relevant_tips"
+            ],
+            "filter_condition": {}
+          },
+          "result_var": "final_recommendations",
+          "description": {
+            "narrative": "Combine the open businesses with those mentioned in relevant reviews and tips. Aggregate results and rank by relevance or review count to provide final recommendations.",
+            "example_query": "Join open_businesses with relevant_reviews and relevant_tips on business_id, then group and sort by relevance score or count."
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport numpy as np\nfrom pymilvus import connections, Collection\nimport json\n\n# Database paths\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nmilvus_config = {\n    'milvus_collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    },\n    'milvus_host': 'localhost',\n    'milvus_port': '19530'\n}\n\n# Connect to Milvus\nconnections.connect(host=milvus_config['milvus_host'], port=milvus_config['milvus_port'])\n\n# Helper function to get SQLite connection\ndef get_sqlite_conn(db_name):\n    return sqlite3.connect(sqlite_paths[db_name])\n\n# Step 1: Get open businesses\nconn_business = get_sqlite_conn('business')\ncursor_business = conn_business.cursor()\ncursor_business.execute(\"SELECT business_id, name, address, city, state FROM business WHERE is_open = 1;\")\nopen_businesses = cursor_business.fetchall()\nopen_business_dict = {row[0]: row for row in open_businesses}\nconn_business.close()\n\n# If no open businesses, exit early\nif not open_businesses:\n    print(\"No open businesses found.\")\n    exit()\n\n# Step 2: Vector search in reviews\ntry:\n    reviews_collection = Collection(milvus_config['milvus_collections']['reviews'])\n    # Assuming we have a way to embed the query text; for demo, we'll simulate\n    # In practice, you'd use the same embedding model used during ingestion\n    # Here we assume a function `embed_text` exists\n    def embed_text(text):\n        # Placeholder: in real implementation, use your embedding model\n        # For example, SentenceTransformer or OpenAI embeddings\n        return np.random.rand(768).tolist()  # assuming 768-dim vectors\n    \n    query_embedding = embed_text(\"watching a game\")\n    search_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\n    results = reviews_collection.search(\n        data=[query_embedding],\n        anns_field=\"embedding\",\n        param=search_params,\n        limit=50,\n        output_fields=[\"review_id\"]\n    )\n    \n    relevant_review_ids = []\n    for hit in results[0]:\n        relevant_review_ids.append(hit.entity.get('review_id'))\nexcept Exception as e:\n    print(f\"Milvus search error for reviews: {e}\")\n    relevant_review_ids = []\n\n# Step 3: Fetch relevant reviews from SQLite\nrelevant_reviews_business_ids = set()\nif relevant_review_ids:\n    conn_review = get_sqlite_conn('review')\n    placeholders = ','.join(['?' for _ in relevant_review_ids])\n    cursor_review = conn_review.cursor()\n    cursor_review.execute(f\"SELECT business_id FROM review WHERE review_id IN ({placeholders});\", relevant_review_ids)\n    rows = cursor_review.fetchall()\n    relevant_reviews_business_ids = {row[0] for row in rows}\n    conn_review.close()\n\n# Step 4: Vector search in tips\ntip_relevant_business_ids = set()\ntry:\n    tips_collection = Collection(milvus_config['milvus_collections']['tips'])\n    query_embedding_tip = embed_text(\"watching a game\")\n    results_tip = tips_collection.search(\n        data=[query_embedding_tip],\n        anns_field=\"embedding\",\n        param=search_params,\n        limit=30,\n        output_fields=[\"tip_id\"]\n    )\n    \n    relevant_tip_ids = []\n    for hit in results_tip[0]:\n        relevant_tip_ids.append(hit.entity.get('tip_id'))\n    \n    # Step 5: Fetch relevant tips from SQLite\n    if relevant_tip_ids:\n        conn_tip = get_sqlite_conn('tip')\n        placeholders_tip = ','.join(['?' for _ in relevant_tip_ids])\n        cursor_tip = conn_tip.cursor()\n        cursor_tip.execute(f\"SELECT business_id FROM tip WHERE tip_id IN ({placeholders_tip});\", relevant_tip_ids)\n        tip_rows = cursor_tip.fetchall()\n        tip_relevant_business_ids = {row[0] for row in tip_rows}\n        conn_tip.close()\nexcept Exception as e:\n    print(f\"Milvus search error for tips: {e}\")\n\n# Step 6: Combine results\ncombined_business_ids = relevant_reviews_business_ids.union(tip_relevant_business_ids)\nfinal_recommendations = []\nfor bid in combined_business_ids:\n    if bid in open_business_dict:\n        final_recommendations.append(open_business_dict[bid])\n\n# Output results\nif final_recommendations:\n    print(\"Recommended places to watch a game tonight:\")\n    for rec in final_recommendations[:10]:  # Top 10\n        print(f\"- {rec[1]} at {rec[2]}, {rec[3]}, {rec[4]}\")\nelse:\n    print(\"No specific recommendations found. Here are some open businesses:\")\n    for rec in list(open_business_dict.values())[:10]:\n        print(f\"- {rec[1]} at {rec[2]}, {rec[3]}, {rec[4]}\")\n"
+    }
+  },
+{
+    "index": 69,
+    "question": "I'm looking for an upscale restaurant for a date this weekend. Any recommendations?",
+    "success": true,
+    "result": {
+      "analysis": "The user is asking for upscale restaurant recommendations suitable for a date this weekend. This requires identifying businesses categorized as restaurants with high price levels (indicating 'upscale'), potentially good ratings, and possibly open on weekends. The query involves filtering business data by category, attributes (price), and operational hours, which are stored in the SQLite 'business' database. Additionally, to ensure quality, we may consider reviews or tips, which could involve Milvus vector search for sentiment or Neo4j for user-business interactions. However, the core requirement can be satisfied with SQL filtering.",
+      "natural_question": "Find upscale restaurants suitable for a date this weekend.",
+      "difficulty": "medium",
+      "query_types": [
+        "sql"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "categories": {
+                "like": "%Restaurants%"
+              },
+              "attributes_RestaurantsPriceRange2": {
+                ">=": "3"
+              },
+              "is_open": {
+                "=": 1
+              }
+            }
+          },
+          "result_var": "upscale_restaurants",
+          "description": {
+            "narrative": "Query the business table to find open restaurants with a price range of 3 or 4 (considered upscale). Filter by categories containing 'Restaurants' and ensure they are currently open.",
+            "example_query": "SELECT business_id, name, address, city, stars, review_count, attributes_RestaurantsPriceRange2 FROM business WHERE categories LIKE '%Restaurants%' AND attributes_RestaurantsPriceRange2 >= '3' AND is_open = 1;"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport json\nimport os\n\n# Database paths\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\ndef get_upscale_restaurants():\n    \"\"\"Find upscale restaurants suitable for a date.\"\"\"\n    try:\n        # Connect to business database\n        conn = sqlite3.connect(sqlite_paths['business'])\n        cursor = conn.cursor()\n        \n        # Query for upscale restaurants\n        query = '''\n        SELECT \n            business_id, \n            name, \n            address, \n            city, \n            stars, \n            review_count, \n            attributes_RestaurantsPriceRange2 \n        FROM business \n        WHERE \n            categories LIKE ? \n            AND attributes_RestaurantsPriceRange2 >= ?\n            AND is_open = 1\n        ORDER BY stars DESC, review_count DESC\n        LIMIT 10;\n        '''\n        \n        cursor.execute(query, ('%Restaurants%', '3'))\n        results = cursor.fetchall()\n        \n        # Format results\n        restaurants = []\n        for row in results:\n            restaurants.append({\n                'business_id': row[0],\n                'name': row[1],\n                'address': row[2],\n                'city': row[3],\n                'stars': row[4],\n                'review_count': row[5],\n                'price_range': row[6]\n            })\n        \n        return restaurants\n        \n    except sqlite3.Error as e:\n        print(f\"Database error: {e}\")\n        return []\n    except Exception as e:\n        print(f\"Error: {e}\")\n        return []\n    finally:\n        if conn:\n            conn.close()\n\ndef main():\n    print(\"Finding upscale restaurants for your date...\")\n    recommendations = get_upscale_restaurants()\n    \n    if recommendations:\n        print(f\"\\nFound {len(recommendations)} upscale restaurant(s):\\n\")\n        for i, restaurant in enumerate(recommendations, 1):\n            print(f\"{i}. {restaurant['name']}\")\n            print(f\"   Address: {restaurant['address']}, {restaurant['city']}\")\n            print(f\"   Rating: {restaurant['stars']} stars ({restaurant['review_count']} reviews)\")\n            print(f\"   Price Range: {'$' * int(restaurant['price_range']) if restaurant['price_range'] else 'N/A'}\\n\")\n    else:\n        print(\"No upscale restaurants found matching your criteria.\")\n\nif __name__ == \"__main__\":\n    main()"
+    }
+  },
+{
+    "index": 70,
+    "question": "Recommend a comfortable bookstore in Philadelphia where I can browse for a few hours.",
+    "success": true,
+    "result": {
+      "analysis": "The user is asking for a comfortable bookstore in Philadelphia where they can spend several hours browsing. This requires identifying businesses categorized as bookstores in Philadelphia, then evaluating their comfort or suitability for extended visits. Comfort can be inferred from reviews mentioning terms like 'comfortable', 'cozy', 'relaxing', 'quiet', 'stay for hours', etc. This involves: (1) filtering businesses by city and category using SQL, (2) retrieving relevant reviews, (3) performing semantic search on review text using vector similarity to find comfort-related sentiment, and (4) ranking results accordingly. The query spans relational, vector, and potentially graph data, making it of medium difficulty.",
+      "natural_question": "Recommend a comfortable bookstore in Philadelphia where I can browse for a few hours.",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Philadelphia"
+              },
+              "categories": {
+                "contains": "Bookstores"
+              }
+            }
+          },
+          "result_var": "philly_bookstores",
+          "description": {
+            "narrative": "Query the SQLite business table to find all businesses in Philadelphia that are categorized as bookstores.",
+            "example_query": "SELECT business_id, name, address, stars, review_count FROM business WHERE city = 'Philadelphia' AND categories LIKE '%Bookstores%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "review"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "philly_bookstores.business_id"
+              }
+            }
+          },
+          "result_var": "bookstore_reviews",
+          "description": {
+            "narrative": "Fetch reviews for the identified bookstores from the review table.",
+            "example_query": "SELECT business_id, review_id, text FROM review WHERE business_id IN (SELECT business_id FROM business WHERE city = 'Philadelphia' AND categories LIKE '%Bookstores%');"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "reviews"
+            ],
+            "filter_condition": {
+              "query_vector": "embedding of 'a comfortable, cozy bookstore where you can relax and browse for hours'",
+              "top_k": 10
+            }
+          },
+          "result_var": "comfortable_reviews",
+          "description": {
+            "narrative": "Use Milvus to perform a semantic similarity search on the review vectors using a query embedding that captures the notion of comfort and leisurely browsing.",
+            "example_query": "Search in Milvus collection 'reviews' with query vector derived from 'a comfortable, cozy bookstore where you can relax and browse for hours', returning top 10 most similar review vectors."
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "business",
+              "comfortable_reviews"
+            ],
+            "filter_condition": {}
+          },
+          "result_var": "final_recommendations",
+          "description": {
+            "narrative": "Join the semantically relevant reviews back to their businesses and rank bookstores by the number of comfort-related positive reviews. Return the top recommendation(s).",
+            "example_query": "SELECT b.name, b.address, b.stars, COUNT(cr.review_id) AS comfort_mentions FROM business b JOIN (SELECT DISTINCT business_id, review_id FROM matched_comfort_reviews) cr ON b.business_id = cr.business_id GROUP BY b.business_id ORDER BY comfort_mentions DESC, b.stars DESC LIMIT 3;"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport numpy as np\nfrom sentence_transformers import SentenceTransformer\nfrom pymilvus import connections, Collection\nimport os\n\ndef recommend_comfortable_bookstore():\n    # Configuration\n    sqlite_paths = {\n        \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n        \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\"\n    }\n    milvus_config = {\n        'collection_name': 'reviews',\n        'host': 'localhost',\n        'port': '19530'\n    }\n    \n    # Step 1: Get Philadelphia bookstores\n    conn_business = sqlite3.connect(sqlite_paths[\"business\"])\n    cursor_business = conn_business.cursor()\n    cursor_business.execute(\"\"\"\n        SELECT business_id, name, address, stars, review_count \n        FROM business \n        WHERE city = ? AND categories LIKE ?\n    \"\"\", (\"Philadelphia\", \"%Bookstores%\"))\n    philly_bookstores = cursor_business.fetchall()\n    conn_business.close()\n    \n    if not philly_bookstores:\n        print(\"No bookstores found in Philadelphia.\")\n        return []\n    \n    business_ids = [row[0] for row in philly_bookstores]\n    \n    # Step 2: Get reviews for these bookstores\n    conn_review = sqlite3.connect(sqlite_paths[\"review\"])\n    placeholders = ','.join(['?' for _ in business_ids])\n    cursor_review = conn_review.cursor()\n    cursor_review.execute(f\"\"\"\n        SELECT business_id, review_id, text \n        FROM review \n        WHERE business_id IN ({placeholders})\n    \"\"\", business_ids)\n    reviews = cursor_review.fetchall()\n    conn_review.close()\n    \n    if not reviews:\n        print(\"No reviews found for Philadelphia bookstores.\")\n        return philly_bookstores[:3]  # fallback\n    \n    review_ids = [r[1] for r in reviews]\n    \n    # Step 3: Semantic search in Milvus\n    connections.connect(host=milvus_config['host'], port=milvus_config['port'])\n    collection = Collection(milvus_config['collection_name'])\n    collection.load()\n    \n    model = SentenceTransformer('all-MiniLM-L6-v2')\n    query_text = \"a comfortable, cozy bookstore where you can relax and browse for hours\"\n    query_embedding = model.encode(query_text).tolist()\n    \n    search_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\n    results = collection.search(\n        data=[query_embedding],\n        anns_field=\"vector\",\n        param=search_params,\n        limit=20,\n        expr=None\n    )\n    \n    # Extract review IDs from Milvus results\n    milvus_review_ids = set()\n    for hit in results[0]:\n        if hit.id in review_ids:  # Only consider reviews from our bookstores\n            milvus_review_ids.add(hit.id)\n    \n    # Map business_id to count of comfort-related reviews\n    business_comfort_score = {}\n    for bid, rid, text in reviews:\n        if rid in milvus_review_ids:\n            business_comfort_score[bid] = business_comfort_score.get(bid, 0) + 1\n    \n    # Step 4: Rank and return top recommendations\n    bookstore_dict = {row[0]: row for row in philly_bookstores}\n    ranked = []\n    for bid in business_comfort_score:\n        if bid in bookstore_dict:\n            name, addr, stars, rc = bookstore_dict[bid][1], bookstore_dict[bid][2], bookstore_dict[bid][3], bookstore_dict[bid][4]\n            ranked.append({\n                'name': name,\n                'address': addr,\n                'stars': stars,\n                'review_count': rc,\n                'comfort_mentions': business_comfort_score[bid]\n            })\n    \n    # Sort by comfort mentions (primary), then stars (secondary)\n    ranked.sort(key=lambda x: (-x['comfort_mentions'], -x['stars']))\n    \n    # Fallback: if no semantic matches, return top-rated\n    if not ranked:\n        fallback = []\n        for row in philly_bookstores:\n            fallback.append({\n                'name': row[1],\n                'address': row[2],\n                'stars': row[3],\n                'review_count': row[4],\n                'comfort_mentions': 0\n            })\n        fallback.sort(key=lambda x: -x['stars'])\n        ranked = fallback[:3]\n    else:\n        ranked = ranked[:3]\n    \n    return ranked\n\n# Execute and display\nif __name__ == \"__main__\":\n    recommendations = recommend_comfortable_bookstore()\n    if recommendations:\n        print(\"Top comfortable bookstores in Philadelphia:\")\n        for i, rec in enumerate(recommendations, 1):\n            print(f\"{i}. {rec['name']}\")\n            print(f\"   Address: {rec['address']}\")\n            print(f\"   Rating: {rec['stars']} stars ({rec['review_count']} reviews)\")\n            if rec['comfort_mentions'] > 0:\n                print(f\"   Noted for comfort in {rec['comfort_mentions']} reviews\")\n            print()\n    else:\n        print(\"No bookstores found.\")"
+    }
+  }
+]

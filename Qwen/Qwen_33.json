@@ -1,0 +1,944 @@
+[
+{
+    "index": 321,
+    "question": "In Philadelphia, find Italian restaurants with many check-ins and photos of pasta or red wine; output check-in time ranges, ratings, and photo counts.",
+    "success": true,
+    "result": {
+      "analysis": "This is a multi-step, cross-database query involving filtering businesses by city and category (SQLite), retrieving check-in frequency (SQLite), finding relevant photos via semantic similarity (Milvus vector search on photo captions or inferred content), and aggregating results. The difficulty is 'hard' due to the need for vector search on image relevance and joining across systems.",
+      "natural_question": "In Philadelphia, find Italian restaurants with many check-ins and photos of pasta or red wine; output check-in time ranges, ratings, and photo counts.",
+      "difficulty": "hard",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Philadelphia"
+              },
+              "categories": {
+                "contains": "Italian"
+              }
+            }
+          },
+          "result_var": "italian_restaurants",
+          "description": {
+            "narrative": "Query the SQLite 'business' table to find all businesses in Philadelphia that are categorized as Italian restaurants.",
+            "example_query": "SELECT business_id, name, stars FROM business WHERE city = 'Philadelphia' AND categories LIKE '%Italian%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "checkin"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "italian_restaurants.business_id"
+              }
+            }
+          },
+          "result_var": "checkin_data",
+          "description": {
+            "narrative": "For each Italian restaurant found, retrieve its check-in data to determine time ranges and frequency.",
+            "example_query": "SELECT business_id, MIN(date) AS first_checkin, MAX(date) AS last_checkin, COUNT(*) AS total_checkins FROM checkin WHERE business_id IN (/* list from step 1 */) GROUP BY business_id;"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "photo"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "italian_restaurants.business_id"
+              }
+            }
+          },
+          "result_var": "photo_ids",
+          "description": {
+            "narrative": "Retrieve photo IDs associated with these Italian restaurants from the photo table to prepare for vector search.",
+            "example_query": "SELECT photo_id, business_id FROM photo WHERE business_id IN (/* list from step 1 */);"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "photos"
+            ],
+            "filter_condition": {
+              "semantic_query": {
+                "text": "pasta or red wine"
+              }
+            }
+          },
+          "result_var": "relevant_photo_ids",
+          "description": {
+            "narrative": "Perform a Milvus vector similarity search on the 'photo_vector' collection using the query 'pasta or red wine' to find relevant photos. Return photo IDs with high similarity scores.",
+            "example_query": "Use Milvus client to search collection 'photo_vector' with embedding of 'pasta or red wine', return top-k matches with photo_id."
+          }
+        },
+        {
+          "step": 5,
+          "parameters": {
+            "ms_names": [
+              "aggregation"
+            ],
+            "filter_condition": {}
+          },
+          "result_var": "final_results",
+          "description": {
+            "narrative": "Join results: match relevant photo IDs to businesses, count per business, and combine with check-in time ranges and ratings. Filter for restaurants with 'many' check-ins (e.g., above median) and at least one relevant photo.",
+            "example_query": "Aggregate in Python: group relevant photos by business_id, merge with checkin_data and italian_restaurants, then filter and format output."
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport numpy as np\nfrom pymilvus import connections, Collection\nimport json\nfrom datetime import datetime\n\ndef connect_sqlite(db_name):\n    path_map = {\n        \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n        \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n        \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\"\n    }\n    conn = sqlite3.connect(path_map[db_name])\n    conn.row_factory = sqlite3.Row\n    return conn\n\n# Step 1: Get Italian restaurants in Philadelphia\nconn_biz = connect_sqlite(\"business\")\ncursor = conn_biz.cursor()\ncursor.execute(\"\"\"\n    SELECT business_id, name, stars \n    FROM business \n    WHERE city = ? AND categories LIKE ?\n\"\"\", (\"Philadelphia\", \"%Italian%\"))\nitalian_restaurants = [dict(row) for row in cursor.fetchall()]\nconn_biz.close()\n\nif not italian_restaurants:\n    print(\"No Italian restaurants found in Philadelphia.\")\n    exit()\n\nbiz_ids = [r['business_id'] for r in italian_restaurants]\nbiz_id_to_info = {r['business_id']: r for r in italian_restaurants}\n\n# Step 2: Get check-in data\nconn_checkin = connect_sqlite(\"checkin\")\ncursor = conn_checkin.cursor()\nplaceholders = ','.join(['?' for _ in biz_ids])\ncursor.execute(f\"\"\"\n    SELECT business_id, MIN(date) AS first_checkin, MAX(date) AS last_checkin, COUNT(*) AS total_checkins\n    FROM checkin\n    WHERE business_id IN ({placeholders})\n    GROUP BY business_id\n\"\"\", biz_ids)\ncheckin_data = {row['business_id']: dict(row) for row in cursor.fetchall()}\nconn_checkin.close()\n\n# Determine threshold for \"many\" check-ins (e.g., top 50% or > median)\nif checkin_data:\n    checkin_counts = [d['total_checkins'] for d in checkin_data.values()]\n    median_checkins = sorted(checkin_counts)[len(checkin_counts)//2] if checkin_counts else 0\nelse:\n    median_checkins = 0\n\n# Step 3: Get photo IDs for these businesses\nconn_photo = connect_sqlite(\"photo\")\ncursor = conn_photo.cursor()\ncursor.execute(f\"\"\"\n    SELECT photo_id, business_id \n    FROM photo \n    WHERE business_id IN ({placeholders})\n\"\"\", biz_ids)\nphoto_records = [dict(row) for row in cursor.fetchall()]\nconn_photo.close()\n\nphoto_id_to_biz = {p['photo_id']: p['business_id'] for p in photo_records}\nphoto_ids = list(photo_id_to_biz.keys())\n\nif not photo_ids:\n    print(\"No photos found for Italian restaurants in Philadelphia.\")\n    relevant_photo_biz_ids = set()\nelse:\n    # Step 4: Vector search in Milvus for 'pasta or red wine'\n    connections.connect(host='localhost', port='19530')\n    collection = Collection('photo_vector')\n    collection.load()\n\n    # Assuming we have a function to get embedding (in practice, use same model as indexing)\n    # For demo, we'll simulate; in real use, replace with actual embedding generation\n    from sentence_transformers import SentenceTransformer\n    model = SentenceTransformer('all-MiniLM-L6-v2')\n    query_embedding = model.encode([\"pasta or red wine\"])[0].tolist()\n\n    search_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\n    results = collection.search(\n        data=[query_embedding],\n        anns_field=\"vector\",\n        param=search_params,\n        limit=100,\n        expr=None\n    )\n\n    relevant_photo_ids = set()\n    for hit in results[0]:\n        # Assuming Milvus stores photo_id as 'id' or in payload\n        # Adjust based on actual schema\n        photo_id = hit.id  # or hit.entity.get('photo_id')\n        if str(photo_id) in photo_id_to_biz:  # ensure it's from our target businesses\n            relevant_photo_ids.add(str(photo_id))\n\n    # Map back to business IDs\n    relevant_photo_biz_ids = set(photo_id_to_biz[p_id] for p_id in relevant_photo_ids if p_id in photo_id_to_biz)\n\n# Step 5: Aggregate final results\nresults = []\nfor biz_id in biz_ids:\n    if biz_id not in checkin_data:\n        continue\n    if checkin_data[biz_id]['total_checkins'] <= median_checkins:\n        continue\n    if biz_id not in relevant_photo_biz_ids:\n        continue\n\n    info = biz_id_to_info[biz_id]\n    checkin = checkin_data[biz_id]\n    # Count relevant photos for this business\n    photo_count = sum(1 for pid in relevant_photo_ids if photo_id_to_biz.get(pid) == biz_id)\n\n    results.append({\n        \"business_id\": biz_id,\n        \"name\": info['name'],\n        \"rating\": info['stars'],\n        \"first_checkin\": checkin['first_checkin'],\n        \"last_checkin\": checkin['last_checkin'],\n        \"photo_count\": photo_count\n    })\n\n# Output\nfor r in results:\n    print(json.dumps(r, indent=2))\n\n# Cleanup\nconnections.disconnect('default')"
+    }
+  },
+{
+    "index": 322,
+    "question": "In Tucson, find Mexican restaurants with many check-ins and photos of tacos or chili; list check-in times, review stars, photo counts and addresses.",
+    "success": true,
+    "result": {
+      "analysis": "This query involves multiple data sources and requires joining structured business data (SQLite), temporal check-in records, review ratings, photo metadata, and vector-based image content filtering (Milvus) to identify relevant Mexican restaurants in Tucson that have photos related to tacos or chili. The difficulty is high due to cross-database coordination and semantic filtering via vector search.",
+      "natural_question": "In Tucson, find Mexican restaurants with many check-ins and photos of tacos or chili; list check-in times, review stars, photo counts and addresses.",
+      "difficulty": "hard",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business",
+              "checkin",
+              "review",
+              "photo"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Tucson"
+              },
+              "categories": {
+                "contains": "Mexican"
+              }
+            }
+          },
+          "result_var": "mexican_restaurants",
+          "description": {
+            "narrative": "Query the SQLite 'business' table to find all businesses in Tucson categorized as Mexican restaurants. Join with 'checkin', 'review', and 'photo' tables to gather check-in timestamps, average star ratings, and photo counts per business.",
+            "example_query": "SELECT b.business_id, b.name, b.address, b.city, b.postal_code, c.date AS checkin_times, r.stars, COUNT(p.photo_id) AS photo_count FROM business b JOIN checkin c ON b.business_id = c.business_id JOIN review r ON b.business_id = r.business_id LEFT JOIN photo p ON b.business_id = p.business_id WHERE b.city = 'Tucson' AND b.categories LIKE '%Mexican%' GROUP BY b.business_id;"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "photos"
+            ],
+            "filter_condition": {
+              "text_query": {
+                "semantic_contains": [
+                  "tacos",
+                  "chili"
+                ]
+              }
+            }
+          },
+          "result_var": "relevant_photo_ids",
+          "description": {
+            "narrative": "Use Milvus vector database to perform a semantic search on photo captions or associated text (or image embeddings if available) to find photos related to 'tacos' or 'chili'. Return the photo IDs that match this criterion.",
+            "example_query": "Perform vector similarity search in Milvus collection 'photo_vector' using embeddings of the phrases 'tacos' and 'chili'; return top-k matching photo IDs."
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "mexican_restaurants",
+              "relevant_photo_ids"
+            ],
+            "filter_condition": {}
+          },
+          "result_var": "final_results",
+          "description": {
+            "narrative": "Filter the Mexican restaurants from Step 1 to only include those whose photos appear in the relevant photo IDs from Step 2. Aggregate check-in times, ensure review stars are included, count only relevant photos, and retain address info.",
+            "example_query": "Filter mexican_restaurants where photo_id IN (relevant_photo_ids); group by business_id to re-aggregate check-in times, stars, relevant photo count, and address."
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport numpy as np\nfrom pymilvus import connections, Collection\nimport json\nfrom datetime import datetime\n\ndef connect_sqlite(db_name):\n    path_map = {\n        \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n        \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n        \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n        \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\"\n    }\n    conn = sqlite3.connect(path_map[db_name])\n    conn.row_factory = sqlite3.Row\n    return conn\n\n# Connect to Milvus\nconnections.connect(host='localhost', port='19530')\nphoto_collection = Collection('photo_vector')\n\n# Step 1: Get Mexican restaurants in Tucson with check-ins, reviews, and photos\nbusiness_conn = connect_sqlite('business')\ncheckin_conn = connect_sqlite('checkin')\nreview_conn = connect_sqlite('review')\nphoto_conn = connect_sqlite('photo')\n\n# Fetch businesses\nb_cur = business_conn.execute(\n    \"SELECT business_id, name, address, city, postal_code FROM business WHERE city = ? AND categories LIKE ?\",\n    ('Tucson', '%Mexican%')\n)\nbusinesses = {row['business_id']: dict(row) for row in b_cur.fetchall()}\n\n# Fetch check-ins\ncheckin_data = {}\nc_cur = checkin_conn.execute(\"SELECT business_id, date FROM checkin\")\nfor row in c_cur:\n    bid = row['business_id']\n    if bid in businesses:\n        if bid not in checkin_data:\n            checkin_data[bid] = []\n        # Split dates (they are comma-separated strings)\n        checkin_data[bid].extend(row['date'].split(', '))\n\n# Fetch average stars\nreview_data = {}\nr_cur = review_conn.execute(\"SELECT business_id, AVG(stars) as avg_stars FROM review GROUP BY business_id\")\nfor row in r_cur:\n    if row['business_id'] in businesses:\n        review_data[row['business_id']] = row['avg_stars']\n\n# Fetch all photo IDs for these businesses\nphoto_data = {}\np_cur = photo_conn.execute(\"SELECT photo_id, business_id FROM photo\")\nphoto_to_business = {}\nfor row in p_cur:\n    bid = row['business_id']\n    if bid in businesses:\n        if bid not in photo_data:\n            photo_data[bid] = []\n        photo_data[bid].append(row['photo_id'])\n        photo_to_business[row['photo_id']] = bid\n\nall_photo_ids = [pid for pid_list in photo_data.values() for pid in pid_list]\n\n# Step 2: Vector search in Milvus for taco/chili-related photos\nfrom sentence_transformers import SentenceTransformer\nmodel = SentenceTransformer('all-MiniLM-L6-v2')\n\nqueries = ['tacos', 'chili']\nquery_embeddings = model.encode(queries).tolist()\n\n# Search Milvus\nphoto_collection.load()\nresults = []\nfor emb in query_embeddings:\n    search_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\n    res = photo_collection.search(\n        data=[emb],\n        anns_field=\"embedding\",\n        param=search_params,\n        limit=100,\n        expr=None\n    )\n    results.extend([hit.id for hit in res[0]])\n\nrelevant_photo_ids = set(results)\n\n# Map relevant photos back to businesses\nrelevant_businesses = set()\nrelevant_photo_counts = {}\nfor pid in relevant_photo_ids:\n    if pid in photo_to_business:\n        bid = photo_to_business[pid]\n        relevant_businesses.add(bid)\n        relevant_photo_counts[bid] = relevant_photo_counts.get(bid, 0) + 1\n\n# Step 3: Compile final results\nfinal_output = []\nfor bid in relevant_businesses:\n    if bid in businesses:\n        entry = {\n            'business_id': bid,\n            'name': businesses[bid]['name'],\n            'address': f\"{businesses[bid]['address']}, {businesses[bid]['city']}, {businesses[bid]['postal_code']}\",\n            'checkin_times': checkin_data.get(bid, []),\n            'review_stars': review_data.get(bid, None),\n            'relevant_photo_count': relevant_photo_counts.get(bid, 0)\n        }\n        final_output.append(entry)\n\n# Sort by photo count and check-in frequency\nfinal_output.sort(key=lambda x: (x['relevant_photo_count'], len(x['checkin_times'])), reverse=True)\n\n# Output\nfor item in final_output:\n    print(json.dumps(item, indent=2))\n\n# Cleanup\nbusiness_conn.close()\ncheckin_conn.close()\nreview_conn.close()\nphoto_conn.close()\nconnections.disconnect('default')"
+    }
+  },
+{
+    "index": 323,
+    "question": "In New Orleans, find seafood restaurants with active check-ins and photos of shrimp or oysters; output check-in time ranges, photo counts, ratings and addresses.",
+    "success": true,
+    "result": {
+      "analysis": "This is a complex multi-database query requiring: (1) filtering businesses in New Orleans that are seafood restaurants, (2) checking for active check-ins, (3) finding photos related to shrimp or oysters using vector similarity search, and (4) aggregating results with time ranges, counts, ratings and addresses. The query spans SQLite (business, checkin, photo), Milvus (photo vectors), and requires semantic matching.",
+      "natural_question": "In New Orleans, find seafood restaurants with active check-ins and photos of shrimp or oysters; output check-in time ranges, photo counts, ratings and addresses.",
+      "difficulty": "hard",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "New Orleans"
+              },
+              "categories": {
+                "contains": "Seafood"
+              }
+            }
+          },
+          "result_var": "seafood_businesses",
+          "description": {
+            "narrative": "Find all seafood restaurants in New Orleans from the business table by filtering city = 'New Orleans' and categories containing 'Seafood'.",
+            "example_query": "SELECT business_id, name, address, stars FROM business WHERE city = 'New Orleans' AND categories LIKE '%Seafood%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "checkin"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "seafood_businesses.business_id"
+              }
+            }
+          },
+          "result_var": "active_checkins",
+          "description": {
+            "narrative": "Get check-in records for the seafood businesses found in step 1 to determine active check-ins and extract time ranges.",
+            "example_query": "SELECT business_id, date FROM checkin WHERE business_id IN (SELECT business_id FROM seafood_businesses);"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "photo"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "seafood_businesses.business_id"
+              }
+            }
+          },
+          "result_var": "candidate_photos",
+          "description": {
+            "narrative": "Retrieve photo records associated with the seafood businesses to get photo IDs for vector search.",
+            "example_query": "SELECT photo_id, business_id FROM photo WHERE business_id IN (SELECT business_id FROM seafood_businesses);"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "photos"
+            ],
+            "filter_condition": {
+              "vector_query": {
+                "text": [
+                  "shrimp",
+                  "oysters"
+                ],
+                "collection": "photo_vector"
+              }
+            }
+          },
+          "result_var": "relevant_photo_ids",
+          "description": {
+            "narrative": "Perform vector similarity search in Milvus 'photo_vector' collection using text queries 'shrimp' and 'oysters' to find relevant photo IDs.",
+            "example_query": "Search in Milvus collection 'photo_vector' with embeddings of 'shrimp' and 'oysters' to get top-k similar photo vectors."
+          }
+        },
+        {
+          "step": 5,
+          "parameters": {
+            "ms_names": [
+              "photo",
+              "business",
+              "checkin"
+            ],
+            "filter_condition": {
+              "photo_id": {
+                "in": "relevant_photo_ids"
+              },
+              "business_id": {
+                "in": "seafood_businesses.business_id"
+              }
+            }
+          },
+          "result_var": "final_results",
+          "description": {
+            "narrative": "Join all results to produce final output with check-in time ranges, photo counts, ratings, and addresses for restaurants meeting all criteria.",
+            "example_query": "SELECT b.address, b.stars, COUNT(p.photo_id) as photo_count, MIN(c.date) as first_checkin, MAX(c.date) as last_checkin FROM business b JOIN checkin c ON b.business_id = c.business_id JOIN photo p ON b.business_id = p.business_id WHERE b.business_id IN (filtered_businesses) AND p.photo_id IN (relevant_photo_ids) GROUP BY b.business_id;"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport pandas as pd\nfrom pymilvus import connections, Collection\nfrom datetime import datetime\nimport numpy as np\nfrom sentence_transformers import SentenceTransformer\n\n# Database configuration\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nmilvus_config = {\n    'collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    },\n    'host': 'localhost',\n    'port': '19530'\n}\n\n# Connect to databases\ndef connect_sqlite(db_name):\n    return sqlite3.connect(sqlite_paths[db_name])\n\n# Connect to Milvus\nconnections.connect(host=milvus_config['host'], port=milvus_config['port'])\n\ntry:\n    # Step 1: Get seafood restaurants in New Orleans\n    conn_business = connect_sqlite('business')\n    query_seafood = \"\"\"\n    SELECT business_id, name, address, stars \n    FROM business \n    WHERE city = 'New Orleans' \n    AND categories LIKE '%Seafood%'\n    \"\"\"\n    seafood_businesses = pd.read_sql_query(query_seafood, conn_business)\n    conn_business.close()\n    \n    if seafood_businesses.empty:\n        print(\"No seafood restaurants found in New Orleans\")\n        exit()\n    \n    business_ids = tuple(seafood_businesses['business_id'].tolist())\n    \n    # Step 2: Get active check-ins for these businesses\n    conn_checkin = connect_sqlite('checkin')\n    query_checkins = f\"\"\"\n    SELECT business_id, date \n    FROM checkin \n    WHERE business_id IN ({','.join(['?' for _ in business_ids])})\n    \"\"\"\n    checkins = pd.read_sql_query(query_checkins, conn_checkin, params=business_ids)\n    conn_checkin.close()\n    \n    if checkins.empty:\n        print(\"No active check-ins found for seafood restaurants\")\n        exit()\n    \n    # Step 3: Get photos for these businesses\n    conn_photo = connect_sqlite('photo')\n    query_photos = f\"\"\"\n    SELECT photo_id, business_id \n    FROM photo \n    WHERE business_id IN ({','.join(['?' for _ in business_ids])})\n    \"\"\"\n    candidate_photos = pd.read_sql_query(query_photos, conn_photo, params=business_ids)\n    conn_photo.close()\n    \n    if candidate_photos.empty:\n        print(\"No photos found for seafood restaurants\")\n        exit()\n    \n    # Step 4: Vector search for shrimp/oysters photos\n    photo_collection = Collection(milvus_config['collections']['photos'])\n    photo_collection.load()\n    \n    # Load sentence transformer model\n    model = SentenceTransformer('all-MiniLM-L6-v2')\n    \n    # Create query embeddings\n    queries = [\"shrimp\", \"oysters\"]\n    query_embeddings = model.encode(queries)\n    \n    relevant_photo_ids = set()\n    \n    for embedding in query_embeddings:\n        search_params = {\n            \"metric_type\": \"L2\",\n            \"params\": {\"nprobe\": 10}\n        }\n        \n        results = photo_collection.search(\n            data=[embedding.tolist()],\n            anns_field=\"vector\",\n            param=search_params,\n            limit=50,\n            output_fields=[\"photo_id\"]\n        )\n        \n        for hits in results:\n            for hit in hits:\n                relevant_photo_ids.add(hit.entity.get('photo_id'))\n    \n    if not relevant_photo_ids:\n        print(\"No photos found matching shrimp or oysters\")\n        exit()\n    \n    # Step 5: Final aggregation\n    # Filter candidate photos to only relevant ones\n    relevant_photos_df = candidate_photos[candidate_photos['photo_id'].isin(relevant_photo_ids)]\n    \n    if relevant_photos_df.empty:\n        print(\"No relevant photos found for the seafood restaurants\")\n        exit()\n    \n    # Get unique business IDs with relevant photos\n    businesses_with_relevant_photos = relevant_photos_df['business_id'].unique()\n    \n    # Filter seafood businesses to only those with relevant photos\n    final_businesses = seafood_businesses[seafood_businesses['business_id'].isin(businesses_with_relevant_photos)]\n    \n    # Aggregate check-in time ranges\n    checkin_ranges = checkins.groupby('business_id').agg({\n        'date': ['min', 'max']\n    }).reset_index()\n    checkin_ranges.columns = ['business_id', 'first_checkin', 'last_checkin']\n    \n    # Count photos per business\n    photo_counts = relevant_photos_df.groupby('business_id').size().reset_index(name='photo_count')\n    \n    # Merge all results\n    result = final_businesses.merge(photo_counts, on='business_id', how='inner')\n    result = result.merge(checkin_ranges, on='business_id', how='inner')\n    \n    # Select required columns\n    final_output = result[['address', 'stars', 'photo_count', 'first_checkin', 'last_checkin']]\n    \n    print(\"Results:\")\n    print(final_output.to_string(index=False))\n    \nexcept Exception as e:\n    print(f\"Error occurred: {str(e)}\")\nfinally:\n    # Clean up Milvus connection\n    try:\n        photo_collection.release()\n    except:\n        pass\n    connections.disconnect('default')"
+    }
+  },
+{
+    "index": 324,
+    "question": "In Philadelphia, find bars with active check-ins and photos of beer or bar counters; return check-in times and review sentences mentioning lively atmosphere, plus photo counts.",
+    "success": true,
+    "result": {
+      "analysis": "This is a complex multi-database query that requires joining data from SQLite (for business, check-in, and photo metadata), Milvus (for semantic search in reviews and image content via vectors), and potentially Neo4j if relationships between users/businesses were needed (though not explicitly required here). The query involves filtering businesses by city and category, finding active check-ins, retrieving photos with specific visual content (beer/bar counters), and extracting review sentences about 'lively atmosphere'. Difficulty is hard due to cross-database coordination and semantic search requirements.",
+      "natural_question": "In Philadelphia, find bars with active check-ins and photos of beer or bar counters; return check-in times and review sentences mentioning lively atmosphere, plus photo counts.",
+      "difficulty": "hard",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Philadelphia"
+              },
+              "categories": {
+                "like": "%Bars%"
+              }
+            }
+          },
+          "result_var": "philly_bars",
+          "description": {
+            "native": "Identify all businesses in Philadelphia categorized as bars.",
+            "example_query": "SELECT business_id, name FROM business WHERE city = 'Philadelphia' AND categories LIKE '%Bars%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "checkin"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "philly_bars.business_id"
+              }
+            }
+          },
+          "result_var": "active_checkins",
+          "description": {
+            "native": "Retrieve check-in records for the identified Philadelphia bars to confirm activity.",
+            "example_query": "SELECT business_id, date FROM checkin WHERE business_id IN (SELECT business_id FROM business WHERE city = 'Philadelphia' AND categories LIKE '%Bars%');"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "photo"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "philly_bars.business_id"
+              }
+            }
+          },
+          "result_var": "bar_photos",
+          "description": {
+            "native": "Fetch photo metadata for the bars to later analyze content.",
+            "example_query": "SELECT photo_id, business_id, caption FROM photo WHERE business_id IN (SELECT business_id FROM business WHERE city = 'Philadelphia' AND categories LIKE '%Bars%');"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "photos"
+            ],
+            "filter_condition": {
+              "vector_search": {
+                "query_text": "beer OR bar counter"
+              }
+            }
+          },
+          "result_var": "relevant_photo_ids",
+          "description": {
+            "native": "Use Milvus vector search on photo embeddings to find images depicting beer or bar counters.",
+            "example_query": "Perform vector similarity search in Milvus collection 'photo_vector' using text query 'beer or bar counter' to get relevant photo IDs."
+          }
+        },
+        {
+          "step": 5,
+          "parameters": {
+            "ms_names": [
+              "review"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "philly_bars.business_id"
+              }
+            }
+          },
+          "result_var": "bar_reviews",
+          "description": {
+            "native": "Get reviews for the Philadelphia bars to extract relevant sentences.",
+            "example_query": "SELECT review_id, business_id, text FROM review WHERE business_id IN (SELECT business_id FROM business WHERE city = 'Philadelphia' AND categories LIKE '%Bars%');"
+          }
+        },
+        {
+          "step": 6,
+          "parameters": {
+            "ms_names": [
+              "reviews"
+            ],
+            "filter_condition": {
+              "vector_search": {
+                "query_text": "lively atmosphere"
+              }
+            }
+          },
+          "result_var": "lively_review_sentences",
+          "description": {
+            "native": "Use Milvus vector search on review text embeddings to find sentences mentioning 'lively atmosphere'.",
+            "example_query": "Perform vector similarity search in Milvus collection 'reviews' using text query 'lively atmosphere' to retrieve relevant review sentence embeddings and map back to original sentences."
+          }
+        },
+        {
+          "step": 7,
+          "parameters": {},
+          "result_var": "final_result",
+          "description": {
+            "native": "Combine all results: match bars with active check-ins, filter photos by content relevance, count photos per bar, and associate with lively atmosphere review sentences.",
+            "example_query": "Join philly_bars, active_checkins, filtered bar_photos (intersected with relevant_photo_ids), and lively_review_sentences to produce final output with check-in times, review sentences, and photo counts per bar."
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport pandas as pd\nfrom pymilvus import connections, Collection\nimport re\nimport ast\nfrom datetime import datetime\n\ndef connect_sqlite(db_name):\n    path_map = {\n        \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n        \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n        \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n        \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n        \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n        \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n    }\n    return sqlite3.connect(path_map[db_name])\n\n# Connect to Milvus\nconnections.connect(host='localhost', port='19530')\n\n# Step 1: Get Philadelphia bars\nconn_business = connect_sqlite('business')\nphilly_bars_query = \"\"\"\nSELECT business_id, name \nFROM business \nWHERE city = 'Philadelphia' AND categories LIKE '%Bars%'\n\"\"\"\nphilly_bars = pd.read_sql_query(philly_bars_query, conn_business)\nconn_business.close()\n\nif philly_bars.empty:\n    print(\"No bars found in Philadelphia.\")\n    exit()\n\nbar_ids = tuple(philly_bars['business_id'].tolist())\n\n# Step 2: Get active check-ins\nconn_checkin = connect_sqlite('checkin')\nif len(bar_ids) == 1:\n    checkin_query = f\"SELECT business_id, date FROM checkin WHERE business_id = '{bar_ids[0]}'\"\nelse:\n    checkin_query = f\"SELECT business_id, date FROM checkin WHERE business_id IN {bar_ids}\"\n\nactive_checkins = pd.read_sql_query(checkin_query, conn_checkin)\nconn_checkin.close()\n\n# Parse check-in dates (they are stored as comma-separated strings)\ncheckin_records = []\nfor _, row in active_checkins.iterrows():\n    dates = row['date'].split(',')\n    for d in dates:\n        checkin_records.append({\n            'business_id': row['business_id'],\n            'checkin_time': d.strip()\n        })\n\ncheckin_df = pd.DataFrame(checkin_records)\n\n# Step 3: Get photos for these bars\nconn_photo = connect_sqlite('photo')\nif len(bar_ids) == 1:\n    photo_query = f\"SELECT photo_id, business_id FROM photo WHERE business_id = '{bar_ids[0]}'\"\nelse:\n    photo_query = f\"SELECT photo_id, business_id FROM photo WHERE business_id IN {bar_ids}\"\n\nbar_photos = pd.read_sql_query(photo_query, conn_photo)\nconn_photo.close()\n\n# Step 4: Vector search for photos with beer or bar counter\nphoto_collection = Collection('photo_vector')\nphoto_collection.load()\n\n# Assuming we have a function to convert text to embedding\n# For demo, we'll simulate by assuming we can search with text\n# In practice, you'd need an embedding model\nfrom sentence_transformers import SentenceTransformer\nmodel = SentenceTransformer('all-MiniLM-L6-v2')\n\nquery_embedding = model.encode([\"beer or bar counter\"])[0].tolist()\n\nsearch_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\nresults = photo_collection.search(\n    data=[query_embedding],\n    anns_field=\"embedding\",\n    param=search_params,\n    limit=100,\n    expr=None\n)\n\n# Extract photo_ids from results (assuming metadata includes photo_id)\nrelevant_photo_ids = set()\nfor hits in results:\n    for hit in hits:\n        # This assumes the entity has a 'photo_id' field\n        # Actual implementation depends on how you stored metadata in Milvus\n        relevant_photo_ids.add(hit.id)  # or hit.entity.get('photo_id')\n\n# For this example, assume we can map hit.id to photo_id directly\n# In real scenario, you'd store photo_id as a field in Milvus collection\n\n# Filter bar_photos to only include relevant ones\nif relevant_photo_ids:\n    relevant_bar_photos = bar_photos[bar_photos['photo_id'].isin(relevant_photo_ids)]\nelse:\n    relevant_bar_photos = pd.DataFrame(columns=bar_photos.columns)\n\n# Count photos per business\nphoto_counts = relevant_bar_photos.groupby('business_id').size().reset_index(name='photo_count')\n\n# Step 5: Get reviews for bars\nconn_review = connect_sqlite('review')\nif len(bar_ids) == 1:\n    review_query = f\"SELECT review_id, business_id, text FROM review WHERE business_id = '{bar_ids[0]}'\"\nelse:\n    review_query = f\"SELECT review_id, business_id, text FROM review WHERE business_id IN {bar_ids}\"\n\nbar_reviews = pd.read_sql_query(review_query, conn_review)\nconn_review.close()\n\n# Step 6: Vector search for 'lively atmosphere' in reviews\nreview_collection = Collection('reviews')\nreview_collection.load()\n\nlively_query_embedding = model.encode([\"lively atmosphere\"])[0].tolist()\n\nlively_results = review_collection.search(\n    data=[lively_query_embedding],\n    anns_field=\"embedding\",\n    param=search_params,\n    limit=50,\n    expr=None\n)\n\n# Extract review_ids or sentences\nlively_sentences = []\nfor hits in lively_results:\n    for hit in hits:\n        # Again, depends on how metadata is stored\n        # Assume we can get the actual sentence text\n        # In practice, you might need to join back with SQLite\n        lively_sentences.append({\n            'review_id': hit.id,  # or appropriate field\n            'sentence': \"Sample lively atmosphere sentence\"  # placeholder\n        })\n\n# For demonstration, we'll do simple text matching as fallback\nlively_review_texts = []\nfor _, row in bar_reviews.iterrows():\n    sentences = re.split(r'[.!?]+', row['text'])\n    for sent in sentences:\n        if 'lively' in sent.lower() and 'atmosphere' in sent.lower():\n            lively_review_texts.append({\n                'business_id': row['business_id'],\n                'sentence': sent.strip()\n            })\n\nlively_df = pd.DataFrame(lively_review_texts)\n\n# Step 7: Combine results\n# Start with bars that have both check-ins and relevant photos\nbars_with_activity = pd.merge(\n    philly_bars,\n    checkin_df,\n    on='business_id',\n    how='inner'\n)\n\nif not photo_counts.empty:\n    bars_with_activity = pd.merge(\n        bars_with_activity,\n        photo_counts,\n        on='business_id',\n        how='left'\n    ).fillna(0)\nelse:\n    bars_with_activity['photo_count'] = 0\n\n# Add lively atmosphere sentences\nfinal_result = pd.merge(\n    bars_with_activity,\n    lively_df,\n    on='business_id',\n    how='left'\n)\n\n# Select required columns\noutput = final_result[[\n    'business_id', \n    'name', \n    'checkin_time', \n    'sentence', \n    'photo_count'\n]].drop_duplicates()\n\nprint(\"Results:\")\nprint(output.to_string(index=False))\n\n# Clean up\nphoto_collection.release()\nreview_collection.release()"
+    }
+  },
+{
+    "index": 325,
+    "question": "In Philadelphia food businesses, find photos with label food and caption containing 'spicy', return business name, rating, and review date.",
+    "success": true,
+    "result": {
+      "analysis": "This query involves multiple data sources: SQLite for business and review metadata, Milvus for photo vector search (with label 'food' and caption containing 'spicy'), and cross-referencing between them. The difficulty is medium because it requires filtering businesses by city, joining with photos that meet specific criteria, and retrieving associated reviews. Query types include SQL for structured filtering and joins, and vector search in Milvus to find relevant photos based on captions and labels.",
+      "natural_question": "In Philadelphia food businesses, find photos with label food and caption containing 'spicy', return business name, rating, and review date.",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Philadelphia"
+              },
+              "categories": {
+                "like": "%Food%"
+              }
+            }
+          },
+          "result_var": "philly_food_businesses",
+          "description": {
+            "narrative": "Retrieve all food-related businesses located in Philadelphia from the business SQLite table.",
+            "example_query": "SELECT business_id, name FROM business WHERE city = 'Philadelphia' AND categories LIKE '%Food%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "photo"
+            ],
+            "filter_condition": {
+              "label": {
+                "eq": "food"
+              },
+              "caption": {
+                "like": "%spicy%"
+              }
+            }
+          },
+          "result_var": "spicy_food_photos",
+          "description": {
+            "narrative": "Find photos labeled as 'food' and with captions containing 'spicy' using a vector similarity or metadata filter in Milvus. Since Milvus stores vector embeddings, we assume caption and label metadata are stored alongside vectors for filtering.",
+            "example_query": "Search in Milvus collection 'photo_vector' with expr=\"label == 'food' and caption like '%spicy%'\" to get photo_id and business_id."
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "review"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "from previous step"
+              }
+            }
+          },
+          "result_var": "reviews_for_businesses",
+          "description": {
+            "narrative": "Fetch reviews for the businesses identified in the previous steps to get rating and date.",
+            "example_query": "SELECT business_id, date, stars FROM review WHERE business_id IN (...);"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "join_results"
+            ],
+            "filter_condition": {}
+          },
+          "result_var": "final_result",
+          "description": {
+            "narrative": "Join business names from step 1, ratings and dates from step 3, ensuring alignment via business_id.",
+            "example_query": "Combine results in Python: match business_id across datasets and output business name, rating (stars), and review date."
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport pandas as pd\nfrom pymilvus import connections, Collection\n\n# Database paths\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\"\n}\n\nmilvus_config = {\n    'collections': {\n        'photos': 'photo_vector'\n    },\n    'host': 'localhost',\n    'port': '19530'\n}\n\n# Step 1: Get Philadelphia food businesses\nconn_business = sqlite3.connect(sqlite_paths['business'])\nphilly_food_businesses = pd.read_sql(\"\"\"\n    SELECT business_id, name \n    FROM business \n    WHERE city = 'Philadelphia' AND categories LIKE '%Food%'\n\"\"\", conn_business)\nconn_business.close()\n\nif philly_food_businesses.empty:\n    print('No food businesses found in Philadelphia.')\nelse:\n    # Step 2: Connect to Milvus and search for spicy food photos\n    connections.connect(host=milvus_config['host'], port=milvus_config['port'])\n    photo_collection = Collection(milvus_config['collections']['photos'])\n    photo_collection.load()\n\n    # Use expression-based filtering if metadata is stored\n    expr = \"label == \\\"food\\\" and caption like \\\"%spicy%\\\"\"\n    spicy_photos_results = photo_collection.query(\n        expr=expr,\n        output_fields=[\"photo_id\", \"business_id\"]\n    )\n\n    photo_collection.release()\n    connections.disconnect(alias='default')\n\n    if not spicy_photos_results:\n        print('No spicy food photos found.')\n    else:\n        spicy_photos_df = pd.DataFrame(spicy_photos_results)\n        # Filter only businesses in Philly food list\n        philly_business_ids = set(philly_food_businesses['business_id'])\n        spicy_photos_df = spicy_photos_df[\n            spicy_photos_df['business_id'].isin(philly_business_ids)\n        ]\n\n        if spicy_photos_df.empty:\n            print('No matching photos for Philadelphia food businesses.')\n        else:\n            # Step 3: Get reviews for these businesses\n            target_business_ids = tuple(spicy_photos_df['business_id'].unique())\n            conn_review = sqlite3.connect(sqlite_paths['review'])\n            reviews_df = pd.read_sql(f\"\"\"\n                SELECT business_id, date, stars \n                FROM review \n                WHERE business_id IN ({','.join(['?' for _ in target_business_ids])})\n            \"\"\", conn_review, params=target_business_ids)\n            conn_review.close()\n\n            # Step 4: Merge all data\n            result = philly_food_businesses.merge(reviews_df, on='business_id', how='inner')\n            result = result[['name', 'stars', 'date']].rename(columns={\n                'name': 'business_name',\n                'stars': 'rating'\n            })\n\n            print(result.to_dict(orient='records'))"
+    }
+  },
+{
+    "index": 326,
+    "question": "In Tampa sandwiches shops, find photos with label inside and caption mentioning toasted; list review stars and addresses.",
+    "success": true,
+    "result": {
+      "analysis": "This query involves multiple data sources: SQLite for business and review data, Milvus for photo vector search with label and caption conditions, and potentially joining results across databases. The difficulty is medium because it requires filtering businesses by city and category, then matching photos with specific textual conditions, and finally joining with reviews and addresses.",
+      "natural_question": "In Tampa sandwich shops, find photos with label 'inside' and caption mentioning 'toasted'; list review stars and addresses.",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Tampa"
+              },
+              "categories": {
+                "contains": "Sandwiches"
+              }
+            }
+          },
+          "result_var": "tampa_sandwich_businesses",
+          "description": {
+            "narrative": "First, identify all businesses in Tampa that are categorized as sandwich shops. This requires querying the business table with filters on city and categories fields.",
+            "example_query": "SELECT business_id, address FROM business WHERE city = 'Tampa' AND categories LIKE '%Sandwiches%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "photo"
+            ],
+            "filter_condition": {
+              "label": {
+                "eq": "inside"
+              },
+              "caption": {
+                "contains": "toasted"
+              }
+            }
+          },
+          "result_var": "filtered_photos",
+          "description": {
+            "narrative": "Find photos that have label 'inside' and caption containing 'toasted'. Since photos are stored in SQLite with metadata, we can filter directly using SQL conditions on the photo table.",
+            "example_query": "SELECT photo_id, business_id FROM photo WHERE label = 'inside' AND caption LIKE '%toasted%';"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "review"
+            ],
+            "filter_condition": {}
+          },
+          "result_var": "business_reviews",
+          "description": {
+            "narrative": "Get review stars for the businesses that match both the Tampa sandwich shop criteria and have the specified photos. Join the filtered businesses with reviews table to get star ratings.",
+            "example_query": "SELECT r.business_id, r.stars FROM review r WHERE r.business_id IN (SELECT DISTINCT p.business_id FROM photo p WHERE p.label = 'inside' AND p.caption LIKE '%toasted%' AND p.business_id IN (SELECT business_id FROM business WHERE city = 'Tampa' AND categories LIKE '%Sandwiches%'));"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "business",
+              "photo",
+              "review"
+            ],
+            "filter_condition": {}
+          },
+          "result_var": "final_results",
+          "description": {
+            "narrative": "Combine all results to produce the final output with review stars and addresses for Tampa sandwich shops that have photos with label 'inside' and caption mentioning 'toasted'.",
+            "example_query": "SELECT DISTINCT b.address, r.stars FROM business b JOIN photo p ON b.business_id = p.business_id JOIN review r ON b.business_id = r.business_id WHERE b.city = 'Tampa' AND b.categories LIKE '%Sandwiches%' AND p.label = 'inside' AND p.caption LIKE '%toasted%';"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport os\nfrom typing import List, Dict, Any\n\ndef execute_query(db_path: str, query: str, params: tuple = ()) -> List[Dict[str, Any]]:\n    \"\"\"Execute a query on SQLite database and return results as list of dictionaries.\"\"\"\n    conn = sqlite3.connect(db_path)\n    conn.row_factory = sqlite3.Row\n    cursor = conn.cursor()\n    try:\n        cursor.execute(query, params)\n        results = [dict(row) for row in cursor.fetchall()]\n        return results\n    except Exception as e:\n        print(f\"Error executing query: {e}\")\n        return []\n    finally:\n        conn.close()\n\ndef main():\n    # Database paths\n    sqlite_paths = {\n        \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n        \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n        \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n        \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n        \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n        \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n    }\n    \n    # Step 1: Get Tampa sandwich businesses\n    business_query = \"\"\"\n    SELECT business_id, address \n    FROM business \n    WHERE city = ? AND categories LIKE ?\n    \"\"\"\n    tampa_sandwich_businesses = execute_query(\n        sqlite_paths[\"business\"], \n        business_query, \n        (\"Tampa\", \"%Sandwiches%\")\n    )\n    \n    if not tampa_sandwich_businesses:\n        print(\"No Tampa sandwich shops found.\")\n        return []\n    \n    business_ids = [biz[\"business_id\"] for biz in tampa_sandwich_businesses]\n    \n    # Step 2: Find photos with label 'inside' and caption containing 'toasted'\n    # Create placeholders for IN clause\n    placeholders = ','.join(['?' for _ in business_ids])\n    photo_query = f\"\"\"\n    SELECT photo_id, business_id \n    FROM photo \n    WHERE label = ? AND caption LIKE ? AND business_id IN ({placeholders})\n    \"\"\"\n    photo_params = [\"inside\", \"%toasted%\"] + business_ids\n    filtered_photos = execute_query(sqlite_paths[\"photo\"], photo_query, tuple(photo_params))\n    \n    if not filtered_photos:\n        print(\"No photos found with label 'inside' and caption containing 'toasted'.\")\n        return []\n    \n    photo_business_ids = list(set([photo[\"business_id\"] for photo in filtered_photos]))\n    \n    # Step 3: Get reviews for these businesses\n    review_placeholders = ','.join(['?' for _ in photo_business_ids])\n    review_query = f\"\"\"\n    SELECT business_id, stars \n    FROM review \n    WHERE business_id IN ({review_placeholders})\n    \"\"\"\n    business_reviews = execute_query(sqlite_paths[\"review\"], review_query, tuple(photo_business_ids))\n    \n    if not business_reviews:\n        print(\"No reviews found for matching businesses.\")\n        return []\n    \n    # Step 4: Combine results - get addresses and stars\n    # Create a mapping from business_id to address\n    business_address_map = {biz[\"business_id\"]: biz[\"address\"] for biz in tampa_sandwich_businesses}\n    \n    # Create final results\n    final_results = []\n    for review in business_reviews:\n        business_id = review[\"business_id\"]\n        if business_id in business_address_map:\n            final_results.append({\n                \"address\": business_address_map[business_id],\n                \"stars\": review[\"stars\"]\n            })\n    \n    # Remove duplicates if any\n    unique_results = []\n    seen = set()\n    for result in final_results:\n        key = (result[\"address\"], result[\"stars\"])\n        if key not in seen:\n            seen.add(key)\n            unique_results.append(result)\n    \n    return unique_results\n\nif __name__ == \"__main__\":\n    results = main()\n    print(f\"Found {len(results)} results:\")\n    for result in results:\n        print(f\"Address: {result['address']}, Stars: {result['stars']}\")"
+    }
+  },
+{
+    "index": 327,
+    "question": "In Nashville bars, find photos with label drink and caption containing cocktail; return addresses, review dates and photo counts.",
+    "success": true,
+    "result": {
+      "analysis": "This query involves multiple data sources: SQLite for business and photo metadata, Milvus for semantic search on photo captions (vector similarity or keyword filtering), and potentially joining with review data. The task requires filtering businesses by city and category (Nashville bars), then finding photos labeled 'drink' with captions containing 'cocktail', and finally aggregating addresses, associated review dates, and photo counts. This is a medium-difficulty multi-step query involving SQL filtering, possible vector/text search, and joins.",
+      "natural_question": "In Nashville bars, find photos with label drink and caption containing cocktail; return addresses, review dates and photo counts.",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Nashville"
+              },
+              "categories": {
+                "contains": "Bars"
+              }
+            }
+          },
+          "result_var": "nashville_bars",
+          "description": {
+            "narrative": "Retrieve all businesses in Nashville that are categorized as bars. Extract their business_id and address information.",
+            "example_query": "SELECT business_id, address, city, state, postal_code FROM business WHERE city = 'Nashville' AND categories LIKE '%Bars%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "photo"
+            ],
+            "filter_condition": {
+              "label": {
+                "eq": "drink"
+              }
+            }
+          },
+          "result_var": "drink_photos",
+          "description": {
+            "narrative": "Fetch all photos with label 'drink' from the photo table, including their business_id and photo_id.",
+            "example_query": "SELECT photo_id, business_id, caption FROM photo WHERE label = 'drink';"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "photos"
+            ],
+            "filter_condition": {
+              "caption_keywords": {
+                "contains": "cocktail"
+              }
+            }
+          },
+          "result_var": "cocktail_photo_ids",
+          "description": {
+            "narrative": "Use Milvus to find photo IDs where the caption contains the word 'cocktail'. Since Milvus stores vector embeddings, we assume there's a way to filter by keyword presence (or use a hybrid search). Return matching photo_id list.",
+            "example_query": "Perform a hybrid/vector search in Milvus collection 'photo_vector' for captions containing 'cocktail'."
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "review"
+            ],
+            "filter_condition": {}
+          },
+          "result_var": "reviews_for_businesses",
+          "description": {
+            "narrative": "Join the filtered businesses with reviews to get review dates associated with each business.",
+            "example_query": "SELECT business_id, date FROM review WHERE business_id IN (...);"
+          }
+        },
+        {
+          "step": 5,
+          "parameters": {},
+          "result_var": "final_result",
+          "description": {
+            "narrative": "Combine results: match Nashville bars with drink-labeled photos that have 'cocktail' in caption, count photos per business, and attach review dates and addresses.",
+            "example_query": "Aggregate and join all intermediate results to produce final output with address, review dates, and photo counts."
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport pandas as pd\nfrom pymilvus import connections, Collection\n\n# Database paths\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\"\n}\n\n# Connect to Milvus\nconnections.connect(host='localhost', port='19530')\nphoto_collection = Collection('photo_vector')\n\ntry:\n    # Step 1: Get Nashville bars\n    conn_business = sqlite3.connect(sqlite_paths['business'])\n    nashville_bars_query = \"\"\"\n    SELECT business_id, address, city, state, postal_code \n    FROM business \n    WHERE city = 'Nashville' AND categories LIKE '%Bars%'\n    \"\"\"\n    nashville_bars = pd.read_sql_query(nashville_bars_query, conn_business)\n    conn_business.close()\n    \n    if nashville_bars.empty:\n        print(\"No Nashville bars found.\")\n        final_result = pd.DataFrame()\n    else:\n        bar_ids = tuple(nashville_bars['business_id'].tolist())\n        \n        # Step 2: Get drink-labeled photos for these bars\n        conn_photo = sqlite3.connect(sqlite_paths['photo'])\n        drink_photos_query = f\"\"\"\n        SELECT photo_id, business_id, caption \n        FROM photo \n        WHERE label = 'drink' AND business_id IN ({','.join(['?' for _ in bar_ids])})\n        \"\"\"\n        drink_photos = pd.read_sql_query(drink_photos_query, conn_photo, params=bar_ids)\n        conn_photo.close()\n        \n        if drink_photos.empty:\n            print(\"No drink-labeled photos found for Nashville bars.\")\n            final_result = pd.DataFrame()\n        else:\n            # Step 3: Filter photos with 'cocktail' in caption using Milvus\n            # Note: In practice, Milvus doesn't support direct keyword filtering unless hybrid search is set up.\n            # As a workaround, we'll filter using pandas since we already have captions\n            cocktail_photos = drink_photos[drink_photos['caption'].str.contains('cocktail', case=False, na=False)]\n            \n            if cocktail_photos.empty:\n                print(\"No photos with 'cocktail' in caption found.\")\n                final_result = pd.DataFrame()\n            else:\n                # Get unique business_ids with cocktail photos\n                cocktail_business_ids = tuple(cocktail_photos['business_id'].unique())\n                \n                # Step 4: Get reviews for these businesses\n                conn_review = sqlite3.connect(sqlite_paths['review'])\n                reviews_query = f\"\"\"\n                SELECT business_id, date \n                FROM review \n                WHERE business_id IN ({','.join(['?' for _ in cocktail_business_ids])})\n                \"\"\"\n                reviews = pd.read_sql_query(reviews_query, conn_review, params=cocktail_business_ids)\n                conn_review.close()\n                \n                # Step 5: Aggregate photo counts\n                photo_counts = cocktail_photos.groupby('business_id').size().reset_index(name='photo_count')\n                \n                # Merge all data\n                result = nashville_bars[nashville_bars['business_id'].isin(cocktail_business_ids)].copy()\n                result = result.merge(photo_counts, on='business_id', how='left')\n                \n                # Add review dates (may be multiple per business)\n                result_with_reviews = result.merge(reviews, on='business_id', how='left')\n                \n                # Select required columns\n                final_result = result_with_reviews[['address', 'date', 'photo_count']].rename(columns={'date': 'review_date'})\n\n    # Output result\n    if not final_result.empty:\n        print(final_result.to_string(index=False))\n    else:\n        print(\"No results found matching all criteria.\")\n\nexcept Exception as e:\n    print(f\"An error occurred: {e}\")\nfinally:\n    connections.disconnect('default')"
+    }
+  },
+{
+    "index": 328,
+    "question": "In New Orleans seafood restaurants, find photos labeled food with caption containing oyster; return ratings, review snippets and photo counts.",
+    "success": true,
+    "result": {
+      "analysis": "This query involves multiple data sources: we need to identify seafood restaurants in New Orleans from the SQLite 'business' table, find their photos labeled as 'food' with captions containing 'oyster' from the 'photo' table (and potentially Milvus for caption semantics), then retrieve associated reviews (ratings and snippets) and count photos per business. The query is of medium difficulty due to multi-step joins across tables and potential use of vector search if semantic matching is needed, though keyword matching may suffice.",
+      "natural_question": "In New Orleans seafood restaurants, find photos labeled food with caption containing oyster; return ratings, review snippets and photo counts.",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "New Orleans"
+              },
+              "categories": {
+                "contains": "Seafood"
+              }
+            }
+          },
+          "result_var": "seafood_restaurants",
+          "description": {
+            "narrative": "Identify all businesses in New Orleans that are categorized as seafood restaurants.",
+            "example_query": "SELECT business_id, name FROM business WHERE city = 'New Orleans' AND categories LIKE '%Seafood%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "photo"
+            ],
+            "filter_condition": {
+              "label": {
+                "eq": "food"
+              },
+              "caption": {
+                "contains": "oyster"
+              }
+            }
+          },
+          "result_var": "oyster_food_photos",
+          "description": {
+            "narrative": "Find all photos labeled as 'food' with captions containing the word 'oyster'.",
+            "example_query": "SELECT photo_id, business_id, caption FROM photo WHERE label = 'food' AND caption LIKE '%oyster%';"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "review"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "seafood_restaurants.business_id"
+              }
+            }
+          },
+          "result_var": "reviews_for_restaurants",
+          "description": {
+            "narrative": "Retrieve reviews (including star ratings and text snippets) for the identified seafood restaurants.",
+            "example_query": "SELECT business_id, stars, text FROM review WHERE business_id IN (SELECT business_id FROM business WHERE city = 'New Orleans' AND categories LIKE '%Seafood%');"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "oyster_food_photos",
+              "reviews_for_restaurants",
+              "seafood_restaurants"
+            ],
+            "filter_condition": {}
+          },
+          "result_var": "final_result",
+          "description": {
+            "narrative": "Join the seafood restaurants with matching oyster food photos and their reviews, then aggregate photo counts per restaurant along with ratings and review snippets.",
+            "example_query": "SELECT r.business_id, b.name, r.stars, r.text AS review_snippet, COUNT(p.photo_id) AS photo_count FROM business b JOIN photo p ON b.business_id = p.business_id JOIN review r ON b.business_id = r.business_id WHERE b.city = 'New Orleans' AND b.categories LIKE '%Seafood%' AND p.label = 'food' AND p.caption LIKE '%oyster%' GROUP BY r.business_id, b.name, r.stars, r.text;"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport pandas as pd\nfrom collections import defaultdict\n\n# Database paths\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\n\ndef get_seafood_restaurants():\n    conn = sqlite3.connect(sqlite_paths['business'])\n    query = \"\"\"\n    SELECT business_id, name \n    FROM business \n    WHERE city = 'New Orleans' \n      AND categories LIKE '%Seafood%'\n    \"\"\"\n    df = pd.read_sql_query(query, conn)\n    conn.close()\n    return df\n\n\ndef get_oyster_food_photos():\n    conn = sqlite3.connect(sqlite_paths['photo'])\n    query = \"\"\"\n    SELECT photo_id, business_id, caption \n    FROM photo \n    WHERE label = 'food' \n      AND caption LIKE '%oyster%'\n    \"\"\"\n    df = pd.read_sql_query(query, conn)\n    conn.close()\n    return df\n\n\ndef get_reviews_for_businesses(business_ids):\n    if not business_ids:\n        return pd.DataFrame()\n    conn = sqlite3.connect(sqlite_paths['review'])\n    placeholders = ','.join(['?' for _ in business_ids])\n    query = f\"SELECT business_id, stars, text FROM review WHERE business_id IN ({placeholders})\"\n    df = pd.read_sql_query(query, conn, params=business_ids)\n    conn.close()\n    return df\n\n\ndef main():\n    try:\n        # Step 1: Get seafood restaurants in New Orleans\n        seafood_df = get_seafood_restaurants()\n        if seafood_df.empty:\n            print(\"No seafood restaurants found in New Orleans.\")\n            return\n        \n        business_ids = seafood_df['business_id'].tolist()\n        \n        # Step 2: Get oyster-related food photos\n        photo_df = get_oyster_food_photos()\n        if photo_df.empty:\n            print(\"No food photos with 'oyster' caption found.\")\n            return\n        \n        # Filter photos to only those from seafood restaurants\n        photo_df = photo_df[photo_df['business_id'].isin(business_ids)]\n        if photo_df.empty:\n            print(\"No matching photos for seafood restaurants.\")\n            return\n        \n        # Step 3: Get reviews for these businesses\n        review_df = get_reviews_for_businesses(business_ids)\n        if review_df.empty:\n            print(\"No reviews found for these businesses.\")\n            return\n        \n        # Step 4: Merge and aggregate\n        merged = pd.merge(seafood_df, photo_df, on='business_id', how='inner')\n        merged = pd.merge(merged, review_df, on='business_id', how='inner')\n        \n        # Group by business and collect results\n        result = merged.groupby(['business_id', 'name', 'stars', 'text']).size().reset_index(name='photo_count')\n        result.rename(columns={'text': 'review_snippet'}, inplace=True)\n        \n        # Display results\n        print(result[['name', 'stars', 'review_snippet', 'photo_count']].to_string(index=False))\n        \n    except Exception as e:\n        print(f\"An error occurred: {e}\")\n\nif __name__ == \"__main__\":\n    main()"
+    }
+  },
+{
+    "index": 329,
+    "question": "In Edmonton Chinese restaurants, find photos with caption containing dumpling; list labels, business name, review date and rating.",
+    "success": true,
+    "result": {
+      "analysis": "This query involves multiple data sources: we need to identify Chinese restaurants in Edmonton from the SQLite 'business' table, find their photos with captions containing 'dumpling' (likely stored in the 'photo' table), and then retrieve associated labels, business names, review dates, and ratings. The photo captions may be stored as text that can be filtered via SQL, or may require vector similarity search if exact matching is not feasible. However, since the request specifies 'containing dumpling', a direct SQL LIKE filter is appropriate. Review date and rating come from the 'review' table linked by business_id. This is a medium-difficulty multi-step join across relational tables.",
+      "natural_question": "In Edmonton Chinese restaurants, find photos with caption containing dumpling; list labels, business name, review date and rating.",
+      "difficulty": "medium",
+      "query_types": [
+        "sql"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business",
+              "photo",
+              "review"
+            ],
+            "filter_condition": {
+              "business.city": {
+                "eq": "Edmonton"
+              },
+              "business.categories": {
+                "like": "%Chinese%"
+              },
+              "photo.caption": {
+                "like": "%dumpling%"
+              }
+            }
+          },
+          "result_var": "photo_review_data",
+          "description": {
+            "narrative": "Join the business, photo, and review tables to find Chinese restaurants in Edmonton that have photos with captions containing 'dumpling'. Retrieve the photo labels (caption or label field), business name, review date, and star rating.",
+            "example_query": "SELECT p.label, b.name AS business_name, r.date AS review_date, r.stars AS rating FROM business b JOIN photo p ON b.business_id = p.business_id JOIN review r ON b.business_id = r.business_id WHERE b.city = 'Edmonton' AND b.categories LIKE '%Chinese%' AND p.caption LIKE '%dumpling%';"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport os\n\n# Database paths\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\"\n}\n\n# Ensure all databases exist\nfor db_name, path in sqlite_paths.items():\n    if not os.path.exists(path):\n        raise FileNotFoundError(f\"Database file not found: {path}\")\n\n# Connect to each database\nconn_business = sqlite3.connect(sqlite_paths[\"business\"])\nconn_photo = sqlite3.connect(sqlite_paths[\"photo\"])\nconn_review = sqlite3.connect(sqlite_paths[\"review\"])\n\n# Enable foreign key support (if needed)\nconn_business.execute(\"PRAGMA foreign_keys = ON;\")\nconn_photo.execute(\"PRAGMA foreign_keys = ON;\")\nconn_review.execute(\"PRAGMA foreign_keys = ON;\")\n\ntry:\n    # Since SQLite doesn't support cross-database joins directly,\n    # we'll extract relevant data and join in Python\n\n    # Step 1: Get Chinese restaurants in Edmonton\n    cursor_biz = conn_business.cursor()\n    cursor_biz.execute('''\n        SELECT business_id, name \n        FROM business \n        WHERE city = ? AND categories LIKE ?\n    ''', ('Edmonton', '%Chinese%'))\n    edmonton_chinese = {row[0]: row[1] for row in cursor_biz.fetchall()}\n\n    if not edmonton_chinese:\n        print(\"No Chinese restaurants found in Edmonton.\")\n    else:\n        # Step 2: Get photos with 'dumpling' in caption for these businesses\n        business_ids = list(edmonton_chinese.keys())\n        placeholders = ','.join(['?' for _ in business_ids])\n        cursor_photo = conn_photo.cursor()\n        cursor_photo.execute(f'''\n            SELECT business_id, label, caption \n            FROM photo \n            WHERE business_id IN ({placeholders}) AND caption LIKE ?\n        ''', business_ids + ['%dumpling%'])\n        photo_data = cursor_photo.fetchall()\n\n        if not photo_data:\n            print(\"No photos with 'dumpling' in caption found for Edmonton Chinese restaurants.\")\n        else:\n            # Step 3: For each business with matching photos, get reviews\n            results = []\n            cursor_review = conn_review.cursor()\n            for biz_id, label, caption in photo_data:\n                cursor_review.execute('''\n                    SELECT date, stars \n                    FROM review \n                    WHERE business_id = ?\n                ''', (biz_id,))\n                reviews = cursor_review.fetchall()\n                business_name = edmonton_chinese[biz_id]\n                for review_date, rating in reviews:\n                    results.append({\n                        'label': label,\n                        'business_name': business_name,\n                        'review_date': review_date,\n                        'rating': rating\n                    })\n\n            # Output results\n            if results:\n                print(f\"Found {len(results)} matching records:\")\n                for record in results:\n                    print(record)\n            else:\n                print(\"No reviews found for businesses with dumpling photos.\")\n\nfinally:\n    conn_business.close()\n    conn_photo.close()\n    conn_review.close()"
+    }
+  },
+{
+    "index": 330,
+    "question": "In Reno delis, find photos with caption containing sandwich; show label, rating, review date, address and photo counts.",
+    "success": true,
+    "result": {
+      "analysis": "This query involves multiple data sources: SQLite for business and photo metadata, Milvus for semantic search on photo captions (though caption is stored in SQLite), and potentially review data for rating and date. The query requires filtering businesses by city (Reno) and category (delis), then finding photos with 'sandwich' in their caption, and finally enriching results with business details like address, rating, and photo counts. This is a medium-difficulty multi-step query.",
+      "natural_question": "In Reno delis, find photos with caption containing sandwich; show label, rating, review date, address and photo counts.",
+      "difficulty": "medium",
+      "query_types": [
+        "sql"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business",
+              "photo"
+            ],
+            "filter_condition": {
+              "business.city": {
+                "eq": "Reno"
+              },
+              "business.categories": {
+                "contains": "Delis"
+              },
+              "photo.caption": {
+                "contains": "sandwich"
+              }
+            }
+          },
+          "result_var": "sandwich_photos_with_business",
+          "description": {
+            "narrative": "Join the business and photo tables to find photos from delis in Reno that have 'sandwich' in their caption. Extract business_id, photo_id, caption as label, and other relevant fields.",
+            "example_query": "SELECT p.photo_id, p.business_id, p.caption as label, b.name, b.address, b.stars as rating, b.review_count FROM business b JOIN photo p ON b.business_id = p.business_id WHERE b.city = 'Reno' AND b.categories LIKE '%Delis%' AND p.caption LIKE '%sandwich%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "review"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "from_step_1_business_ids"
+              }
+            }
+          },
+          "result_var": "latest_reviews",
+          "description": {
+            "narrative": "For each business found in step 1, get the most recent review date to serve as the review date for the business.",
+            "example_query": "SELECT business_id, MAX(date) as review_date FROM review WHERE business_id IN (/* business_ids from step 1 */) GROUP BY business_id;"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "photo"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "from_step_1_business_ids"
+              }
+            }
+          },
+          "result_var": "photo_counts",
+          "description": {
+            "narrative": "Count total number of photos per business from step 1 to get photo counts.",
+            "example_query": "SELECT business_id, COUNT(*) as photo_count FROM photo WHERE business_id IN (/* business_ids from step 1 */) GROUP BY business_id;"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "combined_results"
+            ],
+            "filter_condition": {}
+          },
+          "result_var": "final_results",
+          "description": {
+            "narrative": "Combine all results from previous steps to produce the final output with label (caption), rating (stars), review date, address, and photo counts.",
+            "example_query": "Combine results from steps 1, 2, and 3 by business_id to create final result set."
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport os\nfrom datetime import datetime\n\ndef execute_query():\n    # Database paths\n    sqlite_paths = {\n        \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n        \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n        \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n        \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n        \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n        \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n    }\n    \n    try:\n        # Connect to databases\n        business_conn = sqlite3.connect(sqlite_paths[\"business\"])\n        photo_conn = sqlite3.connect(sqlite_paths[\"photo\"])\n        review_conn = sqlite3.connect(sqlite_paths[\"review\"])\n        \n        # Enable row factory for easier access\n        business_conn.row_factory = sqlite3.Row\n        photo_conn.row_factory = sqlite3.Row\n        review_conn.row_factory = sqlite3.Row\n        \n        # Step 1: Find photos with sandwich caption from Reno delis\n        query_step1 = '''\n        SELECT p.photo_id, p.business_id, p.caption as label, \n               b.name, b.address, b.stars as rating, b.review_count\n        FROM business b \n        JOIN photo p ON b.business_id = p.business_id \n        WHERE b.city = ? \n        AND b.categories LIKE ? \n        AND p.caption LIKE ?\n        '''\n        \n        cursor1 = business_conn.cursor()\n        cursor1.execute(query_step1, ('Reno', '%Delis%', '%sandwich%'))\n        step1_results = cursor1.fetchall()\n        \n        if not step1_results:\n            print(\"No photos found matching the criteria.\")\n            return []\n        \n        # Extract business IDs\n        business_ids = list(set([row['business_id'] for row in step1_results]))\n        \n        # Step 2: Get latest review date for each business\n        placeholders = ','.join(['?' for _ in business_ids])\n        query_step2 = f'''\n        SELECT business_id, MAX(date) as review_date \n        FROM review \n        WHERE business_id IN ({placeholders})\n        GROUP BY business_id\n        '''\n        \n        cursor2 = review_conn.cursor()\n        cursor2.execute(query_step2, business_ids)\n        review_dates = {row['business_id']: row['review_date'] for row in cursor2.fetchall()}\n        \n        # Step 3: Get photo counts for each business\n        query_step3 = f'''\n        SELECT business_id, COUNT(*) as photo_count \n        FROM photo \n        WHERE business_id IN ({placeholders})\n        GROUP BY business_id\n        '''\n        \n        cursor3 = photo_conn.cursor()\n        cursor3.execute(query_step3, business_ids)\n        photo_counts = {row['business_id']: row['photo_count'] for row in cursor3.fetchall()}\n        \n        # Step 4: Combine results\n        final_results = []\n        for row in step1_results:\n            business_id = row['business_id']\n            result = {\n                'label': row['label'],\n                'rating': row['rating'],\n                'review_date': review_dates.get(business_id, 'N/A'),\n                'address': row['address'],\n                'photo_count': photo_counts.get(business_id, 0)\n            }\n            final_results.append(result)\n        \n        # Print results\n        print(f\"Found {len(final_results)} photos matching criteria:\")\n        for i, result in enumerate(final_results, 1):\n            print(f\"\\nPhoto {i}:\")\n            print(f\"  Label: {result['label']}\")\n            print(f\"  Rating: {result['rating']}\")\n            print(f\"  Review Date: {result['review_date']}\")\n            print(f\"  Address: {result['address']}\")\n            print(f\"  Photo Count: {result['photo_count']}\")\n        \n        return final_results\n        \n    except sqlite3.Error as e:\n        print(f\"Database error: {e}\")\n        return []\n    except Exception as e:\n        print(f\"Error: {e}\")\n        return []\n    finally:\n        # Close connections\n        if 'business_conn' in locals():\n            business_conn.close()\n        if 'photo_conn' in locals():\n            photo_conn.close()\n        if 'review_conn' in locals():\n            review_conn.close()\n\n# Execute the query\nif __name__ == \"__main__\":\n    results = execute_query()\n"
+    }
+  }
+]

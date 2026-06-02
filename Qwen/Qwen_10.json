@@ -1,0 +1,1258 @@
+[
+{
+    "index": 91,
+    "question": "In Tampa, find honest and fairly priced Japanese car repair shops, preferably ones people I know have used.",
+    "success": true,
+    "result": {
+      "analysis": "This query involves multiple aspects: geographic filtering (Tampa), business category (Japanese car repair), sentiment/attribute filtering (honest, fairly priced), and social connection (people I know have used). This requires combining SQL for location and category filtering, vector search for sentiment analysis of reviews/tips, and graph traversal for social connections. The complexity is high due to the multi-database coordination required.",
+      "natural_question": "In Tampa, find honest and fairly priced Japanese car repair shops, preferably ones people I know have used.",
+      "difficulty": "hard",
+      "query_types": [
+        "sql",
+        "vector",
+        "graph"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Tampa"
+              },
+              "categories": {
+                "contains": "Japanese"
+              }
+            }
+          },
+          "result_var": "tampa_japanese_businesses",
+          "description": {
+            "narrative": "First, identify all businesses in Tampa that are categorized as Japanese car repair shops by querying the business table in SQLite.",
+            "example_query": "SELECT business_id, name, address, categories FROM business WHERE city = 'Tampa' AND categories LIKE '%Japanese%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "reviews",
+              "tips"
+            ],
+            "filter_condition": {
+              "sentiment": {
+                "contains": [
+                  "honest",
+                  "fairly priced",
+                  "reasonable",
+                  "trustworthy"
+                ]
+              }
+            }
+          },
+          "result_var": "positive_sentiment_businesses",
+          "description": {
+            "narrative": "Use Milvus vector database to perform semantic search on reviews and tips for businesses identified in step 1, looking for content that expresses honesty and fair pricing sentiments.",
+            "example_query": "Perform vector similarity search in 'reviews' and 'tips' collections using embedding of query 'honest and fairly priced car repair'"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "user",
+              "review"
+            ],
+            "filter_condition": {
+              "connection_type": {
+                "eq": "KNOWS"
+              }
+            }
+          },
+          "result_var": "connected_businesses",
+          "description": {
+            "narrative": "Query the Neo4j graph database to find businesses that have been reviewed by users who are connected to the current user (assuming we have a current user context) through KNOWS relationships.",
+            "example_query": "MATCH (currentUser:User {user_id: 'current_user_id'})-[:KNOWS*1..2]-(friend:User)-[:WROTE]->(review:Review)-[:ABOUT]->(business:Business) WHERE business.business_id IN $business_ids RETURN business.business_id, count(friend) as friend_count"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "combined_results"
+            ],
+            "filter_condition": {}
+          },
+          "result_var": "final_ranked_results",
+          "description": {
+            "narrative": "Combine and rank the results from steps 1-3, prioritizing businesses that appear in all three result sets, then those with positive sentiment, and finally those in Tampa with Japanese car repair categorization.",
+            "example_query": "Merge results based on business_id and apply ranking logic"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport json\nfrom pymilvus import connections, Collection\nfrom neo4j import GraphDatabase\nimport numpy as np\nfrom sentence_transformers import SentenceTransformer\nimport os\n\ndef connect_sqlite(db_path):\n    \"\"\"Connect to SQLite database\"\"\"\n    return sqlite3.connect(db_path)\n\ndef connect_milvus(host='localhost', port='19530'):\n    \"\"\"Connect to Milvus vector database\"\"\"\n    connections.connect(host=host, port=port)\n\ndef connect_neo4j(uri='bolt://localhost:7687', auth=('neo4j', 'password')):\n    \"\"\"Connect to Neo4j graph database\"\"\"\n    return GraphDatabase.driver(uri, auth=auth)\n\ndef get_tampa_japanese_businesses(sqlite_conn):\n    \"\"\"Step 1: Get Japanese car repair businesses in Tampa\"\"\"\n    cursor = sqlite_conn.cursor()\n    query = \"\"\"\n    SELECT business_id, name, address, categories, stars, review_count \n    FROM business \n    WHERE city = ? AND (categories LIKE ? OR categories LIKE ?)\n    \"\"\"\n    cursor.execute(query, ('Tampa', '%Japanese%', '%Auto Repair%'))\n    results = cursor.fetchall()\n    \n    businesses = []\n    for row in results:\n        # Check if it's actually a car repair shop with Japanese focus\n        categories = row[3].lower() if row[3] else ''\n        if ('auto' in categories or 'car' in categories or 'repair' in categories) and ('japanese' in categories):\n            businesses.append({\n                'business_id': row[0],\n                'name': row[1],\n                'address': row[2],\n                'categories': row[3],\n                'stars': row[4],\n                'review_count': row[5]\n            })\n    \n    return businesses\n\ndef semantic_search_positive_reviews(business_ids, model=None):\n    \"\"\"Step 2: Search for positive sentiment in reviews and tips using Milvus\"\"\"\n    if not business_ids:\n        return []\n    \n    # Initialize sentence transformer model\n    if model is None:\n        model = SentenceTransformer('all-MiniLM-L6-v2')\n    \n    # Create search query embedding\n    search_text = \"honest and fairly priced car repair service trustworthy reasonable\"\n    search_embedding = model.encode([search_text])[0].tolist()\n    \n    # Connect to Milvus\n    connect_milvus()\n    \n    positive_business_ids = set()\n    \n    # Search in reviews collection\n    try:\n        reviews_collection = Collection('reviews')\n        reviews_collection.load()\n        \n        search_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\n        results = reviews_collection.search(\n            data=[search_embedding],\n            anns_field=\"embedding\",\n            param=search_params,\n            limit=50,\n            output_fields=[\"business_id\"]\n        )\n        \n        for hits in results:\n            for hit in hits:\n                if hit.entity.get('business_id') in business_ids:\n                    positive_business_ids.add(hit.entity.get('business_id'))\n                    \n    except Exception as e:\n        print(f\"Error searching reviews: {e}\")\n    \n    # Search in tips collection\n    try:\n        tips_collection = Collection('milvus_tip')\n        tips_collection.load()\n        \n        results = tips_collection.search(\n            data=[search_embedding],\n            anns_field=\"embedding\",\n            param=search_params,\n            limit=30,\n            output_fields=[\"business_id\"]\n        )\n        \n        for hits in results:\n            for hit in hits:\n                if hit.entity.get('business_id') in business_ids:\n                    positive_business_ids.add(hit.entity.get('business_id'))\n                    \n    except Exception as e:\n        print(f\"Error searching tips: {e}\")\n    \n    return list(positive_business_ids)\n\ndef get_connected_businesses(neo4j_driver, business_ids, current_user_id=None):\n    \"\"\"Step 3: Find businesses used by people the current user knows\"\"\"\n    if not business_ids or not current_user_id:\n        # If no current user specified, return empty (or could return all with connection count 0)\n        return {}\n    \n    business_id_str = \"'\" + \"','\".join(business_ids) + \"'\"\n    \n    query = f\"\"\"\n    MATCH (currentUser:User {{user_id: $current_user_id}})-[:KNOWS*1..2]-(friend:User)-[:WROTE]->(review:Review)-[:ABOUT]->(business:Business)\n    WHERE business.business_id IN [{business_id_str}]\n    RETURN business.business_id as business_id, count(friend) as friend_count\n    \"\"\"\n    \n    with neo4j_driver.session() as session:\n        result = session.run(query, current_user_id=current_user_id)\n        connected_businesses = {}\n        for record in result:\n            connected_businesses[record['business_id']] = record['friend_count']\n    \n    return connected_businesses\n\ndef main(current_user_id=None):\n    \"\"\"Main function to execute the complete query\"\"\"\n    \n    # Database paths\n    sqlite_paths = {\n        \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n        \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n        \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n        \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n        \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n        \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n    }\n    \n    try:\n        # Step 1: Get Tampa Japanese car repair businesses\n        business_conn = connect_sqlite(sqlite_paths['business'])\n        tampa_businesses = get_tampa_japanese_businesses(business_conn)\n        business_ids = [b['business_id'] for b in tampa_businesses]\n        \n        print(f\"Found {len(tampa_businesses)} Japanese car repair businesses in Tampa\")\n        \n        if not business_ids:\n            print(\"No businesses found matching criteria\")\n            return []\n        \n        # Step 2: Find businesses with positive sentiment\n        positive_business_ids = semantic_search_positive_reviews(business_ids)\n        print(f\"Found {len(positive_business_ids)} businesses with positive sentiment about honesty and fair pricing\")\n        \n        # Step 3: Find businesses connected to user's network\n        neo4j_driver = connect_neo4j()\n        connected_businesses = get_connected_businesses(neo4j_driver, business_ids, current_user_id)\n        print(f\"Found {len(connected_businesses)} businesses used by people in your network\")\n        \n        # Step 4: Combine and rank results\n        final_results = []\n        business_dict = {b['business_id']: b for b in tampa_businesses}\n        \n        for business_id in business_ids:\n            business_info = business_dict[business_id]\n            score = 0\n            reasons = []\n            \n            # Base score from Yelp rating\n            score += business_info['stars'] * 10 if business_info['stars'] else 0\n            \n            # Bonus for positive sentiment\n            if business_id in positive_business_ids:\n                score += 20\n                reasons.append(\"Positive reviews about honesty and fair pricing\")\n            \n            # Bonus for social connections\n            if business_id in connected_businesses:\n                friend_count = connected_businesses[business_id]\n                score += friend_count * 15\n                reasons.append(f\"Used by {friend_count} people in your network\")\n            \n            final_results.append({\n                **business_info,\n                'relevance_score': score,\n                'reasons': reasons\n            })\n        \n        # Sort by relevance score\n        final_results.sort(key=lambda x: x['relevance_score'], reverse=True)\n        \n        # Close connections\n        business_conn.close()\n        neo4j_driver.close()\n        \n        return final_results[:10]  # Return top 10 results\n        \n    except Exception as e:\n        print(f\"Error executing query: {e}\")\n        return []\n\n# Example usage\nif __name__ == \"__main__\":\n    # You would need to specify a current user ID to leverage the social graph\n    # For demonstration, we'll run without a specific user\n    results = main(current_user_id=None)\n    \n    print(\"\\nTop Japanese Car Repair Shops in Tampa:\")\n    print(\"=\" * 50)\n    \n    for i, result in enumerate(results, 1):\n        print(f\"{i}. {result['name']}\")\n        print(f\"   Address: {result['address']}\")\n        print(f\"   Rating: {result['stars']} stars ({result['review_count']} reviews)\")\n        print(f\"   Score: {result['relevance_score']}\")\n        if result['reasons']:\n            print(f\"   Why recommended: {', '.join(result['reasons'])}\")\n        print()"
+    }
+  },
+{
+    "index": 92,
+    "question": "In Philadelphia, find board game cafes or geeky bars with friendly community vibes and big tables, and check if elite friends have visited; show table photos.",
+    "success": true,
+    "result": {
+      "analysis": "This query involves multiple aspects: (1) finding businesses in Philadelphia that are board game cafes or geeky bars with specific ambiance attributes ('friendly community vibes', 'big tables'), which requires semantic/text search; (2) checking if any elite users have reviewed or visited these places, requiring user-business interaction data; and (3) retrieving photos of tables from those venues. This spans SQL filtering, vector similarity search for ambiance, graph lookup for elite connections, and image retrieval — making it a hard multi-database query.",
+      "natural_question": "In Philadelphia, find board game cafes or geeky bars with friendly community vibes and big tables, and check if elite friends have visited; show table photos.",
+      "difficulty": "hard",
+      "query_types": [
+        "sql",
+        "vector",
+        "graph"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Philadelphia"
+              },
+              "categories": {
+                "contains_any": [
+                  "Board Games",
+                  "Bar",
+                  "Cafe",
+                  "Pub",
+                  "Game"
+                ]
+              }
+            }
+          },
+          "result_var": "candidate_businesses",
+          "description": {
+            "narrative": "First, retrieve candidate businesses in Philadelphia whose categories suggest they might be board game cafes or geeky bars. Use partial matching on categories since Yelp uses free-text category strings.",
+            "example_query": "SELECT business_id, name, address, categories FROM business WHERE city = 'Philadelphia' AND (categories LIKE '%Board%Game%' OR categories LIKE '%Bar%' OR categories LIKE '%Cafe%' OR categories LIKE '%Pub%' OR categories LIKE '%Game%');"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "reviews",
+              "tips"
+            ],
+            "filter_condition": {
+              "business_ids": {
+                "in": "candidate_businesses.business_id"
+              },
+              "semantic_keywords": [
+                "friendly community",
+                "big tables",
+                "spacious tables",
+                "welcoming atmosphere"
+              ]
+            }
+          },
+          "result_var": "filtered_businesses_with_vibe",
+          "description": {
+            "narrative": "Perform vector similarity search in Milvus on review and tip texts associated with the candidate businesses to find those that semantically match 'friendly community vibes' and 'big tables'. Combine results and rank by relevance.",
+            "example_query": "In Milvus, search in 'reviews' and 'milvus_tip' collections for embeddings closest to the query embedding of 'friendly community vibes and big tables', filtered by business_id in candidate list."
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "user",
+              "review"
+            ],
+            "filter_condition": {
+              "business_ids": {
+                "in": "filtered_businesses_with_vibe.business_id"
+              },
+              "elite_status": true
+            }
+          },
+          "result_var": "elite_visits",
+          "description": {
+            "narrative": "Join the review table with the user table to identify reviews of the filtered businesses written by elite users (where user.elite is not null/empty).",
+            "example_query": "SELECT r.business_id, u.user_id, u.name FROM review r JOIN user u ON r.user_id = u.user_id WHERE r.business_id IN (...) AND u.elite IS NOT NULL AND u.elite != '';"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "photo"
+            ],
+            "filter_condition": {
+              "business_ids": {
+                "in": "filtered_businesses_with_vibe.business_id"
+              },
+              "caption_contains": [
+                "table",
+                "tables"
+              ]
+            }
+          },
+          "result_var": "table_photos",
+          "description": {
+            "narrative": "Retrieve photos from the photo table for the filtered businesses where captions mention 'table' or 'tables'. Also fetch their photo_id for potential vector-based image retrieval if needed.",
+            "example_query": "SELECT photo_id, business_id, caption, photo_url FROM photo WHERE business_id IN (...) AND (caption LIKE '%table%' OR caption LIKE '%tables%');"
+          }
+        },
+        {
+          "step": 5,
+          "parameters": {
+            "ms_names": [
+              "photos"
+            ],
+            "filter_condition": {
+              "photo_ids": {
+                "in": "table_photos.photo_id"
+              }
+            }
+          },
+          "result_var": "photo_vectors",
+          "description": {
+            "narrative": "Optionally, use Milvus 'photo_vector' collection to verify or enhance table photo relevance via image embedding similarity (e.g., against a 'table' reference image), though caption filtering may suffice.",
+            "example_query": "Search Milvus 'photo_vector' collection using photo_id in table_photos to retrieve or validate image embeddings."
+          }
+        },
+        {
+          "step": 6,
+          "parameters": {
+            "ms_names": [
+              "neo4j"
+            ],
+            "filter_condition": {
+              "user_context": "current_user_friends",
+              "elite_visits": "elite_visits.user_id"
+            }
+          },
+          "result_var": "elite_friends_visited",
+          "description": {
+            "narrative": "In Neo4j, check if any of the elite reviewers are friends of the current user (assuming a 'FRIENDS_WITH' relationship exists). This step assumes we have a current user context; if not, return all elite visits.",
+            "example_query": "MATCH (me:User {user_id: 'CURRENT_USER_ID'})-[:FRIENDS_WITH]-(friend:User) WHERE friend.user_id IN [...] RETURN friend.user_id, friend.name;"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport json\nfrom sentence_transformers import SentenceTransformer\nfrom pymilvus import connections, Collection\nfrom neo4j import GraphDatabase\nimport numpy as np\n\n# Configuration\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nmilvus_config = {\n    'collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    },\n    'host': 'localhost',\n    'port': '19530'\n}\n\nneo4j_config = {\n    'uri': 'bolt://localhost:7687',\n    'auth': ('neo4j', 'password')\n}\n\n# Assume current user ID for friend check (replace with actual if known)\nCURRENT_USER_ID = None  # Set to a real user_id if available\n\n# Step 1: Get candidate businesses in Philadelphia\nconn_business = sqlite3.connect(sqlite_paths['business'])\ncur = conn_business.cursor()\ncur.execute('''\n    SELECT business_id, name, address, categories \n    FROM business \n    WHERE city = ? \n    AND (\n        categories LIKE '%Board%Game%' OR \n        categories LIKE '%Bar%' OR \n        categories LIKE '%Cafe%' OR \n        categories LIKE '%Pub%' OR \n        categories LIKE '%Game%'\n    )\n''', ('Philadelphia',))\ncandidate_businesses = cur.fetchall()\nconn_business.close()\n\nif not candidate_businesses:\n    print('No candidate businesses found.')\n    exit()\n\nbusiness_ids = [row[0] for row in candidate_businesses]\nprint(f'Found {len(business_ids)} candidate businesses.')\n\n# Step 2: Vector search for vibe in reviews and tips\nconnections.connect(host=milvus_config['host'], port=milvus_config['port'])\nmodel = SentenceTransformer('all-MiniLM-L6-v2')\n\nquery_text = 'friendly community vibes and big tables'\nquery_embedding = model.encode([query_text])[0].tolist()\n\n# Search reviews\nreview_collection = Collection(milvus_config['collections']['reviews'])\nreview_results = review_collection.search(\n    data=[query_embedding],\n    anns_field=\"embedding\",\n    param={\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}},\n    limit=50,\n    expr=f\"business_id in [{','.join([f'\\\"{bid}\\\"' for bid in business_ids])}]\"\n)\n\n# Search tips\ntip_collection = Collection(milvus_config['collections']['tips'])\ntip_results = tip_collection.search(\n    data=[query_embedding],\n    anns_field=\"embedding\",\n    param={\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}},\n    limit=50,\n    expr=f\"business_id in [{','.join([f'\\\"{bid}\\\"' for bid in business_ids])}]\"\n)\n\n# Extract business IDs with high relevance\nrelevant_business_ids = set()\nfor hits in review_results + tip_results:\n    for hit in hits:\n        relevant_business_ids.add(hit.entity.get('business_id'))\n\nif not relevant_business_ids:\n    print('No businesses match the vibe criteria.')\n    exit()\n\nprint(f'{len(relevant_business_ids)} businesses match vibe criteria.')\n\n# Step 3: Check for elite user visits\nconn_user = sqlite3.connect(sqlite_paths['user'])\nconn_review = sqlite3.connect(sqlite_paths['review'])\n\n# Get elite users who reviewed these businesses\nelite_visits = []\ncur_rev = conn_review.cursor()\ncur_rev.execute('''\n    SELECT r.business_id, r.user_id \n    FROM review r \n    WHERE r.business_id IN ({})\n'''.format(','.join(['?']*len(relevant_business_ids))), list(relevant_business_ids))\n\nreview_records = cur_rev.fetchall()\nreview_user_ids = list(set([r[1] for r in review_records]))\n\nif review_user_ids:\n    cur_user = conn_user.cursor()\n    cur_user.execute('''\n        SELECT user_id, name, elite \n        FROM user \n        WHERE user_id IN ({}) AND elite IS NOT NULL AND elite != ''\n    '''.format(','.join(['?']*len(review_user_ids))), review_user_ids)\n    \n    elite_users = {row[0]: row[1] for row in cur_user.fetchall()}\n    \n    # Map back to businesses\n    for bid, uid in review_records:\n        if uid in elite_users:\n            elite_visits.append((bid, uid, elite_users[uid]))\n\nconn_user.close()\nconn_review.close()\n\n# Step 4: Get table photos\nconn_photo = sqlite3.connect(sqlite_paths['photo'])\ncur_photo = conn_photo.cursor()\ncur_photo.execute('''\n    SELECT photo_id, business_id, caption \n    FROM photo \n    WHERE business_id IN ({}) \n    AND (caption LIKE '%table%' OR caption LIKE '%tables%')\n'''.format(','.join(['?']*len(relevant_business_ids))), list(relevant_business_ids))\n\ntable_photos = cur_photo.fetchall()\nconn_photo.close()\n\nphoto_business_map = {}\nfor pid, bid, cap in table_photos:\n    if bid not in photo_business_map:\n        photo_business_map[bid] = []\n    photo_business_map[bid].append({'photo_id': pid, 'caption': cap})\n\n# Step 5: (Optional) Validate photos via Milvus image vectors\n# For brevity, we skip detailed image vector search unless needed\n\n# Step 6: Check if elite visitors are friends (if current user known)\nelite_friend_visits = []\nif CURRENT_USER_ID and elite_visits:\n    driver = GraphDatabase.driver(neo4j_config['uri'], auth=neo4j_config['auth'])\n    elite_user_ids = list(set([e[1] for e in elite_visits]))\n    \n    with driver.session() as session:\n        result = session.run(\n            '''\n            MATCH (me:User {user_id: $current_user})-[:FRIENDS_WITH]-(friend:User)\n            WHERE friend.user_id IN $elite_ids\n            RETURN friend.user_id AS user_id, friend.name AS name\n            ''',\n            current_user=CURRENT_USER_ID,\n            elite_ids=elite_user_ids\n        )\n        elite_friends = {record['user_id']: record['name'] for record in result}\n    \n    for bid, uid, uname in elite_visits:\n        if uid in elite_friends:\n            elite_friend_visits.append((bid, uid, elite_friends[uid]))\n    \n    driver.close()\nelse:\n    elite_friend_visits = elite_visits  # Show all elite visits if no user context\n\n# Final output\nresults = []\nfor bid in relevant_business_ids:\n    business_name = next((row[1] for row in candidate_businesses if row[0] == bid), 'Unknown')\n    has_elite_friend = any(e[0] == bid for e in elite_friend_visits)\n    photos = photo_business_map.get(bid, [])\n    \n    results.append({\n        'business_id': bid,\n        'name': business_name,\n        'has_elite_friend_visit': has_elite_friend,\n        'table_photos_count': len(photos),\n        'sample_photo_captions': [p['caption'] for p in photos[:3]]\n    })\n\n# Print results\nfor res in results:\n    print(f\"Business: {res['name']} (ID: {res['business_id']})\")\n    print(f\"  Elite friend visited: {res['has_elite_friend_visit']}\")\n    print(f\"  Table photos: {res['table_photos_count']}\")\n    if res['sample_photo_captions']:\n        print(\"  Sample captions:\", '; '.join(res['sample_photo_captions']))\n    print()\n"
+    }
+  },
+{
+    "index": 93,
+    "question": "In Tucson, find cafes or brunch spots that feel like an indoor jungle, and check if my plant-loving friends have visited; show plant photos.",
+    "success": true,
+    "result": {
+      "analysis": "This is a complex multi-database query that requires: (1) finding businesses in Tucson with specific ambiance keywords using vector similarity, (2) checking social connections in the graph database to identify plant-loving friends, (3) verifying if those friends have visited the identified places via reviews/tips, and (4) retrieving relevant plant photos. This involves SQL filtering, vector search, graph traversal, and cross-database joins.",
+      "natural_question": "In Tucson, find cafes or brunch spots that feel like an indoor jungle, and check if my plant-loving friends have visited; show plant photos.",
+      "difficulty": "hard",
+      "query_types": [
+        "sql",
+        "vector",
+        "graph"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Tucson"
+              },
+              "categories": {
+                "contains_any": [
+                  "Cafes",
+                  "Breakfast & Brunch"
+                ]
+              }
+            }
+          },
+          "result_var": "tucson_cafes_brunch",
+          "description": {
+            "narrative": "First, retrieve all cafes and brunch spots in Tucson from the business table using SQL filtering on city and categories.",
+            "example_query": "SELECT business_id, name, address FROM business WHERE city = 'Tucson' AND (categories LIKE '%Cafes%' OR categories LIKE '%Breakfast & Brunch%');"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "reviews",
+              "tips"
+            ],
+            "filter_condition": {
+              "semantic_query": "indoor jungle with lots of plants and greenery"
+            }
+          },
+          "result_var": "jungle_like_businesses",
+          "description": {
+            "narrative": "Use vector similarity search in Milvus to find reviews or tips that describe venues as 'indoor jungle' or similar plant-rich environments. Match these back to business IDs.",
+            "example_query": "Search in Milvus collections 'reviews' and 'tips' using embedding of query 'indoor jungle with lots of plants and greenery', return top matches with business_id."
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "neo4j"
+            ],
+            "filter_condition": {
+              "user_interest": "plants",
+              "relationship_type": "FRIENDS_WITH"
+            }
+          },
+          "result_var": "plant_loving_friends",
+          "description": {
+            "narrative": "Query the Neo4j graph to find friends of the current user who have 'plants' as an interest. This requires traversing FRIENDS_WITH relationships and checking interest nodes.",
+            "example_query": "MATCH (me:User {user_id: 'CURRENT_USER_ID'})-[:FRIENDS_WITH]->(friend:User)-[:INTERESTED_IN]->(i:Interest {name: 'plants'}) RETURN friend.user_id;"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "review",
+              "tip"
+            ],
+            "filter_condition": {
+              "user_id": {
+                "in": "plant_loving_friends"
+              },
+              "business_id": {
+                "in": "jungle_like_businesses"
+              }
+            }
+          },
+          "result_var": "friend_visits",
+          "description": {
+            "narrative": "Check SQLite review and tip tables to see if any plant-loving friends have reviewed or tipped at the jungle-like venues found earlier.",
+            "example_query": "SELECT * FROM review WHERE user_id IN ('friend1', 'friend2') AND business_id IN ('biz1', 'biz2');"
+          }
+        },
+        {
+          "step": 5,
+          "parameters": {
+            "ms_names": [
+              "photo"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "jungle_like_businesses"
+              },
+              "caption_contains": "plant"
+            }
+          },
+          "result_var": "plant_photos",
+          "description": {
+            "narrative": "Retrieve photos from the photo table for the identified businesses where captions mention plants, or use Milvus vector search on image embeddings if caption filtering is insufficient.",
+            "example_query": "SELECT photo_id, business_id, photo_url FROM photo WHERE business_id IN ('biz1', 'biz2') AND (caption LIKE '%plant%' OR caption LIKE '%greenery%');"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport json\nfrom pymilvus import connections, Collection\nfrom neo4j import GraphDatabase\nimport numpy as np\nfrom sentence_transformers import SentenceTransformer\n\n# Configuration\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nmilvus_config = {\n    'collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    },\n    'host': 'localhost',\n    'port': '19530'\n}\n\nneo4j_config = {\n    'uri': 'bolt://localhost:7687',\n    'auth': ('neo4j', 'password')\n}\n\n# Assume current user ID is known\nCURRENT_USER_ID = 'USER123'  # Replace with actual user ID\n\n# Initialize sentence transformer for embedding\nmodel = SentenceTransformer('all-MiniLM-L6-v2')\n\n# Step 1: Get Tucson cafes and brunch spots\ndef get_tucson_venues():\n    conn = sqlite3.connect(sqlite_paths['business'])\n    cursor = conn.cursor()\n    query = \"\"\"\n    SELECT business_id, name, address \n    FROM business \n    WHERE city = ? AND (categories LIKE ? OR categories LIKE ?)\n    \"\"\"\n    cursor.execute(query, ('Tucson', '%Cafes%', '%Breakfast & Brunch%'))\n    results = cursor.fetchall()\n    conn.close()\n    return [{'business_id': r[0], 'name': r[1], 'address': r[2]} for r in results]\n\n# Step 2: Vector search for 'indoor jungle' descriptions\ndef find_jungle_like_venues(tucson_business_ids):\n    connections.connect(host=milvus_config['host'], port=milvus_config['port'])\n    \n    query_text = \"indoor jungle with lots of plants and greenery\"\n    query_embedding = model.encode([query_text]).tolist()[0]\n    \n    jungle_business_ids = set()\n    \n    # Search in reviews\n    try:\n        reviews_col = Collection(milvus_config['collections']['reviews'])\n        reviews_col.load()\n        search_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\n        results = reviews_col.search(\n            data=[query_embedding],\n            anns_field=\"embedding\",\n            param=search_params,\n            limit=20,\n            output_fields=[\"business_id\"]\n        )\n        for hit in results[0]:\n            if hit.entity.get('business_id') in tucson_business_ids:\n                jungle_business_ids.add(hit.entity.get('business_id'))\n    except Exception as e:\n        print(f\"Error searching reviews: {e}\")\n    \n    # Search in tips\n    try:\n        tips_col = Collection(milvus_config['collections']['tips'])\n        tips_col.load()\n        results = tips_col.search(\n            data=[query_embedding],\n            anns_field=\"embedding\",\n            param=search_params,\n            limit=20,\n            output_fields=[\"business_id\"]\n        )\n        for hit in results[0]:\n            if hit.entity.get('business_id') in tucson_business_ids:\n                jungle_business_ids.add(hit.entity.get('business_id'))\n    except Exception as e:\n        print(f\"Error searching tips: {e}\")\n    \n    return list(jungle_business_ids)\n\n# Step 3: Find plant-loving friends\ndef get_plant_loving_friends():\n    driver = GraphDatabase.driver(neo4j_config['uri'], auth=neo4j_config['auth'])\n    with driver.session() as session:\n        result = session.run(\n            \"\"\"\n            MATCH (me:User {user_id: $user_id})-[:FRIENDS_WITH]->(friend:User)-[:INTERESTED_IN]->(i:Interest {name: 'plants'})\n            RETURN friend.user_id AS user_id\n            \"\"\",\n            user_id=CURRENT_USER_ID\n        )\n        friends = [record['user_id'] for record in result]\n    driver.close()\n    return friends\n\n# Step 4: Check if friends visited jungle venues\ndef check_friend_visits(friend_ids, jungle_business_ids):\n    if not friend_ids or not jungle_business_ids:\n        return []\n    \n    conn = sqlite3.connect(sqlite_paths['review'])\n    cursor = conn.cursor()\n    \n    # Check reviews\n    placeholders = ','.join(['?' for _ in friend_ids])\n    biz_placeholders = ','.join(['?' for _ in jungle_business_ids])\n    query = f\"\"\"\n    SELECT DISTINCT user_id, business_id FROM review \n    WHERE user_id IN ({placeholders}) AND business_id IN ({biz_placeholders})\n    \"\"\"\n    cursor.execute(query, friend_ids + jungle_business_ids)\n    review_visits = cursor.fetchall()\n    \n    conn.close()\n    \n    # Also check tips\n    conn = sqlite3.connect(sqlite_paths['tip'])\n    cursor = conn.cursor()\n    query = f\"\"\"\n    SELECT DISTINCT user_id, business_id FROM tip \n    WHERE user_id IN ({placeholders}) AND business_id IN ({biz_placeholders})\n    \"\"\"\n    cursor.execute(query, friend_ids + jungle_business_ids)\n    tip_visits = cursor.fetchall()\n    conn.close()\n    \n    all_visits = list(set(review_visits + tip_visits))\n    return [{'user_id': v[0], 'business_id': v[1]} for v in all_visits]\n\n# Step 5: Get plant photos\ndef get_plant_photos(jungle_business_ids):\n    if not jungle_business_ids:\n        return []\n    \n    conn = sqlite3.connect(sqlite_paths['photo'])\n    cursor = conn.cursor()\n    placeholders = ','.join(['?' for _ in jungle_business_ids])\n    query = f\"\"\"\n    SELECT photo_id, business_id, photo_url, caption \n    FROM photo \n    WHERE business_id IN ({placeholders}) \n    AND (caption LIKE '%plant%' OR caption LIKE '%green%' OR caption LIKE '%leaf%' OR caption LIKE '%jungle%')\n    \"\"\"\n    cursor.execute(query, jungle_business_ids)\n    results = cursor.fetchall()\n    conn.close()\n    \n    return [{'photo_id': r[0], 'business_id': r[1], 'photo_url': r[2], 'caption': r[3]} for r in results]\n\n# Main execution\ntry:\n    # Step 1\n    tucson_venues = get_tucson_venues()\n    tucson_business_ids = [v['business_id'] for v in tucson_venues]\n    print(f\"Found {len(tucson_venues)} cafes/brunch spots in Tucson\")\n    \n    if not tucson_business_ids:\n        print(\"No venues found in Tucson\")\n        exit()\n    \n    # Step 2\n    jungle_business_ids = find_jungle_like_venues(set(tucson_business_ids))\n    print(f\"Found {len(jungle_business_ids)} jungle-like venues\")\n    \n    if not jungle_business_ids:\n        print(\"No jungle-like venues found\")\n        exit()\n    \n    # Step 3\n    plant_friends = get_plant_loving_friends()\n    print(f\"Found {len(plant_friends)} plant-loving friends\")\n    \n    # Step 4\n    friend_visits = check_friend_visits(plant_friends, jungle_business_ids)\n    visited_business_ids = list(set([v['business_id'] for v in friend_visits]))\n    print(f\"{len(friend_visits)} visits by plant-loving friends to jungle venues\")\n    \n    # Step 5\n    plant_photos = get_plant_photos(visited_business_ids if friend_visits else jungle_business_ids)\n    print(f\"Found {len(plant_photos)} plant-related photos\")\n    \n    # Compile final results\n    final_venues = [v for v in tucson_venues if v['business_id'] in (visited_business_ids if friend_visits else jungle_business_ids)]\n    \n    # Output results\n    print(\"\\n=== RESULTS ===\")\n    for venue in final_venues:\n        print(f\"\\nVenue: {venue['name']}\")\n        print(f\"Address: {venue['address']}\")\n        \n        # Show relevant friend visits\n        venue_visits = [v for v in friend_visits if v['business_id'] == venue['business_id']]\n        if venue_visits:\n            print(f\"Visited by {len(venue_visits)} plant-loving friend(s): {[v['user_id'] for v in venue_visits]}\")\n        \n        # Show plant photos\n        venue_photos = [p for p in plant_photos if p['business_id'] == venue['business_id']]\n        if venue_photos:\n            print(\"Plant photos:\")\n            for photo in venue_photos:\n                print(f\"  - {photo['photo_url']} (Caption: {photo['caption']})\")\n\nexcept Exception as e:\n    print(f\"Error during execution: {e}\")\n    import traceback\n    traceback.print_exc()"
+    }
+  },
+{
+    "index": 94,
+    "question": "In Philadelphia, find a bookstore that feels like a library with old wooden ladders and a quiet vibe; check if my book-loving friends visited, and show reading area photos.",
+    "success": true,
+    "result": {
+      "analysis": "This query involves multiple steps: (1) finding a bookstore in Philadelphia that matches a specific ambiance described in reviews or tips, (2) checking if the user's book-loving friends (from the social graph) have visited it, and (3) retrieving photos of reading areas. It requires SQL for location/business filtering, vector search for semantic matching of ambiance descriptions, graph traversal to find friend visits, and photo retrieval via foreign keys. This is a hard multi-database query.",
+      "natural_question": "In Philadelphia, find a bookstore that feels like a library with old wooden ladders and a quiet vibe; check if my book-loving friends visited, and show reading area photos.",
+      "difficulty": "hard",
+      "query_types": [
+        "sql",
+        "vector",
+        "graph"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Philadelphia"
+              },
+              "categories": {
+                "like": "%Bookstores%"
+              }
+            }
+          },
+          "result_var": "philly_bookstores",
+          "description": {
+            "narrative": "Retrieve all bookstores in Philadelphia from the business table using SQLite.",
+            "example_query": "SELECT business_id, name FROM business WHERE city = 'Philadelphia' AND categories LIKE '%Bookstores%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "reviews",
+              "tips"
+            ],
+            "filter_condition": {
+              "text_embedding_query": {
+                "semantic": "feels like a library with old wooden ladders and a quiet vibe"
+              }
+            }
+          },
+          "result_var": "matching_business_ids",
+          "description": {
+            "narrative": "Perform a vector similarity search in Milvus on review and tip embeddings to find businesses whose textual content matches the ambiance description.",
+            "example_query": "Search in Milvus collections 'reviews' and 'tips' using the embedding of the query text 'feels like a library with old wooden ladders and a quiet vibe', return top business_id matches."
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "intersection(philly_bookstores.business_id, matching_business_ids)"
+              }
+            }
+          },
+          "result_var": "candidate_bookstore",
+          "description": {
+            "narrative": "Intersect results from Step 1 and Step 2 to get candidate bookstores in Philadelphia matching the ambiance.",
+            "example_query": "SELECT * FROM business WHERE business_id IN (<ids from intersection>);"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "user"
+            ],
+            "filter_condition": {
+              "user_interest": {
+                "eq": "books"
+              }
+            }
+          },
+          "result_var": "book_loving_friends",
+          "description": {
+            "narrative": "Use Neo4j to find the user’s friends who are interested in books (assumed node property or inferred from activity).",
+            "example_query": "MATCH (me:User {user_id: '<user_id>'})-[:FRIEND]->(friend:User) WHERE friend.interests CONTAINS 'books' RETURN friend.user_id;"
+          }
+        },
+        {
+          "step": 5,
+          "parameters": {
+            "ms_names": [
+              "review",
+              "checkin"
+            ],
+            "filter_condition": {
+              "user_id": {
+                "in": "book_loving_friends"
+              },
+              "business_id": {
+                "eq": "candidate_bookstore.business_id"
+              }
+            }
+          },
+          "result_var": "friends_visited",
+          "description": {
+            "narrative": "Check in SQLite whether any of these book-loving friends left a review or check-in at the candidate bookstore.",
+            "example_query": "SELECT user_id FROM review WHERE business_id = '<candidate_id>' AND user_id IN (<friend_ids>);"
+          }
+        },
+        {
+          "step": 6,
+          "parameters": {
+            "ms_names": [
+              "photo"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "eq": "candidate_bookstore.business_id"
+              },
+              "caption": {
+                "like": "%reading%area%"
+              }
+            }
+          },
+          "result_var": "reading_area_photos",
+          "description": {
+            "narrative": "Fetch photos associated with the candidate bookstore that have captions suggesting reading areas.",
+            "example_query": "SELECT photo_id, caption FROM photo WHERE business_id = '<candidate_id>' AND (caption LIKE '%reading%' OR caption LIKE '%area%');"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport numpy as np\nfrom pymilvus import connections, Collection\nfrom neo4j import GraphDatabase\nimport json\n\n# Configuration\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nmilvus_config = {\n    'collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    },\n    'host': 'localhost',\n    'port': '19530'\n}\n\nneo4j_config = {\n    'uri': 'bolt://localhost:7687',\n    'auth': ('neo4j', 'password')\n}\n\n# Assume user_id is known\nuser_id = 'YOUR_USER_ID_HERE'  # Replace with actual user ID\n\n# Step 1: Get Philly bookstores\nconn_business = sqlite3.connect(sqlite_paths['business'])\ncur = conn_business.cursor()\ncur.execute(\"SELECT business_id, name FROM business WHERE city = ? AND categories LIKE ?\", \n            ('Philadelphia', '%Bookstores%'))\nphilly_bookstores = {row[0]: row[1] for row in cur.fetchall()}\nconn_business.close()\n\nif not philly_bookstores:\n    print('No bookstores found in Philadelphia.')\nelse:\n    # Step 2: Vector search in Milvus\n    connections.connect(host=milvus_config['host'], port=milvus_config['port'])\n    \n    # Placeholder: In practice, you'd embed the query text using the same model used for ingestion\n    # For demo, assume we have a function `get_embedding(text)`\n    def get_embedding(text):\n        # Dummy embedding - replace with real embedding logic\n        return np.random.rand(768).tolist()\n    \n    query_text = \"feels like a library with old wooden ladders and a quiet vibe\"\n    query_emb = get_embedding(query_text)\n    \n    matching_business_ids = set()\n    for col_name in ['reviews', 'tips']:\n        collection = Collection(milvus_config['collections'][col_name])\n        search_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\n        results = collection.search(\n            data=[query_emb],\n            anns_field=\"embedding\",\n            param=search_params,\n            limit=20,\n            output_fields=[\"business_id\"]\n        )\n        for hits in results:\n            for hit in hits:\n                matching_business_ids.add(hit.entity.get('business_id'))\n    \n    # Step 3: Intersect\n    candidate_ids = set(philly_bookstores.keys()) & matching_business_ids\n    if not candidate_ids:\n        print('No matching ambiance found in Philadelphia bookstores.')\n    else:\n        candidate_id = list(candidate_ids)[0]  # Pick first match\n        candidate_name = philly_bookstores[candidate_id]\n        print(f\"Candidate bookstore: {candidate_name} (ID: {candidate_id})\")\n        \n        # Step 4: Find book-loving friends via Neo4j\n        driver = GraphDatabase.driver(neo4j_config['uri'], auth=neo4j_config['auth'])\n        with driver.session() as session:\n            result = session.run(\n                \"MATCH (me:User {user_id: $user_id})-[:FRIEND]->(friend:User) \"\n                \"WHERE friend.interests CONTAINS 'books' RETURN friend.user_id AS user_id\",\n                user_id=user_id\n            )\n            book_loving_friends = [record['user_id'] for record in result]\n        driver.close()\n        \n        # Step 5: Check if friends visited\n        conn_review = sqlite3.connect(sqlite_paths['review'])\n        placeholders = ','.join(['?' for _ in book_loving_friends])\n        if book_loving_friends:\n            cur = conn_review.cursor()\n            cur.execute(f\"SELECT DISTINCT user_id FROM review WHERE business_id = ? AND user_id IN ({placeholders})\",\n                        [candidate_id] + book_loving_friends)\n            visitors = [row[0] for row in cur.fetchall()]\n            conn_review.close()\n            \n            if visitors:\n                print(f\"Your book-loving friends who visited: {visitors}\")\n            else:\n                print(\"None of your book-loving friends have visited this store.\")\n        else:\n            print(\"You have no book-loving friends in the graph.\")\n            conn_review.close()\n        \n        # Step 6: Get reading area photos\n        conn_photo = sqlite3.connect(sqlite_paths['photo'])\n        cur = conn_photo.cursor()\n        cur.execute(\"SELECT photo_id, caption FROM photo WHERE business_id = ? AND (caption LIKE ? OR caption LIKE ?)\",\n                    (candidate_id, '%reading%', '%area%'))\n        photos = cur.fetchall()\n        conn_photo.close()\n        \n        if photos:\n            print(\"Reading area photos:\")\n            for pid, caption in photos:\n                print(f\"Photo ID: {pid}, Caption: {caption}\")\n        else:\n            print(\"No reading area photos found.\")"
+    }
+  },
+{
+    "index": 95,
+    "question": "In New Orleans, find real speakeasies with secret doors and live jazz; check if jazz-loving friends or local experts visited, and show stage/entrance photos.",
+    "success": true,
+    "result": {
+      "analysis": "This is a complex multi-database query that requires: (1) filtering businesses in New Orleans with specific attributes (speakeasies, secret doors, live jazz), (2) finding reviews/tips mentioning these features, (3) checking social connections of jazz-loving users in the graph database, (4) retrieving relevant photos from both SQLite and Milvus. The query spans all three database types (SQL, vector, graph) and requires careful coordination.",
+      "natural_question": "In New Orleans, find real speakeasies with secret doors and live jazz; check if jazz-loving friends or local experts visited, and show stage/entrance photos.",
+      "difficulty": "hard",
+      "query_types": [
+        "sql",
+        "vector",
+        "graph"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "New Orleans"
+              },
+              "state": {
+                "eq": "LA"
+              }
+            }
+          },
+          "result_var": "new_orleans_businesses",
+          "description": {
+            "narrative": "First, retrieve all businesses located in New Orleans, Louisiana from the business table.",
+            "example_query": "SELECT business_id, name, address, categories FROM business WHERE city = 'New Orleans' AND state = 'LA';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "review",
+              "tip"
+            ],
+            "filter_condition": {
+              "text_keywords": {
+                "contains": [
+                  "speakeasy",
+                  "secret door",
+                  "hidden entrance",
+                  "live jazz",
+                  "jazz music"
+                ]
+              }
+            }
+          },
+          "result_var": "relevant_content_ids",
+          "description": {
+            "narrative": "Search for reviews and tips that mention speakeasy characteristics, secret doors, or live jazz using vector similarity search in Milvus to find semantically relevant content.",
+            "example_query": "Perform vector similarity search in Milvus collections 'reviews' and 'milvus_tip' using embeddings of query phrases like 'speakeasy with secret door and live jazz'"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "business",
+              "review",
+              "tip"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "from_step_1"
+              },
+              "content_id": {
+                "in": "from_step_2"
+              }
+            }
+          },
+          "result_var": "candidate_speakeasies",
+          "description": {
+            "narrative": "Join the New Orleans businesses with the relevant reviews/tips to identify candidate speakeasies that have both location and content matching our criteria.",
+            "example_query": "SELECT DISTINCT b.business_id, b.name, b.address FROM business b JOIN review r ON b.business_id = r.business_id WHERE b.business_id IN (step1_results) AND r.review_id IN (step2_results);"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "user"
+            ],
+            "filter_condition": {
+              "user_attributes": {
+                "contains": [
+                  "jazz",
+                  "music",
+                  "local expert"
+                ]
+              }
+            }
+          },
+          "result_var": "jazz_loving_users",
+          "description": {
+            "narrative": "Identify users who are jazz enthusiasts or local experts by searching their profiles, reviews, or tips for relevant keywords using vector search.",
+            "example_query": "Search user table and perform vector similarity on user descriptions/reviews to find users interested in jazz music"
+          }
+        },
+        {
+          "step": 5,
+          "parameters": {
+            "ms_names": [
+              "neo4j"
+            ],
+            "filter_condition": {
+              "relationship_type": {
+                "eq": "FRIENDS_WITH"
+              },
+              "node_attributes": {
+                "contains": "jazz_loving_users"
+              }
+            }
+          },
+          "result_var": "connected_users",
+          "description": {
+            "narrative": "Use the Neo4j graph database to find friends of the jazz-loving users and local experts, expanding the network of potentially relevant reviewers.",
+            "example_query": "MATCH (u:User)-[:FRIENDS_WITH]-(friend:User) WHERE u.user_id IN [jazz_user_ids] RETURN friend.user_id"
+          }
+        },
+        {
+          "step": 6,
+          "parameters": {
+            "ms_names": [
+              "review",
+              "tip",
+              "photo"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "candidate_speakeasies"
+              },
+              "user_id": {
+                "in": "connected_users"
+              }
+            }
+          },
+          "result_var": "verified_visits",
+          "description": {
+            "narrative": "Check if any of the connected jazz-loving users or their friends have actually visited the candidate speakeasies by looking for their reviews, tips, or check-ins.",
+            "example_query": "SELECT r.*, t.* FROM review r LEFT JOIN tip t ON r.business_id = t.business_id WHERE r.business_id IN (candidate_ids) AND r.user_id IN (connected_user_ids);"
+          }
+        },
+        {
+          "step": 7,
+          "parameters": {
+            "ms_names": [
+              "photo"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "verified_visits"
+              },
+              "photo_labels": {
+                "contains": [
+                  "stage",
+                  "entrance",
+                  "door",
+                  "interior"
+                ]
+              }
+            }
+          },
+          "result_var": "stage_entrance_photos",
+          "description": {
+            "narrative": "Retrieve photos associated with the verified speakeasies, specifically looking for images of stages, entrances, or secret doors using both SQL filtering and vector similarity search on photo content.",
+            "example_query": "SELECT photo_id, business_id, photo_url FROM photo WHERE business_id IN (verified_business_ids) AND (label LIKE '%stage%' OR label LIKE '%entrance%' OR label LIKE '%door%');"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport json\nfrom pymilvus import connections, Collection\nfrom neo4j import GraphDatabase\nimport numpy as np\nfrom sentence_transformers import SentenceTransformer\nimport os\n\ndef connect_sqlite(db_name):\n    \"\"\"Connect to SQLite database\"\"\"\n    sqlite_paths = {\n        \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n        \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n        \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n        \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n        \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n        \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n    }\n    return sqlite3.connect(sqlite_paths[db_name])\n\ndef connect_milvus():\n    \"\"\"Connect to Milvus vector database\"\"\"\n    connections.connect(\n        alias=\"default\",\n        host='localhost',\n        port='19530'\n    )\n\ndef connect_neo4j():\n    \"\"\"Connect to Neo4j graph database\"\"\"\n    uri = \"bolt://localhost:7687\"\n    username = \"neo4j\"\n    password = \"password\"\n    return GraphDatabase.driver(uri, auth=(username, password))\n\n# Initialize embedding model for semantic search\ndef get_embedding_model():\n    return SentenceTransformer('all-MiniLM-L6-v2')\n\n# Step 1: Get New Orleans businesses\ndef get_new_orleans_businesses():\n    conn = connect_sqlite(\"business\")\n    cursor = conn.cursor()\n    cursor.execute(\"\"\"\n        SELECT business_id, name, address, categories \n        FROM business \n        WHERE city = ? AND state = ?\n    \"\"\", (\"New Orleans\", \"LA\"))\n    results = cursor.fetchall()\n    conn.close()\n    return [(row[0], row[1], row[2], row[3]) for row in results]\n\n# Step 2: Vector search for relevant content\ndef search_relevant_content(model):\n    connect_milvus()\n    \n    # Create query embeddings\n    queries = [\n        \"speakeasy with secret door and live jazz music\",\n        \"hidden bar with jazz performance\",\n        \"secret entrance speakeasy New Orleans\"\n    ]\n    query_embeddings = model.encode(queries)\n    \n    relevant_ids = set()\n    \n    # Search in reviews collection\n    try:\n        reviews_collection = Collection(\"reviews\")\n        for embedding in query_embeddings:\n            search_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\n            results = reviews_collection.search(\n                data=[embedding.tolist()],\n                anns_field=\"embedding\",\n                param=search_params,\n                limit=20,\n                output_fields=[\"review_id\"]\n            )\n            for hits in results:\n                for hit in hits:\n                    relevant_ids.add(hit.entity.get(\"review_id\"))\n    except Exception as e:\n        print(f\"Error searching reviews: {e}\")\n    \n    # Search in tips collection\n    try:\n        tips_collection = Collection(\"milvus_tip\")\n        for embedding in query_embeddings:\n            search_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\n            results = tips_collection.search(\n                data=[embedding.tolist()],\n                anns_field=\"embedding\",\n                param=search_params,\n                limit=10,\n                output_fields=[\"tip_id\"]\n            )\n            for hits in results:\n                for hit in hits:\n                    relevant_ids.add(hit.entity.get(\"tip_id\"))\n    except Exception as e:\n        print(f\"Error searching tips: {e}\")\n    \n    return list(relevant_ids)\n\n# Step 3: Find candidate speakeasies\ndef find_candidate_speakeasies(new_orleans_biz, relevant_content_ids):\n    if not relevant_content_ids:\n        return []\n    \n    # Get business IDs from reviews\n    conn = connect_sqlite(\"review\")\n    cursor = conn.cursor()\n    placeholders = ','.join(['?' for _ in relevant_content_ids])\n    cursor.execute(f\"SELECT DISTINCT business_id FROM review WHERE review_id IN ({placeholders})\", relevant_content_ids)\n    review_biz_ids = set(row[0] for row in cursor.fetchall())\n    conn.close()\n    \n    # Get business IDs from tips\n    conn = connect_sqlite(\"tip\")\n    cursor = conn.cursor()\n    cursor.execute(f\"SELECT DISTINCT business_id FROM tip WHERE tip_id IN ({placeholders})\", relevant_content_ids)\n    tip_biz_ids = set(row[0] for row in cursor.fetchall())\n    conn.close()\n    \n    # Combine and filter by New Orleans businesses\n    new_orleans_biz_ids = set(biz[0] for biz in new_orleans_biz)\n    candidate_biz_ids = (review_biz_ids | tip_biz_ids) & new_orleans_biz_ids\n    \n    # Get full business info for candidates\n    candidate_businesses = [biz for biz in new_orleans_biz if biz[0] in candidate_biz_ids]\n    return candidate_businesses\n\n# Step 4: Find jazz-loving users\ndef find_jazz_loving_users(model):\n    connect_milvus()\n    \n    jazz_queries = [\"jazz enthusiast\", \"loves jazz music\", \"local jazz expert\", \"New Orleans jazz fan\"]\n    query_embeddings = model.encode(jazz_queries)\n    \n    jazz_user_ids = set()\n    \n    # Search in user-related content\n    try:\n        # Check reviews by users mentioning jazz\n        reviews_collection = Collection(\"reviews\")\n        for embedding in query_embeddings:\n            search_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\n            results = reviews_collection.search(\n                data=[embedding.tolist()],\n                anns_field=\"embedding\",\n                param=search_params,\n                limit=15,\n                output_fields=[\"user_id\"]\n            )\n            for hits in results:\n                for hit in hits:\n                    jazz_user_ids.add(hit.entity.get(\"user_id\"))\n    except Exception as e:\n        print(f\"Error finding jazz users in reviews: {e}\")\n    \n    return list(jazz_user_ids)\n\n# Step 5: Find connected users via Neo4j\ndef find_connected_users(jazz_user_ids):\n    if not jazz_user_ids:\n        return []\n    \n    driver = connect_neo4j()\n    connected_users = set()\n    \n    with driver.session() as session:\n        for user_id in jazz_user_ids:\n            result = session.run(\n                \"MATCH (u:User {user_id: $user_id})-[:FRIENDS_WITH]-(friend:User) RETURN friend.user_id\",\n                user_id=user_id\n            )\n            for record in result:\n                connected_users.add(record[\"friend.user_id\"])\n    \n    driver.close()\n    return list(connected_users)\n\n# Step 6: Verify visits by connected users\ndef verify_visits(candidate_businesses, connected_users):\n    if not candidate_businesses or not connected_users:\n        return []\n    \n    candidate_biz_ids = [biz[0] for biz in candidate_businesses]\n    \n    # Check reviews\n    conn = connect_sqlite(\"review\")\n    cursor = conn.cursor()\n    biz_placeholders = ','.join(['?' for _ in candidate_biz_ids])\n    user_placeholders = ','.join(['?' for _ in connected_users])\n    \n    cursor.execute(f\"\"\"\n        SELECT DISTINCT business_id FROM review \n        WHERE business_id IN ({biz_placeholders}) AND user_id IN ({user_placeholders})\n    \"\"\", candidate_biz_ids + connected_users)\n    reviewed_biz = set(row[0] for row in cursor.fetchall())\n    conn.close()\n    \n    # Check tips\n    conn = connect_sqlite(\"tip\")\n    cursor = conn.cursor()\n    cursor.execute(f\"\"\"\n        SELECT DISTINCT business_id FROM tip \n        WHERE business_id IN ({biz_placeholders}) AND user_id IN ({user_placeholders})\n    \"\"\", candidate_biz_ids + connected_users)\n    tipped_biz = set(row[0] for row in cursor.fetchall())\n    conn.close()\n    \n    verified_biz_ids = reviewed_biz | tipped_biz\n    verified_businesses = [biz for biz in candidate_businesses if biz[0] in verified_biz_ids]\n    return verified_businesses\n\n# Step 7: Get stage/entrance photos\ndef get_stage_entrance_photos(verified_businesses):\n    if not verified_businesses:\n        return []\n    \n    biz_ids = [biz[0] for biz in verified_businesses]\n    placeholders = ','.join(['?' for _ in biz_ids])\n    \n    conn = connect_sqlite(\"photo\")\n    cursor = conn.cursor()\n    \n    # Try to get photos with relevant labels first\n    try:\n        cursor.execute(f\"\"\"\n            SELECT photo_id, business_id, photo_url, label \n            FROM photo \n            WHERE business_id IN ({placeholders}) \n            AND (label LIKE '%stage%' OR label LIKE '%entrance%' OR label LIKE '%door%' OR label LIKE '%interior%')\n        \"\"\", biz_ids)\n        photos = cursor.fetchall()\n        \n        if photos:\n            return [(row[0], row[1], row[2], row[3]) for row in photos]\n    except:\n        pass\n    \n    # If no labeled photos, get all photos for these businesses\n    cursor.execute(f\"SELECT photo_id, business_id, photo_url, label FROM photo WHERE business_id IN ({placeholders}) LIMIT 10\", biz_ids)\n    photos = cursor.fetchall()\n    conn.close()\n    \n    return [(row[0], row[1], row[2], row[3]) for row in photos]\n\ndef main():\n    try:\n        print(\"Starting speakeasy search in New Orleans...\")\n        \n        # Initialize embedding model\n        model = get_embedding_model()\n        \n        # Step 1: Get New Orleans businesses\n        print(\"Step 1: Fetching New Orleans businesses...\")\n        new_orleans_biz = get_new_orleans_businesses()\n        print(f\"Found {len(new_orleans_biz)} businesses in New Orleans\")\n        \n        if not new_orleans_biz:\n            print(\"No businesses found in New Orleans\")\n            return\n        \n        # Step 2: Search for relevant content\n        print(\"Step 2: Searching for speakeasy-related content...\")\n        relevant_content_ids = search_relevant_content(model)\n        print(f\"Found {len(relevant_content_ids)} relevant content items\")\n        \n        # Step 3: Find candidate speakeasies\n        print(\"Step 3: Identifying candidate speakeasies...\")\n        candidate_speakeasies = find_candidate_speakeasies(new_orleans_biz, relevant_content_ids)\n        print(f\"Found {len(candidate_speakeasies)} candidate speakeasies\")\n        \n        if not candidate_speakeasies:\n            print(\"No candidate speakeasies found\")\n            return\n        \n        # Step 4: Find jazz-loving users\n        print(\"Step 4: Finding jazz-loving users...\")\n        jazz_users = find_jazz_loving_users(model)\n        print(f\"Found {len(jazz_users)} jazz-loving users\")\n        \n        # Step 5: Find connected users\n        print(\"Step 5: Finding friends of jazz lovers...\")\n        connected_users = find_connected_users(jazz_users)\n        print(f\"Found {len(connected_users)} connected users\")\n        \n        # Step 6: Verify visits\n        print(\"Step 6: Verifying visits by jazz community...\")\n        verified_speakeasies = verify_visits(candidate_speakeasies, connected_users)\n        print(f\"Verified {len(verified_speakeasies)} speakeasies with jazz community visits\")\n        \n        if not verified_speakeasies:\n            print(\"No verified speakeasies found with jazz community visits\")\n            # Still proceed with candidates if no verified ones\n            verified_speakeasies = candidate_speakeasies\n        \n        # Step 7: Get photos\n        print(\"Step 7: Retrieving stage/entrance photos...\")\n        photos = get_stage_entrance_photos(verified_speakeasies)\n        print(f\"Found {len(photos)} relevant photos\")\n        \n        # Output results\n        print(\"\\n=== SPEAKEASY RESULTS ===\")\n        for i, biz in enumerate(verified_speakeasies, 1):\n            print(f\"\\n{i}. {biz[1]}\")\n            print(f\"   Address: {biz[2]}\")\n            print(f\"   Categories: {biz[3]}\")\n            \n            # Show relevant photos for this business\n            biz_photos = [p for p in photos if p[1] == biz[0]]\n            if biz_photos:\n                print(f\"   Photos ({len(biz_photos)}):\")\n                for photo in biz_photos[:3]:  # Show up to 3 photos\n                    print(f\"     - {photo[2]} (Label: {photo[3]})\")\n            else:\n                print(\"   No photos available\")\n        \n    except Exception as e:\n        print(f\"Error during execution: {e}\")\n        import traceback\n        traceback.print_exc()\n\nif __name__ == \"__main__\":\n    main()"
+    }
+  },
+{
+    "index": 96,
+    "question": "In Tucson, find modern minimalist hair salons with professional colorists, and see if fashion bloggers I follow have visited; show salon or hair work photos.",
+    "success": true,
+    "result": {
+      "analysis": "This is a complex multi-step query that spans multiple data sources. It requires: (1) filtering businesses in Tucson with specific attributes (modern minimalist hair salons), (2) identifying those with professional colorists (likely from reviews or tips mentioning 'colorist' or 'professional coloring'), (3) checking if any fashion bloggers followed by the user have visited these salons (requires graph relationships in Neo4j), and (4) retrieving photos of the salon or hair work (from photo DB or vector DB). This involves SQL for business filtering, vector search for semantic matching of 'modern minimalist' and 'professional colorist', graph traversal for blogger-follow relationships, and photo retrieval.",
+      "natural_question": "In Tucson, find modern minimalist hair salons with professional colorists, and see if fashion bloggers I follow have visited; show salon or hair work photos.",
+      "difficulty": "hard",
+      "query_types": [
+        "sql",
+        "vector",
+        "graph"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Tucson"
+              },
+              "categories": {
+                "contains": "Hair Salons"
+              }
+            }
+          },
+          "result_var": "tucson_salons",
+          "description": {
+            "narrative": "First, retrieve all hair salons located in Tucson from the business table.",
+            "example_query": "SELECT business_id, name, address, categories FROM business WHERE city = 'Tucson' AND categories LIKE '%Hair Salons%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "reviews",
+              "tips"
+            ],
+            "filter_condition": {
+              "semantic_concepts": [
+                "modern minimalist",
+                "professional colorist"
+              ]
+            }
+          },
+          "result_var": "salons_with_attributes",
+          "description": {
+            "narrative": "Use Milvus vector database to perform semantic search on reviews and tips associated with the Tucson salons to identify those described as 'modern minimalist' and having 'professional colorists'.",
+            "example_query": "Perform vector similarity search in Milvus collections 'reviews' and 'tips' using embeddings of the phrases 'modern minimalist hair salon' and 'professional colorist'."
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "neo4j"
+            ],
+            "filter_condition": {
+              "relationship_type": "FOLLOWS",
+              "node_labels": [
+                "User",
+                "FashionBlogger"
+              ],
+              "visited_business": "salon_business_ids"
+            }
+          },
+          "result_var": "bloggers_visited_salon",
+          "description": {
+            "narrative": "Query the Neo4j graph database to find if any fashion bloggers that the current user follows have visited the identified salons. This requires traversing FOLLOWS relationships and CHECKED_IN or REVIEWED relationships to businesses.",
+            "example_query": "MATCH (me:User {user_id: 'current_user_id'})-[:FOLLOWS]->(blogger:FashionBlogger)-[:REVIEWED|CHECKED_IN]->(salon:Business) WHERE salon.business_id IN $salon_ids RETURN blogger.user_id, salon.business_id;"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "photo"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "filtered_salon_ids"
+              },
+              "photo_label": {
+                "in": [
+                  "hair",
+                  "salon",
+                  "interior"
+                ]
+              }
+            }
+          },
+          "result_var": "salon_photos",
+          "description": {
+            "narrative": "Retrieve photos from the photo database for the final filtered salons, prioritizing those labeled as hair work or salon interior.",
+            "example_query": "SELECT photo_id, business_id, photo_url, caption FROM photo WHERE business_id IN ($salon_ids) AND (caption LIKE '%hair%' OR caption LIKE '%color%' OR label IN ('hair', 'interior'));"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport json\nfrom pymilvus import connections, Collection\nfrom neo4j import GraphDatabase\nimport numpy as np\nfrom sentence_transformers import SentenceTransformer\n\n# Configuration\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\nmilvus_config = {\n    'collections': {\n        'reviews': 'reviews',\n        'photos': 'photo_vector',\n        'tips': 'milvus_tip'\n    },\n    'host': 'localhost',\n    'port': '19530'\n}\n\nneo4j_config = {\n    'uri': 'bolt://localhost:7687',\n    'auth': ('neo4j', 'password')\n}\n\n# Assume current user ID is known\nCURRENT_USER_ID = 'user123'  # This would typically come from authentication\n\n# Step 1: Get Tucson hair salons\ndef get_tucson_salons():\n    conn = sqlite3.connect(sqlite_paths['business'])\n    cursor = conn.cursor()\n    cursor.execute(\"\"\"\n        SELECT business_id, name, address, categories \n        FROM business \n        WHERE city = ? AND categories LIKE ?\n    \"\"\", ('Tucson', '%Hair Salons%'))\n    results = cursor.fetchall()\n    conn.close()\n    return [{'business_id': r[0], 'name': r[1], 'address': r[2], 'categories': r[3]} for r in results]\n\n# Step 2: Semantic search for modern minimalist and professional colorist\ndef semantic_filter_salons(salons):\n    # Connect to Milvus\n    connections.connect(host=milvus_config['host'], port=milvus_config['port'])\n    \n    # Load sentence transformer model\n    model = SentenceTransformer('all-MiniLM-L6-v2')\n    \n    # Create search vectors\n    search_phrases = [\n        'modern minimalist hair salon',\n        'professional colorist',\n        'expert hair coloring',\n        'contemporary clean aesthetic salon'\n    ]\n    search_vectors = model.encode(search_phrases)\n    \n    salon_ids = [s['business_id'] for s in salons]\n    qualified_salon_ids = set()\n    \n    # Search in reviews collection\n    try:\n        reviews_col = Collection(milvus_config['collections']['reviews'])\n        reviews_col.load()\n        \n        for vector in search_vectors:\n            search_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\n            results = reviews_col.search(\n                data=[vector.tolist()],\n                anns_field=\"embedding\",\n                param=search_params,\n                limit=50,\n                expr=f\"business_id in [{','.join([f'\\\"{sid}\\\"' for sid in salon_ids])}]\"\n            )\n            \n            for hits in results:\n                for hit in hits:\n                    qualified_salon_ids.add(hit.entity.get('business_id'))\n    except Exception as e:\n        print(f\"Error searching reviews: {e}\")\n    \n    # Search in tips collection\n    try:\n        tips_col = Collection(milvus_config['collections']['tips'])\n        tips_col.load()\n        \n        for vector in search_vectors:\n            search_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\n            results = tips_col.search(\n                data=[vector.tolist()],\n                anns_field=\"embedding\",\n                param=search_params,\n                limit=20,\n                expr=f\"business_id in [{','.join([f'\\\"{sid}\\\"' for sid in salon_ids])}]\"\n            )\n            \n            for hits in results:\n                for hit in hits:\n                    qualified_salon_ids.add(hit.entity.get('business_id'))\n    except Exception as e:\n        print(f\"Error searching tips: {e}\")\n    \n    # Filter original salons\n    filtered_salons = [s for s in salons if s['business_id'] in qualified_salon_ids]\n    return filtered_salons\n\n# Step 3: Check if followed fashion bloggers visited these salons\ndef check_blogger_visits(salons):\n    driver = GraphDatabase.driver(neo4j_config['uri'], auth=neo4j_config['auth'])\n    \n    salon_ids = [s['business_id'] for s in salons]\n    if not salon_ids:\n        driver.close()\n        return []\n    \n    query = \"\"\"\n    MATCH (me:User {user_id: $current_user_id})-[:FOLLOWS]->(blogger:User {is_fashion_blogger: true})\n    MATCH (blogger)-[:WROTE_REVIEW|CHECKED_IN]->(salon:Business)\n    WHERE salon.business_id IN $salon_ids\n    RETURN DISTINCT blogger.user_id, blogger.name, salon.business_id, salon.name\n    \"\"\"\n    \n    with driver.session() as session:\n        result = session.run(query, \n                           current_user_id=CURRENT_USER_ID, \n                           salon_ids=salon_ids)\n        blogger_visits = []\n        for record in result:\n            blogger_visits.append({\n                'blogger_id': record['blogger.user_id'],\n                'blogger_name': record['blogger.name'],\n                'salon_id': record['salon.business_id'],\n                'salon_name': record['salon.name']\n            })\n    \n    driver.close()\n    return blogger_visits\n\n# Step 4: Get photos for the salons\ndef get_salon_photos(salons):\n    conn = sqlite3.connect(sqlite_paths['photo'])\n    cursor = conn.cursor()\n    \n    salon_ids = [s['business_id'] for s in salons]\n    if not salon_ids:\n        conn.close()\n        return []\n    \n    placeholders = ','.join(['?' for _ in salon_ids])\n    cursor.execute(f\"\"\"\n        SELECT photo_id, business_id, photo_url, caption \n        FROM photo \n        WHERE business_id IN ({placeholders})\n        AND (caption LIKE '%hair%' OR caption LIKE '%color%' OR caption LIKE '%salon%' OR caption LIKE '%interior%')\n        LIMIT 20\n    \"\"\", salon_ids)\n    \n    photos = []\n    for row in cursor.fetchall():\n        photos.append({\n            'photo_id': row[0],\n            'business_id': row[1],\n            'photo_url': row[2],\n            'caption': row[3]\n        })\n    \n    conn.close()\n    return photos\n\n# Main execution\ndef main():\n    try:\n        print(\"Step 1: Finding Tucson hair salons...\")\n        tucson_salons = get_tucson_salons()\n        print(f\"Found {len(tucson_salons)} hair salons in Tucson\")\n        \n        if not tucson_salons:\n            print(\"No hair salons found in Tucson\")\n            return\n        \n        print(\"Step 2: Filtering for modern minimalist salons with professional colorists...\")\n        filtered_salons = semantic_filter_salons(tucson_salons)\n        print(f\"Filtered to {len(filtered_salons)} salons matching criteria\")\n        \n        if not filtered_salons:\n            print(\"No salons matched the modern minimalist and professional colorist criteria\")\n            return\n        \n        print(\"Step 3: Checking if followed fashion bloggers visited these salons...\")\n        blogger_visits = check_blogger_visits(filtered_salons)\n        print(f\"Found {len(blogger_visits)} visits by followed fashion bloggers\")\n        \n        print(\"Step 4: Retrieving salon and hair work photos...\")\n        salon_photos = get_salon_photos(filtered_salons)\n        print(f\"Retrieved {len(salon_photos)} relevant photos\")\n        \n        # Compile final results\n        final_results = {\n            'matching_salons': filtered_salons,\n            'blogger_visits': blogger_visits,\n            'photos': salon_photos\n        }\n        \n        # Output results\n        print(\"\\n=== FINAL RESULTS ===\")\n        print(f\"Matching Salons ({len(filtered_salons)}):\")\n        for salon in filtered_salons:\n            print(f\"  - {salon['name']} ({salon['business_id']})\")\n        \n        if blogger_visits:\n            print(f\"\\nBloggers You Follow Who Visited ({len(blogger_visits)}):\")\n            for visit in blogger_visits:\n                print(f\"  - {visit['blogger_name']} visited {visit['salon_name']}\")\n        else:\n            print(\"\\nNo visits found by fashion bloggers you follow\")\n        \n        if salon_photos:\n            print(f\"\\nPhotos ({len(salon_photos)}):\")\n            for photo in salon_photos[:5]:  # Show first 5\n                print(f\"  - {photo['photo_url']} (Caption: {photo['caption'][:50]}...)\")\n        else:\n            print(\"\\nNo relevant photos found\")\n            \n    except Exception as e:\n        print(f\"Error during execution: {e}\")\n        import traceback\n        traceback.print_exc()\n\nif __name__ == \"__main__\":\n    main()"
+    }
+  },
+{
+    "index": 97,
+    "question": "In Tampa, find curated sustainable or vintage shops that feel high quality, recommended by elite eco-fashion friends, and show display photos.",
+    "success": true,
+    "result": {
+      "analysis": "This query is complex and multi-faceted. It requires: (1) identifying businesses in Tampa; (2) filtering for sustainable or vintage shops; (3) ensuring high quality perception; (4) finding recommendations from elite users who are also interested in eco-fashion; and (5) retrieving display photos. This involves SQL for business/user data, graph traversal to find elite eco-fashion friends and their tips/reviews, and vector search may be used to assess 'high quality' or 'eco-fashion' semantics if needed. However, since the request emphasizes 'recommended by elite eco-fashion friends', we prioritize graph relationships and textual content from tips/reviews. Photos are retrieved from the photo table linked to businesses.",
+      "natural_question": "In Tampa, find curated sustainable or vintage shops that feel high quality, recommended by elite eco-fashion friends, and show display photos.",
+      "difficulty": "hard",
+      "query_types": [
+        "sql",
+        "graph"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Tampa"
+              },
+              "categories": {
+                "contains_any": [
+                  "Sustainable",
+                  "Vintage",
+                  "Thrift",
+                  "Second Hand",
+                  "Eco"
+                ]
+              }
+            }
+          },
+          "result_var": "tampa_sustainable_businesses",
+          "description": {
+            "narrative": "Retrieve businesses in Tampa whose categories suggest sustainability or vintage focus.",
+            "example_query": "SELECT business_id, name, categories FROM business WHERE city = 'Tampa' AND (categories LIKE '%Sustainable%' OR categories LIKE '%Vintage%' OR categories LIKE '%Thrift%' OR categories LIKE '%Second Hand%' OR categories LIKE '%Eco%');"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "user"
+            ],
+            "filter_condition": {
+              "elite": {
+                "not_null": true
+              },
+              "friends": {
+                "exists": true
+              }
+            }
+          },
+          "result_var": "elite_users",
+          "description": {
+            "narrative": "Identify elite users who have friends (to later check if they engage with eco-fashion topics).",
+            "example_query": "SELECT user_id FROM user WHERE elite IS NOT NULL AND friends IS NOT NULL;"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "tip",
+              "review"
+            ],
+            "filter_condition": {
+              "text": {
+                "contains_any": [
+                  "eco",
+                  "sustainable",
+                  "vintage",
+                  "ethical",
+                  "green fashion"
+                ]
+              }
+            }
+          },
+          "result_var": "eco_fashion_content",
+          "description": {
+            "narrative": "Find tips or reviews from elite users that mention eco-fashion related keywords.",
+            "example_query": "SELECT user_id, business_id FROM tip WHERE (text LIKE '%eco%' OR text LIKE '%sustainable%' OR text LIKE '%vintage%' OR text LIKE '%ethical%' OR text LIKE '%green fashion%') UNION SELECT user_id, business_id FROM review WHERE (text LIKE '%eco%' OR text LIKE '%sustainable%' OR text LIKE '%vintage%' OR text LIKE '%ethical%' OR text LIKE '%green fashion%');"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "neo4j"
+            ],
+            "filter_condition": {
+              "relationship": "FRIENDS_WITH",
+              "node_labels": [
+                "User"
+              ],
+              "content_filter": "eco-fashion interest"
+            }
+          },
+          "result_var": "eco_fashion_elite_user_ids",
+          "description": {
+            "narrative": "Use Neo4j to find elite users who are connected to others interested in eco-fashion, or who themselves posted eco-fashion content. We assume a graph where User nodes are connected via FRIENDS_WITH, and possibly tagged with interests.",
+            "example_query": "MATCH (u:User)-[:FRIENDS_WITH*1..2]-(friend:User) WHERE u.is_elite = true AND (u.eco_fashion_interest = true OR friend.eco_fashion_interest = true) RETURN DISTINCT u.user_id;"
+          }
+        },
+        {
+          "step": 5,
+          "parameters": {
+            "ms_names": [
+              "tip",
+              "review"
+            ],
+            "filter_condition": {
+              "user_id": {
+                "in": "eco_fashion_elite_user_ids"
+              },
+              "business_id": {
+                "in": "tampa_sustainable_businesses"
+              }
+            }
+          },
+          "result_var": "recommended_businesses",
+          "description": {
+            "narrative": "Find tips or reviews on Tampa sustainable businesses authored by elite eco-fashion users.",
+            "example_query": "SELECT DISTINCT business_id FROM tip WHERE user_id IN (/* eco_fashion_elite_user_ids */) AND business_id IN (/* tampa_sustainable_businesses */);"
+          }
+        },
+        {
+          "step": 6,
+          "parameters": {
+            "ms_names": [
+              "photo"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "recommended_businesses"
+              }
+            }
+          },
+          "result_var": "display_photos",
+          "description": {
+            "narrative": "Retrieve photo URLs or paths associated with the recommended businesses.",
+            "example_query": "SELECT business_id, photo_id, caption FROM photo WHERE business_id IN (/* recommended_businesses */);"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport json\nfrom neo4j import GraphDatabase\n\n# Database paths\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n    \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n    \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n    \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n}\n\n# Neo4j config\nneo4j_config = {\n    'uri': 'bolt://localhost:7687',\n    'auth': ('neo4j', 'password')\n}\n\n# Helper: connect to SQLite\ndef get_sqlite_conn(db_name):\n    return sqlite3.connect(sqlite_paths[db_name])\n\n# Step 1: Get Tampa sustainable/vintage businesses\ndef get_tampa_sustainable_businesses():\n    conn = get_sqlite_conn('business')\n    cursor = conn.cursor()\n    keywords = ['Sustainable', 'Vintage', 'Thrift', 'Second Hand', 'Eco']\n    like_clauses = ' OR '.join([f\"categories LIKE ?\" for _ in keywords])\n    query = f\"SELECT business_id, name, categories FROM business WHERE city = 'Tampa' AND ({like_clauses});\"\n    params = [f'%{k}%' for k in keywords]\n    cursor.execute(query, params)\n    results = cursor.fetchall()\n    conn.close()\n    return {row[0]: {'name': row[1], 'categories': row[2]} for row in results}\n\n# Step 2 & 3: Find eco-fashion content from elite users (via SQL first)\ndef get_eco_fashion_user_business_pairs():\n    # Get elite user IDs\n    conn_user = get_sqlite_conn('user')\n    cursor_user = conn_user.cursor()\n    cursor_user.execute(\"SELECT user_id FROM user WHERE elite IS NOT NULL AND friends IS NOT NULL;\")\n    elite_user_ids = set(row[0] for row in cursor_user.fetchall())\n    conn_user.close()\n\n    # Search tips and reviews for eco-fashion keywords\n    eco_keywords = ['eco', 'sustainable', 'vintage', 'ethical', 'green fashion']\n    like_clauses = ' OR '.join([f\"text LIKE ?\" for _ in eco_keywords])\n    params = [f'%{k}%' for k in eco_keywords]\n\n    # Tips\n    conn_tip = get_sqlite_conn('tip')\n    cursor_tip = conn_tip.cursor()\n    cursor_tip.execute(f\"SELECT user_id, business_id FROM tip WHERE ({like_clauses});\", params)\n    tip_results = cursor_tip.fetchall()\n    conn_tip.close()\n\n    # Reviews\n    conn_rev = get_sqlite_conn('review')\n    cursor_rev = conn_rev.cursor()\n    cursor_rev.execute(f\"SELECT user_id, business_id FROM review WHERE ({like_clauses});\", params)\n    rev_results = cursor_rev.fetchall()\n    conn_rev.close()\n\n    # Filter by elite users\n    eco_fashion_pairs = set()\n    for uid, bid in tip_results + rev_results:\n        if uid in elite_user_ids:\n            eco_fashion_pairs.add((uid, bid))\n    return eco_fashion_pairs\n\n# Step 4: Use Neo4j to refine elite eco-fashion users (optional enhancement)\ndef get_eco_fashion_elite_users_neo4j():\n    driver = GraphDatabase.driver(neo4j_config['uri'], auth=neo4j_config['auth'])\n    with driver.session() as session:\n        result = session.run(\n            \"\"\"\n            MATCH (u:User)\n            WHERE u.is_elite = true AND \n                  (u.eco_fashion_interest = true OR\n                   EXISTS((u)-[:FRIENDS_WITH]->(:User {eco_fashion_interest: true})) OR\n                   EXISTS((u)<-[:FRIENDS_WITH]-(:User {eco_fashion_interest: true})))\n            RETURN DISTINCT u.user_id AS user_id\n            \"\"\"\n        )\n        user_ids = {record['user_id'] for record in result}\n    driver.close()\n    return user_ids\n\n# Combine logic\ndef main():\n    try:\n        # Step 1\n        tampa_biz = get_tampa_sustainable_businesses()\n        if not tampa_biz:\n            print(\"No sustainable/vintage businesses found in Tampa.\")\n            return\n        tampa_biz_ids = set(tampa_biz.keys())\n\n        # Step 2-3: Get eco-fashion recommendations from elite users via SQL\n        eco_pairs = get_eco_fashion_user_business_pairs()\n        recommended_biz_ids = {bid for uid, bid in eco_pairs if bid in tampa_biz_ids}\n\n        # Optional Step 4: Refine using Neo4j if available\n        try:\n            neo4j_elite_users = get_eco_fashion_elite_users_neo4j()\n            if neo4j_elite_users:\n                # Re-filter pairs using Neo4j elite set\n                eco_pairs_neo = {(uid, bid) for uid, bid in eco_pairs if uid in neo4j_elite_users}\n                recommended_biz_ids = {bid for uid, bid in eco_pairs_neo if bid in tampa_biz_ids}\n        except Exception as e:\n            print(f\"Neo4j refinement skipped: {e}\")\n\n        if not recommended_biz_ids:\n            print(\"No recommendations from elite eco-fashion users found.\")\n            return\n\n        # Step 6: Get photos\n        conn_photo = get_sqlite_conn('photo')\n        cursor_photo = conn_photo.cursor()\n        placeholders = ','.join(['?' for _ in recommended_biz_ids])\n        cursor_photo.execute(f\"SELECT business_id, photo_id, caption FROM photo WHERE business_id IN ({placeholders});\", list(recommended_biz_ids))\n        photos = cursor_photo.fetchall()\n        conn_photo.close()\n\n        # Compile results\n        results = {}\n        for bid in recommended_biz_ids:\n            results[bid] = {\n                'name': tampa_biz[bid]['name'],\n                'categories': tampa_biz[bid]['categories'],\n                'photos': []\n            }\n\n        for bid, pid, caption in photos:\n            if bid in results:\n                results[bid]['photos'].append({'photo_id': pid, 'caption': caption})\n\n        # Output\n        print(json.dumps(results, indent=2))\n\n    except Exception as e:\n        print(f\"Error: {e}\")\n\nif __name__ == \"__main__\":\n    main()\n"
+    }
+  },
+{
+    "index": 98,
+    "question": "In Boise, find quiet, comfortable restaurants visited by my older friends or family, based on reviews mentioning a quiet environment and comfortable seating.",
+    "success": true,
+    "result": {
+      "analysis": "This query involves finding restaurants in Boise that are described as quiet and comfortable, specifically based on reviews. It requires filtering businesses by location (Boise), category (restaurants), and then using semantic search on review text to find mentions of 'quiet environment' and 'comfortable seating'. The query also implies a social connection ('older friends or family'), which may require user relationship data from the graph database. However, since no specific user ID is given, we'll focus on the semantic review search and business filtering. This is a medium-difficulty query involving SQL filtering and vector similarity search.",
+      "natural_question": "In Boise, find quiet, comfortable restaurants visited by my older friends or family, based on reviews mentioning a quiet environment and comfortable seating.",
+      "difficulty": "medium",
+      "query_types": [
+        "sql",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Boise"
+              },
+              "categories": {
+                "contains": "Restaurants"
+              }
+            }
+          },
+          "result_var": "boise_restaurants",
+          "description": {
+            "narrative": "First, retrieve all businesses in Boise that are categorized as restaurants.",
+            "example_query": "SELECT business_id, name, address FROM business WHERE city = 'Boise' AND categories LIKE '%Restaurants%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "reviews"
+            ],
+            "filter_condition": {
+              "semantic_query": {
+                "text": "quiet environment and comfortable seating"
+              }
+            }
+          },
+          "result_var": "relevant_reviews",
+          "description": {
+            "narrative": "Perform a vector similarity search in the Milvus 'reviews' collection to find reviews that semantically match 'quiet environment and comfortable seating'.",
+            "example_query": "Search in Milvus collection 'reviews' with query embedding of 'quiet environment and comfortable seating', returning top matches with business_id."
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "business",
+              "reviews"
+            ],
+            "filter_condition": {
+              "join_condition": {
+                "business.business_id": "reviews.business_id"
+              }
+            }
+          },
+          "result_var": "final_restaurants",
+          "description": {
+            "narrative": "Join the Boise restaurants with the relevant reviews to get the final list of quiet, comfortable restaurants in Boise.",
+            "example_query": "SELECT DISTINCT b.business_id, b.name, b.address FROM business b INNER JOIN (review_ids from step 2) r ON b.business_id = r.business_id;"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport json\nfrom pymilvus import connections, Collection\nimport numpy as np\nfrom sentence_transformers import SentenceTransformer\n\n# Database paths\nsqlite_paths = {\n    \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n    \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\"\n}\n\n# Milvus configuration\nmilvus_config = {\n    'collections': {\n        'reviews': 'reviews'\n    },\n    'host': 'localhost',\n    'port': '19530'\n}\n\n# Connect to SQLite databases\ndef get_sqlite_connection(db_name):\n    return sqlite3.connect(sqlite_paths[db_name])\n\n# Connect to Milvus\ndef connect_milvus():\n    connections.connect(host=milvus_config['host'], port=milvus_config['port'])\n\n# Load sentence transformer model for embedding queries\nmodel = SentenceTransformer('all-MiniLM-L6-v2')\n\ntry:\n    # Step 1: Get Boise restaurants\n    conn_business = get_sqlite_connection('business')\n    cursor_business = conn_business.cursor()\n    cursor_business.execute(\"\"\"\n        SELECT business_id, name, address \n        FROM business \n        WHERE city = ? AND categories LIKE ?\n    \"\"\", ('Boise', '%Restaurants%'))\n    \n    boise_restaurants = cursor_business.fetchall()\n    boise_business_ids = [row[0] for row in boise_restaurants]\n    print(f\"Found {len(boise_restaurants)} restaurants in Boise\")\n    \n    # Step 2: Semantic search for quiet and comfortable reviews\n    connect_milvus()\n    reviews_collection = Collection(milvus_config['collections']['reviews'])\n    reviews_collection.load()\n    \n    # Create query embedding\n    query_text = \"quiet environment and comfortable seating\"\n    query_embedding = model.encode([query_text])[0].tolist()\n    \n    # Search in Milvus\n    search_params = {\"metric_type\": \"L2\", \"params\": {\"nprobe\": 10}}\n    results = reviews_collection.search(\n        data=[query_embedding],\n        anns_field=\"embedding\",\n        param=search_params,\n        limit=100,\n        output_fields=[\"business_id\", \"review_id\"]\n    )\n    \n    relevant_business_ids = set()\n    for result in results[0]:\n        relevant_business_ids.add(result.entity.get('business_id'))\n    \n    print(f\"Found {len(relevant_business_ids)} businesses with relevant reviews\")\n    \n    # Step 3: Find intersection - Boise restaurants with relevant reviews\n    final_business_ids = set(boise_business_ids) & relevant_business_ids\n    \n    # Get final restaurant details\n    final_restaurants = []\n    for restaurant in boise_restaurants:\n        if restaurant[0] in final_business_ids:\n            final_restaurants.append({\n                'business_id': restaurant[0],\n                'name': restaurant[1],\n                'address': restaurant[2]\n            })\n    \n    # Output results\n    print(\"\\nQuiet and comfortable restaurants in Boise:\")\n    for restaurant in final_restaurants:\n        print(f\"- {restaurant['name']} at {restaurant['address']}\")\n    \n    # Clean up\n    reviews_collection.release()\n    conn_business.close()\n    \nexcept Exception as e:\n    print(f\"Error occurred: {e}\")\n    import traceback\n    traceback.print_exc()\nfinally:\n    connections.disconnect('default')"
+    }
+  },
+{
+    "index": 99,
+    "question": "In Clearwater, find well-rated restaurants frequently visited by people with similar tastes (friends), and show recent feedback.",
+    "success": true,
+    "result": {
+      "analysis": "This query involves multiple data sources: identifying restaurants in Clearwater (SQLite business table), filtering by high ratings, finding users who are friends (Neo4j graph relationships), checking their visit patterns (SQLite checkin or review tables), and retrieving recent feedback (SQLite reviews with possible vector similarity for sentiment/taste alignment). This is a complex multi-step query requiring SQL, graph, and potentially vector operations.",
+      "natural_question": "In Clearwater, find well-rated restaurants frequently visited by people with similar tastes (friends), and show recent feedback.",
+      "difficulty": "hard",
+      "query_types": [
+        "sql",
+        "graph",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Clearwater"
+              },
+              "stars": {
+                "gte": 4.0
+              },
+              "categories": {
+                "like": "%Restaurant%"
+              }
+            }
+          },
+          "result_var": "clearwater_restaurants",
+          "description": {
+            "narrative": "Find all restaurants in Clearwater with a rating of at least 4 stars.",
+            "example_query": "SELECT business_id, name, stars FROM business WHERE city = 'Clearwater' AND stars >= 4.0 AND categories LIKE '%Restaurant%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "user"
+            ],
+            "filter_condition": {}
+          },
+          "result_var": "all_users",
+          "description": {
+            "narrative": "Retrieve user information to later match with friend relationships from Neo4j.",
+            "example_query": "SELECT user_id FROM user;"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "neo4j"
+            ],
+            "filter_condition": {}
+          },
+          "result_var": "friend_pairs",
+          "description": {
+            "narrative": "Query Neo4j to get all friend relationships between users.",
+            "example_query": "MATCH (u1:User)-[:FRIEND]->(u2:User) RETURN u1.user_id AS user1, u2.user_id AS user2;"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "review"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "clearwater_restaurants.business_id"
+              }
+            }
+          },
+          "result_var": "reviews_of_restaurants",
+          "description": {
+            "narrative": "Get all reviews for the identified Clearwater restaurants.",
+            "example_query": "SELECT review_id, user_id, business_id, text, date FROM review WHERE business_id IN (SELECT business_id FROM business WHERE city = 'Clearwater' AND stars >= 4.0 AND categories LIKE '%Restaurant%');"
+          }
+        },
+        {
+          "step": 5,
+          "parameters": {
+            "ms_names": [
+              "milvus_collections"
+            ],
+            "filter_condition": {
+              "collection": {
+                "eq": "reviews"
+              },
+              "review_ids": {
+                "in": "reviews_of_restaurants.review_id"
+              }
+            }
+          },
+          "result_var": "review_vectors",
+          "description": {
+            "narrative": "Fetch vector embeddings of reviews to identify similar taste patterns among friends.",
+            "example_query": "Search vectors in Milvus collection 'reviews' using review_ids from previous step."
+          }
+        },
+        {
+          "step": 6,
+          "parameters": {},
+          "result_var": "final_result",
+          "description": {
+            "narrative": "Join restaurant info, friend-reviewed restaurants, and recent feedback. Filter for restaurants frequently reviewed by connected friends and sort by review date to show recent feedback.",
+            "example_query": "Combine results from steps 1, 3, 4, and 5 to produce final output with restaurant details and recent reviews from friend groups."
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport json\nfrom neo4j import GraphDatabase\nfrom pymilvus import connections, Collection\nfrom datetime import datetime\n\ndef connect_sqlite(db_name):\n    path_map = {\n        \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n        \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n        \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n        \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n        \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n        \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n    }\n    return sqlite3.connect(path_map[db_name])\n\n# Connect to Milvus\nconnections.connect(host='localhost', port='19530')\n\n# Connect to Neo4j\nneo4j_driver = GraphDatabase.driver('bolt://localhost:7687', auth=('neo4j', 'password'))\n\ndef execute_neo4j_query(query):\n    with neo4j_driver.session() as session:\n        result = session.run(query)\n        return [(record['user1'], record['user2']) for record in result]\n\ntry:\n    # Step 1: Get well-rated restaurants in Clearwater\n    conn_business = connect_sqlite('business')\n    cursor = conn_business.cursor()\n    cursor.execute(\"\"\"\n        SELECT business_id, name, stars \n        FROM business \n        WHERE city = ? AND stars >= ? AND categories LIKE ?\n    \"\"\", ('Clearwater', 4.0, '%Restaurant%'))\n    clearwater_restaurants = cursor.fetchall()\n    restaurant_ids = [r[0] for r in clearwater_restaurants]\n    conn_business.close()\n    \n    if not restaurant_ids:\n        print('No well-rated restaurants found in Clearwater.')\n        exit()\n    \n    # Step 2 & 3: Get friend relationships\n    friend_query = \"MATCH (u1:User)-[:FRIEND]->(u2:User) RETURN u1.user_id AS user1, u2.user_id AS user2\"\n    friend_pairs = execute_neo4j_query(friend_query)\n    friend_set = set()\n    for u1, u2 in friend_pairs:\n        friend_set.add((u1, u2))\n        friend_set.add((u2, u1))  # undirected for ease\n    \n    # Step 4: Get reviews for these restaurants\n    conn_review = connect_sqlite('review')\n    placeholders = ','.join(['?' for _ in restaurant_ids])\n    cursor = conn_review.cursor()\n    cursor.execute(f\"SELECT review_id, user_id, business_id, text, date FROM review WHERE business_id IN ({placeholders}) ORDER BY date DESC\", restaurant_ids)\n    reviews = cursor.fetchall()\n    conn_review.close()\n    \n    # Build mapping from business to reviewers\n    business_reviewers = {}\n    for rid, uid, bid, text, date in reviews:\n        if bid not in business_reviewers:\n            business_reviewers[bid] = []\n        business_reviewers[bid].append((rid, uid, text, date))\n    \n    # Step 5 & 6: Find restaurants frequently reviewed by friends and collect recent feedback\n    friend_visited_restaurants = {}\n    for bid, review_list in business_reviewers.items():\n        user_ids = [r[1] for r in review_list]\n        user_set = set(user_ids)\n        friend_review_count = 0\n        recent_feedback = []\n        \n        # Count how many reviews are from users who are friends\n        for i, (rid, uid, text, date) in enumerate(review_list):\n            for other_uid in user_set:\n                if (uid, other_uid) in friend_set:\n                    friend_review_count += 1\n                    break\n            # Collect recent feedback (e.g., last 10 reviews)\n            if i < 10:\n                recent_feedback.append({\n                    'review_id': rid,\n                    'user_id': uid,\n                    'text': text,\n                    'date': date\n                })\n        \n        # Only include if multiple friend-related reviews\n        if friend_review_count >= 2:\n            restaurant_info = next((r for r in clearwater_restaurants if r[0] == bid), None)\n            if restaurant_info:\n                friend_visited_restaurants[bid] = {\n                    'name': restaurant_info[1],\n                    'stars': restaurant_info[2],\n                    'friend_review_count': friend_review_count,\n                    'recent_feedback': recent_feedback\n                }\n    \n    # Output results\n    print(json.dumps(friend_visited_restaurants, indent=2))\n\nexcept Exception as e:\n    print(f\"Error: {e}\")\nfinally:\n    neo4j_driver.close()\n"
+    }
+  },
+{
+    "index": 100,
+    "question": "In Saint Petersburg, find restaurants suitable for work gatherings where people I know have visited more than once and reviews are usually positive.",
+    "success": true,
+    "result": {
+      "analysis": "This is a complex multi-step query that requires: (1) finding restaurants in Saint Petersburg, (2) identifying users connected to the current user in the social graph, (3) filtering businesses where these connected users have visited more than once (multiple reviews), and (4) ensuring reviews are generally positive. This requires combining SQL queries for business location and review data, graph queries for social connections, and potentially vector similarity for sentiment analysis of reviews. The difficulty is hard due to the multi-database coordination required.",
+      "natural_question": "In Saint Petersburg, find restaurants suitable for work gatherings where people I know have visited more than once and reviews are usually positive.",
+      "difficulty": "hard",
+      "query_types": [
+        "sql",
+        "graph",
+        "vector"
+      ],
+      "plan": [
+        {
+          "step": 1,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "city": {
+                "eq": "Saint Petersburg"
+              },
+              "categories": {
+                "contains": "Restaurants"
+              }
+            }
+          },
+          "result_var": "stpetersburg_restaurants",
+          "description": {
+            "narrative": "First, retrieve all restaurants in Saint Petersburg from the business table in SQLite database.",
+            "example_query": "SELECT business_id, name, address, categories FROM business WHERE city = 'Saint Petersburg' AND categories LIKE '%Restaurants%';"
+          }
+        },
+        {
+          "step": 2,
+          "parameters": {
+            "ms_names": [
+              "neo4j"
+            ],
+            "filter_condition": {
+              "relationship": {
+                "eq": "FRIENDS_WITH"
+              }
+            }
+          },
+          "result_var": "connected_users",
+          "description": {
+            "narrative": "Query the Neo4j graph database to find all users connected to the current user through FRIENDS_WITH relationships.",
+            "example_query": "MATCH (me:User {user_id: 'CURRENT_USER_ID'})-[:FRIENDS_WITH]-(friend:User) RETURN friend.user_id;"
+          }
+        },
+        {
+          "step": 3,
+          "parameters": {
+            "ms_names": [
+              "review"
+            ],
+            "filter_condition": {
+              "business_id": {
+                "in": "stpetersburg_restaurants.business_id"
+              },
+              "user_id": {
+                "in": "connected_users.user_id"
+              }
+            }
+          },
+          "result_var": "friend_reviews",
+          "description": {
+            "narrative": "Join the review table with the results from steps 1 and 2 to get reviews from connected users for Saint Petersburg restaurants.",
+            "example_query": "SELECT business_id, user_id, review_id, stars, text FROM review WHERE business_id IN (SELECT business_id FROM stpetersburg_restaurants) AND user_id IN (SELECT user_id FROM connected_users);"
+          }
+        },
+        {
+          "step": 4,
+          "parameters": {
+            "ms_names": [
+              "review"
+            ],
+            "filter_condition": {
+              "visit_count": {
+                "gt": 1
+              }
+            }
+          },
+          "result_var": "frequent_visitors",
+          "description": {
+            "narrative": "Group the reviews by business_id and user_id to identify restaurants where connected users have reviewed more than once (indicating multiple visits).",
+            "example_query": "SELECT business_id, user_id, COUNT(*) as visit_count FROM friend_reviews GROUP BY business_id, user_id HAVING COUNT(*) > 1;"
+          }
+        },
+        {
+          "step": 5,
+          "parameters": {
+            "ms_names": [
+              "milvus_collections.reviews"
+            ],
+            "filter_condition": {
+              "sentiment": {
+                "positive": true
+              }
+            }
+          },
+          "result_var": "positive_reviews",
+          "description": {
+            "narrative": "Use Milvus vector database to analyze review sentiment by searching for reviews with positive semantic meaning, or alternatively filter reviews with high star ratings (>=4) as a proxy for positive sentiment.",
+            "example_query": "Search in Milvus 'reviews' collection for vectors with positive sentiment embeddings, or use SQL: SELECT business_id, AVG(stars) as avg_rating FROM friend_reviews WHERE business_id IN (SELECT business_id FROM frequent_visitors) GROUP BY business_id HAVING AVG(stars) >= 4.0;"
+          }
+        },
+        {
+          "step": 6,
+          "parameters": {
+            "ms_names": [
+              "business"
+            ],
+            "filter_condition": {
+              "final_filter": {
+                "suitable_for_work": true
+              }
+            }
+          },
+          "result_var": "final_restaurants",
+          "description": {
+            "narrative": "Combine all filters to get the final list of restaurants that meet all criteria: located in Saint Petersburg, visited multiple times by connected users, and have positive reviews.",
+            "example_query": "SELECT b.name, b.address, b.business_id, fr.avg_rating FROM business b JOIN (SELECT business_id, AVG(stars) as avg_rating FROM friend_reviews WHERE business_id IN (SELECT DISTINCT business_id FROM frequent_visitors) GROUP BY business_id HAVING AVG(stars) >= 4.0) fr ON b.business_id = fr.business_id WHERE b.city = 'Saint Petersburg' AND b.categories LIKE '%Restaurants%';"
+          }
+        }
+      ],
+      "complete_code": "import sqlite3\nimport json\nfrom neo4j import GraphDatabase\nfrom pymilvus import connections, Collection\nimport numpy as np\n\ndef find_suitable_restaurants(current_user_id):\n    \"\"\"\n    Find restaurants in Saint Petersburg suitable for work gatherings where \n    people the current user knows have visited more than once and reviews are positive.\n    \n    Args:\n        current_user_id (str): The ID of the current user\n    \n    Returns:\n        list: List of suitable restaurants with details\n    \"\"\"\n    \n    # Database connection configurations\n    sqlite_paths = {\n        \"business\": \"D:/Yelp-JSON/db/sqlite3/business.db\",\n        \"checkin\": \"D:/Yelp-JSON/db/sqlite3/checkin.db\",\n        \"photo\": \"D:/Yelp-JSON/db/sqlite3/photo.db\",\n        \"review\": \"D:/Yelp-JSON/db/sqlite3/review.db\",\n        \"tip\": \"D:/Yelp-JSON/db/sqlite3/tip.db\",\n        \"user\": \"D:/Yelp-JSON/db/sqlite3/user.db\"\n    }\n    \n    milvus_config = {\n        'collections': {\n            'reviews': 'reviews',\n            'photos': 'photo_vector',\n            'tips': 'milvus_tip'\n        },\n        'host': 'localhost',\n        'port': '19530'\n    }\n    \n    neo4j_config = {\n        'uri': 'bolt://localhost:7687',\n        'auth': ('neo4j', 'password')\n    }\n    \n    try:\n        # Step 1: Get Saint Petersburg restaurants\n        conn_business = sqlite3.connect(sqlite_paths[\"business\"])\n        cursor_business = conn_business.cursor()\n        \n        cursor_business.execute(\"\"\"\n            SELECT business_id, name, address, categories \n            FROM business \n            WHERE city = ? AND categories LIKE ?\n        \"\"\", (\"Saint Petersburg\", \"%Restaurants%\"))\n        \n        stpetersburg_restaurants = cursor_business.fetchall()\n        restaurant_ids = [r[0] for r in stpetersburg_restaurants]\n        \n        if not restaurant_ids:\n            return []\n        \n        # Step 2: Get connected users from Neo4j\n        driver = GraphDatabase.driver(neo4j_config['uri'], auth=neo4j_config['auth'])\n        \n        def get_connected_users(tx, user_id):\n            query = \"\"\"\n            MATCH (me:User {user_id: $user_id})-[:FRIENDS_WITH]-(friend:User)\n            RETURN friend.user_id AS user_id\n            \"\"\"\n            result = tx.run(query, user_id=user_id)\n            return [record[\"user_id\"] for record in result]\n        \n        with driver.session() as session:\n            connected_users = session.execute_read(get_connected_users, current_user_id)\n        \n        driver.close()\n        \n        if not connected_users:\n            return []\n        \n        # Step 3 & 4: Get reviews from connected users for these restaurants\n        # and find those with multiple visits\n        conn_review = sqlite3.connect(sqlite_paths[\"review\"])\n        cursor_review = conn_review.cursor()\n        \n        # Create placeholders for IN clause\n        restaurant_placeholders = ','.join(['?' for _ in restaurant_ids])\n        user_placeholders = ','.join(['?' for _ in connected_users])\n        \n        query = f\"\"\"\n            SELECT business_id, user_id, stars\n            FROM review\n            WHERE business_id IN ({restaurant_placeholders})\n            AND user_id IN ({user_placeholders})\n        \"\"\"\n        \n        cursor_review.execute(query, restaurant_ids + connected_users)\n        all_reviews = cursor_review.fetchall()\n        \n        # Group by business_id and user_id to count visits\n        visit_counts = {}\n        business_ratings = {}\n        \n        for business_id, user_id, stars in all_reviews:\n            key = (business_id, user_id)\n            visit_counts[key] = visit_counts.get(key, 0) + 1\n            \n            if business_id not in business_ratings:\n                business_ratings[business_id] = []\n            business_ratings[business_id].append(stars)\n        \n        # Find businesses where connected users visited more than once\n        qualified_businesses = set()\n        for (business_id, user_id), count in visit_counts.items():\n            if count > 1:\n                qualified_businesses.add(business_id)\n        \n        if not qualified_businesses:\n            return []\n        \n        # Step 5: Filter for positive reviews (average rating >= 4.0)\n        final_businesses = []\n        for business_id in qualified_businesses:\n            if business_id in business_ratings:\n                avg_rating = sum(business_ratings[business_id]) / len(business_ratings[business_id])\n                if avg_rating >= 4.0:\n                    final_businesses.append(business_id)\n        \n        if not final_businesses:\n            return []\n        \n        # Step 6: Get final restaurant details\n        final_placeholders = ','.join(['?' for _ in final_businesses])\n        cursor_business.execute(f\"\"\"\n            SELECT business_id, name, address, categories\n            FROM business\n            WHERE business_id IN ({final_placeholders})\n        \"\"\", final_businesses)\n        \n        final_restaurants = []\n        for row in cursor_business.fetchall():\n            business_id = row[0]\n            avg_rating = sum(business_ratings[business_id]) / len(business_ratings[business_id])\n            final_restaurants.append({\n                'business_id': business_id,\n                'name': row[1],\n                'address': row[2],\n                'categories': row[3],\n                'average_rating': round(avg_rating, 2),\n                'visit_evidence': f\"Visited multiple times by {len([k for k in visit_counts.keys() if k[0] == business_id and visit_counts[k] > 1])} connected users\"\n            })\n        \n        # Clean up connections\n        conn_business.close()\n        conn_review.close()\n        \n        return final_restaurants\n        \n    except Exception as e:\n        print(f\"Error occurred: {str(e)}\")\n        return []\n\n# Example usage\nif __name__ == \"__main__\":\n    # Replace with actual current user ID\n    current_user = \"USER123\"\n    results = find_suitable_restaurants(current_user)\n    \n    print(f\"Found {len(results)} suitable restaurants in Saint Petersburg:\")\n    for restaurant in results:\n        print(f\"\\nName: {restaurant['name']}\")\n        print(f\"Address: {restaurant['address']}\")\n        print(f\"Average Rating: {restaurant['average_rating']}\")\n        print(f\"Evidence: {restaurant['visit_evidence']}\")"
+    }
+  }
+]
